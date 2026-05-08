@@ -59,6 +59,20 @@ bn imports
 
 `bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
 
+## API Documentation Lookup
+
+`bn api-docs` queries the Sphinx HTML reference shipped with Binary Ninja (`/Applications/Binary Ninja.app/Contents/Resources/api-docs` on macOS, similar paths elsewhere). It does not require an open target. Override the location with `--docs-dir` or `BN_API_DOCS_DIR` if Binary Ninja is installed somewhere non-standard.
+
+```bash
+bn api-docs search read --kind method            # find methods named *read*
+bn api-docs search --regex '^bn.*\.log_'         # regex over fully-qualified names
+bn api-docs show binaryninja.BinaryView.read     # signature + docstring + source pointer
+bn api-docs list --module binaryninja.highlevelil --kind class
+bn api-docs refresh                              # rebuild the on-disk index after upgrading BN
+```
+
+`show` requires a unique match. If you pass a bare name (e.g. `read`) and several symbols share it, the command prints the qualified candidates and exits non-zero — pass the qualified name to disambiguate.
+
 ## Caller-Static Mapping
 
 Prefer `bn callsites` over ad hoc `py exec` when the task is "find exact native RNG return-address callers" or any similar direct-call mapping workflow.

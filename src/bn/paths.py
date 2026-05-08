@@ -55,6 +55,10 @@ def bridge_socket_path() -> Path:
     return cache_home() / f"{PLUGIN_NAME}.sock"
 
 
+def api_docs_index_path() -> Path:
+    return cache_home() / "api_docs_index.json"
+
+
 def spill_root() -> Path:
     root = Path(tempfile.gettempdir()) / "bn-spills"
     root.mkdir(parents=True, exist_ok=True)

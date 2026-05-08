@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from . import api_docs
 from .output import write_output_result
 from .paths import (
     SKILL_CLIENTS,
@@ -1554,6 +1555,81 @@ def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _api_docs_resolve_dir(args: argparse.Namespace) -> Path:
+    try:
+        return api_docs.find_docs_dir(getattr(args, "docs_dir", None))
+    except FileNotFoundError as exc:
+        raise BridgeError(str(exc)) from exc
+
+
+def _api_docs_search(args: argparse.Namespace) -> int:
+    docs_dir = _api_docs_resolve_dir(args)
+    entries = api_docs.load_or_build_index(docs_dir)
+    matches = api_docs.search(
+        entries,
+        args.pattern,
+        regex=args.regex,
+        kind=args.kind,
+        limit=args.limit,
+    )
+    result: Any = matches
+    if args.format == "text":
+        result = api_docs.format_entries_text(matches)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="api-docs-search")
+    return 0 if matches else 1
+
+
+def _api_docs_list(args: argparse.Namespace) -> int:
+    docs_dir = _api_docs_resolve_dir(args)
+    entries = api_docs.load_or_build_index(docs_dir)
+    matches = api_docs.list_entries(
+        entries,
+        kind=args.kind,
+        module=args.module,
+        limit=args.limit,
+    )
+    result: Any = matches
+    if args.format == "text":
+        result = api_docs.format_entries_text(matches)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="api-docs-list")
+    return 0 if matches else 1
+
+
+def _api_docs_show(args: argparse.Namespace) -> int:
+    docs_dir = _api_docs_resolve_dir(args)
+    entries = api_docs.load_or_build_index(docs_dir)
+    matches = api_docs.find_symbol(entries, args.name)
+    if not matches:
+        print(f"no symbol matching {args.name!r}", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        names = "\n".join(e["name"] for e in matches)
+        print(
+            f"multiple symbols match {args.name!r}; pass a fully qualified name:\n{names}",
+            file=sys.stderr,
+        )
+        return 2
+    detail = api_docs.extract_symbol_detail(docs_dir, matches[0])
+    result: Any = detail.to_dict()
+    if args.format == "text":
+        result = api_docs.format_detail_text(detail)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="api-docs-show")
+    return 0
+
+
+def _api_docs_refresh(args: argparse.Namespace) -> int:
+    docs_dir = _api_docs_resolve_dir(args)
+    entries = api_docs.load_or_build_index(docs_dir, refresh=True)
+    result: Any = {
+        "docs_dir": str(docs_dir),
+        "entries": len(entries),
+    }
+    if args.format == "text":
+        result = f"refreshed {len(entries)} entries from {docs_dir}"
+    _render_result(result, fmt=args.format, out_path=args.out, stem="api-docs-refresh")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
@@ -1841,6 +1917,81 @@ def build_parser() -> argparse.ArgumentParser:
     batch_apply.add_argument("--preview", action="store_true")
     batch_apply.add_argument("manifest", type=Path)
     batch_apply.set_defaults(handler=_batch_apply)
+
+    api_docs_parser = subparsers.add_parser(
+        "api-docs",
+        help="Query Binary Ninja's local Python API docs (no target needed)",
+    )
+    api_docs_sub = api_docs_parser.add_subparsers(dest="api_docs_command")
+
+    def _docs_dir_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--docs-dir",
+            type=Path,
+            help=(
+                "Path to the api-docs directory. Defaults to BN_API_DOCS_DIR or the "
+                "Binary Ninja install location for this platform."
+            ),
+        )
+
+    api_docs_search = api_docs_sub.add_parser("search", help="Search API symbols by name")
+    _common_io_options(api_docs_search)
+    _docs_dir_arg(api_docs_search)
+    api_docs_search.add_argument("pattern")
+    api_docs_search.add_argument(
+        "--regex",
+        action="store_true",
+        help="Interpret the pattern as a case-insensitive regular expression",
+    )
+    api_docs_search.add_argument(
+        "--kind",
+        choices=api_docs.KNOWN_KINDS,
+        help="Restrict matches to one symbol kind",
+    )
+    api_docs_search.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum number of matches to return (default: 50, use -1 for no limit)",
+    )
+    api_docs_search.set_defaults(handler=_api_docs_search)
+
+    api_docs_show = api_docs_sub.add_parser(
+        "show",
+        help="Show signature and docstring for one symbol",
+    )
+    _common_io_options(api_docs_show)
+    _docs_dir_arg(api_docs_show)
+    api_docs_show.add_argument("name", help="Qualified name (e.g. binaryninja.BinaryView.read)")
+    api_docs_show.set_defaults(handler=_api_docs_show)
+
+    api_docs_list = api_docs_sub.add_parser("list", help="List symbols, optionally filtered")
+    _common_io_options(api_docs_list)
+    _docs_dir_arg(api_docs_list)
+    api_docs_list.add_argument(
+        "--kind",
+        choices=api_docs.KNOWN_KINDS,
+        help="Restrict to one symbol kind",
+    )
+    api_docs_list.add_argument(
+        "--module",
+        help="Restrict to entries inside a module prefix (e.g. binaryninja.highlevelil)",
+    )
+    api_docs_list.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum entries to return (default: 200, use -1 for no limit)",
+    )
+    api_docs_list.set_defaults(handler=_api_docs_list)
+
+    api_docs_refresh = api_docs_sub.add_parser(
+        "refresh",
+        help="Rebuild the cached API docs index",
+    )
+    _common_io_options(api_docs_refresh, default_format="json")
+    _docs_dir_arg(api_docs_refresh)
+    api_docs_refresh.set_defaults(handler=_api_docs_refresh)
 
     return parser
 
