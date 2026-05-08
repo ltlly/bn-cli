@@ -27,13 +27,15 @@ bn plugin install
 
 That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
 
-Install the bundled Codex skill:
+Install the bundled skill:
 
 ```bash
 bn skill install
 ```
 
-That symlinks [`skills/bn`](/Users/banteg/dev/banteg/bn/skills/bn) into `$CODEX_HOME/skills/bn` by default. Use `--mode copy` if you want a standalone copy instead. Restart Codex to pick up a new or renamed skill.
+By default this installs into both Codex (`$CODEX_HOME/skills/bn`, default `~/.codex/skills/bn`) and Claude Code (`$CLAUDE_CONFIG_DIR/skills/bn`, default `~/.claude/skills/bn`). Both clients consume the same `SKILL.md` frontmatter format, so the same skill content drives both.
+
+Limit installation to one client with `--client codex` or `--client claude-code`. Use `--mode copy` if you want a standalone copy instead of a symlink. Pass `--dest <path>` (with a single `--client`) to install elsewhere. Restart your agent to pick up a new or renamed skill.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 

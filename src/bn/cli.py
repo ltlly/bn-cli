@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .output import write_output_result
-from .paths import plugin_install_dir, plugin_source_dir, skill_install_dir, skill_source_dir
+from .paths import (
+    SKILL_CLIENTS,
+    plugin_install_dir,
+    plugin_source_dir,
+    skill_install_dir_for,
+    skill_source_dir,
+)
 from .transport import BridgeError, _send_request_to_instance, list_instances, send_request
 from .version import VERSION, build_id_for_file
 
@@ -966,8 +972,19 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
 
 def _skill_install(args: argparse.Namespace) -> int:
     source = skill_source_dir()
-    dest = args.dest or skill_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
+    if args.client == "both":
+        clients = list(SKILL_CLIENTS)
+    else:
+        clients = [args.client]
+
+    if args.dest is not None and len(clients) > 1:
+        raise BridgeError("--dest cannot be combined with --client both; pick a single client")
+
+    installations = []
+    for client in clients:
+        dest = args.dest or skill_install_dir_for(client)
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+        installations.append({"client": client, "destination": str(dest)})
 
     _render_result(
         {
@@ -975,7 +992,7 @@ def _skill_install(args: argparse.Namespace) -> int:
             "mode": args.mode,
             "skill": source.name,
             "source": str(source),
-            "destination": str(dest),
+            "installations": installations,
         },
         fmt=args.format,
         out_path=args.out,
@@ -1556,12 +1573,18 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(plugin_install, default_format="json")
     plugin_install.set_defaults(handler=_plugin_install)
 
-    skill = subparsers.add_parser("skill", help="Install the bundled Codex skill")
+    skill = subparsers.add_parser("skill", help="Install the bundled skill into Codex and/or Claude Code")
     skill_sub = skill.add_subparsers(dest="skill_command")
-    skill_install = skill_sub.add_parser("install", help="Install the bundled Codex skill")
-    skill_install.add_argument("--dest", type=Path, help="Custom install destination")
+    skill_install = skill_sub.add_parser("install", help="Install the bundled skill")
+    skill_install.add_argument("--dest", type=Path, help="Custom install destination (requires a single --client)")
     skill_install.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
     skill_install.add_argument("--force", action="store_true")
+    skill_install.add_argument(
+        "--client",
+        choices=(*SKILL_CLIENTS, "both"),
+        default="both",
+        help="Which agent harness to install the skill into",
+    )
     _common_io_options(skill_install, default_format="json")
     skill_install.set_defaults(handler=_skill_install)
 

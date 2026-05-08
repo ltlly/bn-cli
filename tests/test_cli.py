@@ -204,6 +204,7 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     assert parser.parse_args(["plugin", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).mode == "symlink"
+    assert parser.parse_args(["skill", "install"]).client == "both"
     assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"
     assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "json"
     assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
@@ -380,6 +381,8 @@ def test_skill_install_copy_mode(tmp_path):
         [
             "skill",
             "install",
+            "--client",
+            "codex",
             "--mode",
             "copy",
             "--dest",
@@ -389,6 +392,62 @@ def test_skill_install_copy_mode(tmp_path):
     assert rc == 0
     assert (destination / "SKILL.md").exists()
     assert (destination / "agents" / "openai.yaml").exists()
+
+
+def test_skill_install_claude_code_writes_to_dest(tmp_path):
+    destination = tmp_path / "claude-skill"
+    rc = bn.cli.main(
+        [
+            "skill",
+            "install",
+            "--client",
+            "claude-code",
+            "--mode",
+            "copy",
+            "--dest",
+            str(destination),
+        ]
+    )
+    assert rc == 0
+    assert (destination / "SKILL.md").exists()
+
+
+def test_skill_install_both_clients_writes_to_each(monkeypatch, tmp_path, capsys):
+    codex_dest = tmp_path / "codex" / "bn"
+    claude_dest = tmp_path / "claude" / "bn"
+
+    def fake_install_dir_for(client):
+        if client == "codex":
+            return codex_dest
+        if client == "claude-code":
+            return claude_dest
+        raise AssertionError(f"unexpected client: {client}")
+
+    monkeypatch.setattr(bn.cli, "skill_install_dir_for", fake_install_dir_for)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+    assert rc == 0
+    assert (codex_dest / "SKILL.md").exists()
+    assert (claude_dest / "SKILL.md").exists()
+
+    payload = json.loads(capsys.readouterr().out)
+    clients = sorted(item["client"] for item in payload["installations"])
+    assert clients == ["claude-code", "codex"]
+
+
+def test_skill_install_rejects_dest_with_both(tmp_path, capsys):
+    rc = bn.cli.main(
+        [
+            "skill",
+            "install",
+            "--client",
+            "both",
+            "--dest",
+            str(tmp_path / "anywhere"),
+        ]
+    )
+    assert rc == 2
+    assert "--dest cannot be combined with --client both" in capsys.readouterr().err
 
 
 def test_target_list_text_format_renders_summary(monkeypatch, capsys):

@@ -21,6 +21,13 @@ def codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def claude_home() -> Path:
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".claude"
+
+
 def cache_home() -> Path:
     env = os.environ.get("BN_CACHE_DIR")
     if env:
@@ -82,9 +89,28 @@ def codex_skills_dir() -> Path:
     return codex_home() / "skills"
 
 
+def claude_skills_dir() -> Path:
+    return claude_home() / "skills"
+
+
 def skill_source_dir() -> Path:
     return repo_root() / "skills" / SKILL_NAME
 
 
 def skill_install_dir() -> Path:
     return codex_skills_dir() / SKILL_NAME
+
+
+def claude_skill_install_dir() -> Path:
+    return claude_skills_dir() / SKILL_NAME
+
+
+SKILL_CLIENTS: tuple[str, ...] = ("codex", "claude-code")
+
+
+def skill_install_dir_for(client: str) -> Path:
+    if client == "codex":
+        return skill_install_dir()
+    if client == "claude-code":
+        return claude_skill_install_dir()
+    raise ValueError(f"Unknown skill client: {client}")
