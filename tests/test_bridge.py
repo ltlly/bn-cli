@@ -1151,6 +1151,666 @@ def test_read_write_lock_allows_parallel_readers(monkeypatch):
     assert sorted(entered) == ["first", "second"]
 
 
+class _FakeWorkflowMachine:
+    def __init__(self, *, status=None, dump=None, overrides=None, set_accepted=True, clear_accepted=True, accept_machine_commands=True):
+        self._status = status if status is not None else {"state": "idle"}
+        self._dump = dump if dump is not None else {"trace": []}
+        self._overrides = dict(overrides or {})
+        self.calls: list[tuple[str, Any]] = []
+        self._set_accepted = set_accepted
+        self._clear_accepted = clear_accepted
+        self._suppress_set = False
+        self._breakpoints: list[str] = []
+        self._accept_machine_commands = accept_machine_commands
+        self._machine_state = {"activity": "undetermined", "state": "Idle"}
+
+    def _envelope(self, command: str, *, accepted: bool | None = None, action: str | None = None, response: Any = None) -> dict[str, Any]:
+        cs = {"command": command}
+        if action is not None:
+            cs["action"] = action
+        cs["accepted"] = bool(self._accept_machine_commands if accepted is None else accepted)
+        env = {
+            "commandStatus": cs,
+            "logStatus": {"global": False, "local": False},
+            "machineState": dict(self._machine_state),
+        }
+        if response is not None:
+            env["response"] = response
+        return env
+
+    def enable(self):
+        self.calls.append(("enable", None))
+        return self._envelope("enable")
+
+    def disable(self):
+        self.calls.append(("disable", None))
+        return self._envelope("disable")
+
+    def step(self):
+        self.calls.append(("step", None))
+        return self._envelope("step")
+
+    def halt(self):
+        self.calls.append(("halt", None))
+        return self._envelope("halt")
+
+    def reset(self):
+        self.calls.append(("reset", None))
+        return self._envelope("reset")
+
+    def run(self, advanced: bool = True, incremental: bool = False):
+        self.calls.append(("run", (bool(advanced), bool(incremental))))
+        return self._envelope("run")
+
+    def resume(self, advanced: bool = True, incremental: bool = False):
+        self.calls.append(("resume", (bool(advanced), bool(incremental))))
+        return self._envelope("resume")
+
+    def breakpoint_set(self, activities):
+        if isinstance(activities, str):
+            activities = [activities]
+        for name in activities:
+            if name not in self._breakpoints:
+                self._breakpoints.append(name)
+        self.calls.append(("breakpoint_set", list(activities)))
+        return self._envelope("breakpoint", action="set")
+
+    def breakpoint_delete(self, activities):
+        if isinstance(activities, str):
+            activities = [activities]
+        for name in activities:
+            if name in self._breakpoints:
+                self._breakpoints.remove(name)
+        self.calls.append(("breakpoint_delete", list(activities)))
+        return self._envelope("breakpoint", action="delete")
+
+    def breakpoint_query(self):
+        self.calls.append(("breakpoint_query", None))
+        if self._breakpoints:
+            return self._envelope(
+                "breakpoint",
+                action="query",
+                response={"activities": list(self._breakpoints)},
+            )
+        return self._envelope("breakpoint", action="query")
+
+    def status(self):
+        self.calls.append(("status", None))
+        return dict(self._status)
+
+    def dump(self):
+        self.calls.append(("dump", None))
+        return dict(self._dump)
+
+    def override_query(self, activity=""):
+        self.calls.append(("override_query", activity))
+        if activity:
+            info: dict[str, Any] = {"activity": activity, "eligible": True}
+            if activity in self._overrides:
+                info["override"] = bool(self._overrides[activity])
+            return {
+                "commandStatus": {"accepted": True, "action": "query", "command": "override"},
+                "response": {"activity": info},
+            }
+        listed = []
+        for name, value in self._overrides.items():
+            entry = {"activity": name, "eligible": True, "override": bool(value)}
+            listed.append(entry)
+        return {
+            "commandStatus": {"accepted": True, "action": "query", "command": "override"},
+            "response": {"activities": listed},
+        }
+
+    def override_set(self, activity, enable):
+        self.calls.append(("override_set", (activity, bool(enable))))
+        if self._set_accepted and not self._suppress_set:
+            self._overrides[activity] = bool(enable)
+        return {
+            "commandStatus": {
+                "accepted": bool(self._set_accepted),
+                "action": "set",
+                "command": "override",
+            },
+        }
+
+    def override_clear(self, activity):
+        self.calls.append(("override_clear", activity))
+        if self._clear_accepted:
+            self._overrides.pop(activity, None)
+        return {
+            "commandStatus": {
+                "accepted": bool(self._clear_accepted),
+                "action": "clear",
+                "command": "override",
+            },
+        }
+
+
+class _FakeWorkflow:
+    def __init__(
+        self,
+        name: str,
+        *,
+        registered: bool = True,
+        roots=None,
+        activities=None,
+        eligibility=None,
+        configuration_text: str = "[]",
+        machine: _FakeWorkflowMachine | None = ...,
+    ):
+        self.name = name
+        self.registered = registered
+        self._roots = list(roots or [])
+        self._activities = list(activities or [])
+        self._eligibility = list(eligibility or [])
+        self._configuration_text = configuration_text
+        if machine is ...:
+            self._machine = _FakeWorkflowMachine()
+        else:
+            self._machine = machine
+
+    def activity_roots(self, activity=""):
+        if not activity:
+            return list(self._roots)
+        return [a for a in self._activities if a.startswith(activity + ".")][:1]
+
+    def subactivities(self, activity="", immediate=False):
+        if not activity:
+            base = list(self._activities)
+        else:
+            base = [a for a in self._activities if a.startswith(activity)]
+        if immediate:
+            return [a for a in base if a.count(".") <= activity.count(".") + 1]
+        return base
+
+    def configuration(self, activity=""):
+        return self._configuration_text
+
+    def eligibility_settings(self):
+        return list(self._eligibility)
+
+    @property
+    def machine(self):
+        if self._machine is None:
+            raise AttributeError("Machine does not exist.")
+        return self._machine
+
+
+def _install_fake_workflow(bridge_module, workflows: list[_FakeWorkflow]) -> dict[str, _FakeWorkflow]:
+    by_name = {wf.name: wf for wf in workflows}
+
+    class _WorkflowProxy:
+        @classmethod
+        @property
+        def list(cls):
+            return [by_name[name] for name in by_name]
+
+    # python's classmethod-property combo varies across versions; use a simple namespace
+    proxy = types.SimpleNamespace(list=[by_name[name] for name in by_name])
+    bridge_module.bn.Workflow = proxy
+    return by_name
+
+
+def test_workflow_list_returns_sorted_with_registered_filter(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _install_fake_workflow(
+        bridge,
+        [
+            _FakeWorkflow("core.module.defaultAnalysis", registered=True),
+            _FakeWorkflow("core.function.metaAnalysis", registered=True),
+            _FakeWorkflow("plugins.scratch", registered=False),
+        ],
+    )
+
+    rows = instance._workflow_list(None)
+    assert [r["name"] for r in rows] == [
+        "core.function.metaAnalysis",
+        "core.module.defaultAnalysis",
+        "plugins.scratch",
+    ]
+    assert {r["registered"] for r in rows} == {True, False}
+
+    only_registered = instance._workflow_list(None, registered_only=True)
+    assert all(r["registered"] for r in only_registered)
+    assert {r["name"] for r in only_registered} == {
+        "core.function.metaAnalysis",
+        "core.module.defaultAnalysis",
+    }
+
+
+def test_workflow_show_returns_roots_and_activities(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _install_fake_workflow(
+        bridge,
+        [
+            _FakeWorkflow(
+                "core.function.metaAnalysis",
+                roots=["core.function.start"],
+                activities=[
+                    "core.function.start",
+                    "core.function.start.firstPass",
+                    "core.function.generateHighLevelIL",
+                ],
+                eligibility=["analysis.experimental"],
+            ),
+        ],
+    )
+
+    payload = instance._workflow_show(None, name="core.function.metaAnalysis")
+    assert payload["registered"] is True
+    assert payload["roots"] == ["core.function.start"]
+    assert payload["activities"] == [
+        "core.function.start",
+        "core.function.start.firstPass",
+        "core.function.generateHighLevelIL",
+    ]
+    assert payload["eligibility_settings"] == ["analysis.experimental"]
+    assert payload["depth"] == "all"
+
+
+def test_workflow_show_with_activity_and_config(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _install_fake_workflow(
+        bridge,
+        [
+            _FakeWorkflow(
+                "core.module.defaultAnalysis",
+                activities=[
+                    "core.module.start",
+                    "core.module.start.linearSweep",
+                    "core.module.start.recurDescend",
+                ],
+                configuration_text='[{"name":"core.module.start"}]',
+            ),
+        ],
+    )
+
+    payload = instance._workflow_show(
+        None,
+        name="core.module.defaultAnalysis",
+        activity="core.module.start",
+        depth="immediate",
+        with_config=True,
+    )
+    assert payload["scope_activity"] == "core.module.start"
+    assert payload["depth"] == "immediate"
+    assert payload["configuration"] == '[{"name":"core.module.start"}]'
+
+
+def test_workflow_show_raises_for_unknown_workflow(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _install_fake_workflow(bridge, [_FakeWorkflow("core.module.defaultAnalysis")])
+
+    with pytest.raises(RuntimeError, match="Workflow not found"):
+        instance._workflow_show(None, name="does.not.exist")
+
+
+def test_workflow_active_for_binaryview_and_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    bv_workflow = _FakeWorkflow(
+        "core.module.defaultAnalysis",
+        roots=["core.module.start"],
+        activities=["core.module.start", "core.module.start.linearSweep"],
+    )
+    fn_workflow = _FakeWorkflow(
+        "core.function.metaAnalysis",
+        roots=["core.function.start"],
+        activities=["core.function.start", "core.function.generateHighLevelIL"],
+    )
+
+    fn = _FakeFunction(0x401000, "player_update")
+    fn.workflow = fn_workflow
+
+    class _BVWithWorkflow(_FakeBV):
+        def __init__(self):
+            super().__init__(functions=[fn])
+            self.workflow = bv_workflow
+
+    bv = _BVWithWorkflow()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    bv_payload = instance._workflow_active(None)
+    assert bv_payload["scope"] == "binaryview"
+    assert bv_payload["workflow"]["name"] == "core.module.defaultAnalysis"
+    assert bv_payload["workflow"]["activity_count"] == 2
+
+    fn_payload = instance._workflow_active(None, function="player_update")
+    assert fn_payload["scope"] == "function"
+    assert fn_payload["workflow"]["name"] == "core.function.metaAnalysis"
+    assert fn_payload["workflow"]["function"] == "0x401000"
+
+
+def test_workflow_active_returns_none_when_no_workflow_bound(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BareBV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.workflow = None
+
+    bv = _BareBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_active(None)
+    assert payload == {"workflow": None, "scope": "binaryview"}
+
+
+def test_workflow_machine_status_and_overrides(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    machine = _FakeWorkflowMachine(
+        status={"state": "halted", "current": "core.function.start"},
+        overrides={"core.function.analyzeTailCalls": False},
+    )
+    workflow = _FakeWorkflow("core.module.defaultAnalysis", machine=machine)
+
+    class _BVWithMachine(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.workflow = workflow
+
+    bv = _BVWithMachine()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    status_payload = instance._workflow_machine_call(None, "status", {})
+    assert status_payload["available"] is True
+    assert status_payload["scope"] == "binaryview"
+    assert status_payload["status"]["state"] == "halted"
+
+    overrides_payload = instance._workflow_machine_call(
+        None,
+        "overrides",
+        {"activity": "core.function.analyzeTailCalls"},
+    )
+    assert overrides_payload["available"] is True
+    activity_info = overrides_payload["overrides"]["response"]["activity"]
+    assert activity_info["activity"] == "core.function.analyzeTailCalls"
+    assert activity_info["override"] is False
+    assert ("override_query", "core.function.analyzeTailCalls") in machine.calls
+
+
+def _bv_with_workflow(machine: _FakeWorkflowMachine) -> _FakeBV:
+    workflow = _FakeWorkflow("core.module.metaAnalysis", machine=machine)
+
+    class _BV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.workflow = workflow
+
+    return _BV()
+
+
+def test_workflow_override_set_persists_when_not_preview(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_override_apply(
+        None,
+        action="set",
+        activity="core.function.analyzeTailCalls",
+        enable=False,
+        function=None,
+        preview=False,
+    )
+
+    assert payload["status"] == "verified"
+    assert payload["success"] is True
+    assert payload["committed"] is True
+    assert payload["before"] is None
+    assert payload["after"] is False
+    assert payload["reverted"] is False
+    assert machine._overrides["core.function.analyzeTailCalls"] is False
+
+
+def test_workflow_override_set_preview_reverts_to_previous_state(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_override_apply(
+        None,
+        action="set",
+        activity="core.function.analyzeTailCalls",
+        enable=True,
+        function=None,
+        preview=True,
+    )
+
+    assert payload["status"] == "previewed"
+    assert payload["success"] is True
+    assert payload["committed"] is False
+    assert payload["after"] is True
+    assert payload["reverted"] is True
+    assert "core.function.analyzeTailCalls" not in machine._overrides
+
+
+def test_workflow_override_set_preview_restores_pre_existing_override(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine(overrides={"core.function.foo": True})
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_override_apply(
+        None,
+        action="set",
+        activity="core.function.foo",
+        enable=False,
+        function=None,
+        preview=True,
+    )
+
+    assert payload["before"] is True
+    assert payload["after"] is False
+    assert payload["status"] == "previewed"
+    assert payload["reverted"] is True
+    assert machine._overrides["core.function.foo"] is True
+
+
+def test_workflow_override_clear_round_trip(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine(overrides={"core.function.foo": False})
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_override_apply(
+        None,
+        action="clear",
+        activity="core.function.foo",
+        enable=None,
+        function=None,
+        preview=False,
+    )
+
+    assert payload["status"] == "verified"
+    assert payload["before"] is False
+    assert payload["after"] is None
+    assert "core.function.foo" not in machine._overrides
+
+
+def test_workflow_override_set_marks_verification_failed_when_state_unchanged(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    machine._suppress_set = True  # accept the command but never mutate
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_override_apply(
+        None,
+        action="set",
+        activity="core.function.foo",
+        enable=True,
+        function=None,
+        preview=False,
+    )
+
+    assert payload["status"] == "verification_failed"
+    assert payload["success"] is False
+    assert payload["committed"] is False
+    assert payload["accepted"] is True
+    assert payload["verified"] is False
+    assert payload["reverted"] is True
+
+
+def test_workflow_override_set_unsupported_when_command_not_accepted(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine(set_accepted=False)
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_override_apply(
+        None,
+        action="set",
+        activity="core.function.foo",
+        enable=True,
+        function=None,
+        preview=False,
+    )
+
+    assert payload["status"] == "unsupported"
+    assert payload["success"] is False
+
+
+def test_workflow_override_apply_raises_when_no_machine(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    workflow = _FakeWorkflow("core.module.metaAnalysis", machine=None)
+
+    class _BV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.workflow = workflow
+
+    bv = _BV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure, match="machine not enabled"):
+        instance._workflow_override_apply(
+            None,
+            action="set",
+            activity="core.function.foo",
+            enable=True,
+            function=None,
+            preview=False,
+        )
+
+
+def test_workflow_machine_enable_returns_accepted_envelope(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_machine_command(None, command="enable")
+    assert payload["command"] == "enable"
+    assert payload["accepted"] is True
+    assert payload["scope"] == "binaryview"
+    assert payload["machine_state"] == {"activity": "undetermined", "state": "Idle"}
+    assert ("enable", None) in machine.calls
+
+
+def test_workflow_machine_run_forwards_options(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_machine_command(
+        None,
+        command="run",
+        advanced=False,
+        incremental=True,
+    )
+    assert payload["command"] == "run"
+    assert payload["options"] == {"advanced": False, "incremental": True}
+    assert ("run", (False, True)) in machine.calls
+
+
+def test_workflow_machine_breakpoint_lifecycle(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    set_payload = instance._workflow_machine_command(
+        None,
+        command="breakpoint_set",
+        activities=["analysis.warp.fetcher", "analysis.warp.matcher"],
+    )
+    assert set_payload["accepted"] is True
+    assert set_payload["requested_activities"] == [
+        "analysis.warp.fetcher",
+        "analysis.warp.matcher",
+    ]
+
+    list_payload = instance._workflow_machine_command(None, command="breakpoint_list")
+    assert list_payload["activities"] == [
+        "analysis.warp.fetcher",
+        "analysis.warp.matcher",
+    ]
+
+    clear_payload = instance._workflow_machine_command(
+        None,
+        command="breakpoint_clear",
+        activities=["analysis.warp.fetcher"],
+    )
+    assert clear_payload["accepted"] is True
+    assert clear_payload["requested_activities"] == ["analysis.warp.fetcher"]
+
+    final_list = instance._workflow_machine_command(None, command="breakpoint_list")
+    assert final_list["activities"] == ["analysis.warp.matcher"]
+
+
+def test_workflow_machine_breakpoint_set_requires_activities(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    machine = _FakeWorkflowMachine()
+    bv = _bv_with_workflow(machine)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure, match="at least one activity"):
+        instance._workflow_machine_command(None, command="breakpoint_set", activities=[])
+
+
+def test_workflow_machine_unavailable_when_no_machine(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    workflow = _FakeWorkflow("core.module.defaultAnalysis", machine=None)
+
+    class _BVWithoutMachine(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.workflow = workflow
+
+    bv = _BVWithoutMachine()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    payload = instance._workflow_machine_call(None, "status", {})
+    assert payload["available"] is False
+    assert payload["reason"] == "machine not enabled"
+    assert payload["status"] is None
+
+
 def test_collect_open_views_uses_tabs_api(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 

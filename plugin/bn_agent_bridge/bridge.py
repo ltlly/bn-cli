@@ -106,6 +106,13 @@ READ_LOCKED_OPS = {
     "imports",
     "bundle_function",
     "get_comment",
+    "workflow_list",
+    "workflow_show",
+    "workflow_active",
+    "workflow_machine_status",
+    "workflow_machine_dump",
+    "workflow_machine_overrides",
+    "workflow_machine_breakpoint_list",
 }
 
 
@@ -123,6 +130,17 @@ WRITE_LOCKED_OPS = {
     "types_declare",
     "batch_apply",
     "refresh",
+    "workflow_override_set",
+    "workflow_override_clear",
+    "workflow_machine_enable",
+    "workflow_machine_disable",
+    "workflow_machine_run",
+    "workflow_machine_step",
+    "workflow_machine_halt",
+    "workflow_machine_reset",
+    "workflow_machine_resume",
+    "workflow_machine_breakpoint_set",
+    "workflow_machine_breakpoint_clear",
 }
 
 
@@ -588,6 +606,76 @@ class BinaryNinjaBridge:
             )
         if op == "imports":
             return self._imports(target)
+        if op == "workflow_list":
+            return self._workflow_list(
+                target,
+                registered_only=bool(params.get("registered_only", False)),
+            )
+        if op == "workflow_show":
+            return self._workflow_show(
+                target,
+                name=str(params["name"]),
+                activity=params.get("activity"),
+                depth=str(params.get("depth", "all")),
+                with_config=bool(params.get("with_config", False)),
+            )
+        if op == "workflow_active":
+            return self._workflow_active(target, function=params.get("function"))
+        if op == "workflow_machine_status":
+            return self._workflow_machine_call(target, "status", params)
+        if op == "workflow_machine_dump":
+            return self._workflow_machine_call(target, "dump", params)
+        if op == "workflow_machine_overrides":
+            return self._workflow_machine_call(target, "overrides", params)
+        if op == "workflow_override_set":
+            return self._workflow_override_apply(
+                target,
+                action="set",
+                activity=str(params["activity"]),
+                enable=bool(params["enable"]),
+                function=params.get("function"),
+                preview=bool(params.get("preview", False)),
+            )
+        if op == "workflow_override_clear":
+            return self._workflow_override_apply(
+                target,
+                action="clear",
+                activity=str(params["activity"]),
+                enable=None,
+                function=params.get("function"),
+                preview=bool(params.get("preview", False)),
+            )
+        if op in (
+            "workflow_machine_enable",
+            "workflow_machine_disable",
+            "workflow_machine_step",
+            "workflow_machine_halt",
+            "workflow_machine_reset",
+            "workflow_machine_breakpoint_list",
+        ):
+            command = op[len("workflow_machine_") :]
+            return self._workflow_machine_command(
+                target,
+                command=command,
+                function=params.get("function"),
+            )
+        if op in ("workflow_machine_run", "workflow_machine_resume"):
+            command = op[len("workflow_machine_") :]
+            return self._workflow_machine_command(
+                target,
+                command=command,
+                function=params.get("function"),
+                advanced=bool(params.get("advanced", True)),
+                incremental=bool(params.get("incremental", False)),
+            )
+        if op in ("workflow_machine_breakpoint_set", "workflow_machine_breakpoint_clear"):
+            command = op[len("workflow_machine_") :]
+            return self._workflow_machine_command(
+                target,
+                command=command,
+                function=params.get("function"),
+                activities=list(params.get("activities") or []),
+            )
         if op == "bundle_function":
             return self._bundle_function(target, params["identifier"], params.get("out_path"))
         if op == "py_exec":
@@ -662,6 +750,326 @@ class BinaryNinjaBridge:
             "refreshed": True,
             "target": self._target_info(selector),
         }
+
+    def _workflow_list(self, selector: str | None, *, registered_only: bool = False):
+        workflows = list(getattr(bn.Workflow, "list", []) or [])
+        items: list[dict[str, Any]] = []
+        for wf in workflows:
+            registered = bool(getattr(wf, "registered", False))
+            if registered_only and not registered:
+                continue
+            items.append({"name": str(wf.name), "registered": registered})
+        items.sort(key=lambda r: r["name"])
+        return items
+
+    def _lookup_workflow(self, name: str):
+        workflows = list(getattr(bn.Workflow, "list", []) or [])
+        known = {str(wf.name): wf for wf in workflows}
+        if name not in known:
+            raise RuntimeError(f"Workflow not found: {name}")
+        return known[name]
+
+    def _workflow_show(
+        self,
+        selector: str | None,
+        *,
+        name: str,
+        activity: str | None = None,
+        depth: str = "all",
+        with_config: bool = False,
+    ):
+        wf = self._lookup_workflow(name)
+        scope = activity or ""
+        immediate = depth == "immediate"
+        roots = list(wf.activity_roots(scope))
+        activities = list(wf.subactivities(scope, immediate=immediate))
+        try:
+            eligibility = list(wf.eligibility_settings())
+        except Exception:
+            eligibility = []
+        payload: dict[str, Any] = {
+            "name": str(wf.name),
+            "registered": bool(getattr(wf, "registered", False)),
+            "scope_activity": activity,
+            "depth": "immediate" if immediate else "all",
+            "roots": roots,
+            "activities": activities,
+            "eligibility_settings": eligibility,
+        }
+        if with_config:
+            try:
+                payload["configuration"] = wf.configuration(scope)
+            except Exception as exc:
+                payload["configuration_error"] = f"{type(exc).__name__}: {exc}"
+        return payload
+
+    def _workflow_active(self, selector: str | None, *, function: Any = None):
+        bv = self._resolve_view(selector)
+        scope = "binaryview" if function is None else "function"
+        owner = bv if function is None else self._find_function(bv, function)
+        wf = getattr(owner, "workflow", None)
+        if wf is None:
+            return {"workflow": None, "scope": scope}
+        try:
+            activities = list(wf.subactivities("", immediate=False))
+        except Exception:
+            activities = []
+        try:
+            roots = list(wf.activity_roots(""))
+        except Exception:
+            roots = []
+        info: dict[str, Any] = {
+            "name": str(wf.name),
+            "registered": bool(getattr(wf, "registered", False)),
+            "roots": roots,
+            "activity_count": len(activities),
+        }
+        if scope == "function":
+            info["function"] = hex(int(getattr(owner, "start", 0)))
+        return {"workflow": info, "scope": scope}
+
+    def _resolve_workflow_machine(self, selector: str | None, function: Any):
+        bv = self._resolve_view(selector)
+        scope = "binaryview" if function is None else "function"
+        owner = bv if function is None else self._find_function(bv, function)
+        wf = getattr(owner, "workflow", None)
+        if wf is None:
+            raise OperationFailure(
+                "unsupported",
+                f"No workflow bound to {scope}",
+            )
+        try:
+            machine = wf.machine
+        except AttributeError:
+            machine = None
+        if machine is None:
+            raise OperationFailure(
+                "unsupported",
+                f"Workflow machine not enabled on {scope}",
+            )
+        return owner, scope, machine
+
+    @staticmethod
+    def _read_override(machine: Any, activity: str) -> bool | None:
+        try:
+            resp = machine.override_query(activity)
+        except Exception:
+            return None
+        if not isinstance(resp, dict):
+            return None
+        response = resp.get("response")
+        if not isinstance(response, dict):
+            return None
+        info = response.get("activity")
+        if not isinstance(info, dict):
+            return None
+        if "override" not in info:
+            return None
+        return bool(info.get("override"))
+
+    @staticmethod
+    def _command_accepted(resp: Any) -> bool:
+        if not isinstance(resp, dict):
+            return False
+        cs = resp.get("commandStatus")
+        if not isinstance(cs, dict):
+            return False
+        return bool(cs.get("accepted"))
+
+    def _workflow_override_apply(
+        self,
+        selector: str | None,
+        *,
+        action: str,
+        activity: str,
+        enable: bool | None,
+        function: Any,
+        preview: bool,
+    ) -> dict[str, Any]:
+        if not activity:
+            raise OperationFailure("unsupported", "activity name is required")
+        owner, scope, machine = self._resolve_workflow_machine(selector, function)
+        before = self._read_override(machine, activity)
+        if action == "set":
+            cmd_resp = machine.override_set(activity, bool(enable))
+            expected: bool | None = bool(enable)
+        elif action == "clear":
+            cmd_resp = machine.override_clear(activity)
+            expected = None
+        else:
+            raise OperationFailure("unsupported", f"Unknown override action: {action}")
+
+        accepted = self._command_accepted(cmd_resp)
+        after = self._read_override(machine, activity)
+        verified = after == expected
+
+        reverted = False
+        if preview or not accepted or not verified:
+            try:
+                if before is None:
+                    machine.override_clear(activity)
+                else:
+                    machine.override_set(activity, before)
+                reverted = True
+            except Exception:
+                reverted = False
+
+        if preview:
+            status = "previewed" if (accepted and verified) else "verification_failed"
+        elif accepted and verified:
+            status = "verified"
+        elif not accepted:
+            status = "unsupported"
+        else:
+            status = "verification_failed"
+
+        success = status in ("verified", "previewed")
+        committed = status == "verified"
+
+        payload: dict[str, Any] = {
+            "preview": bool(preview),
+            "success": success,
+            "committed": committed,
+            "status": status,
+            "applied": action,
+            "activity": activity,
+            "scope": scope,
+            "before": before,
+            "after": after,
+            "expected": expected,
+            "verified": verified,
+            "accepted": accepted,
+            "reverted": reverted,
+        }
+        if action == "set":
+            payload["enable"] = bool(enable)
+        if isinstance(cmd_resp, dict):
+            payload["command_status"] = cmd_resp.get("commandStatus")
+        if scope == "function":
+            payload["function"] = hex(int(getattr(owner, "start", 0)))
+        return payload
+
+    def _workflow_machine_command(
+        self,
+        selector: str | None,
+        *,
+        command: str,
+        function: Any = None,
+        advanced: bool | None = None,
+        incremental: bool | None = None,
+        activities: list[str] | None = None,
+    ) -> dict[str, Any]:
+        owner, scope, machine = self._resolve_workflow_machine(selector, function)
+
+        if command == "enable":
+            resp = machine.enable()
+        elif command == "disable":
+            resp = machine.disable()
+        elif command == "step":
+            resp = machine.step()
+        elif command == "halt":
+            resp = machine.halt()
+        elif command == "reset":
+            resp = machine.reset()
+        elif command == "run":
+            resp = machine.run(
+                advanced=bool(advanced) if advanced is not None else True,
+                incremental=bool(incremental) if incremental is not None else False,
+            )
+        elif command == "resume":
+            resp = machine.resume(
+                advanced=bool(advanced) if advanced is not None else True,
+                incremental=bool(incremental) if incremental is not None else False,
+            )
+        elif command == "breakpoint_set":
+            if not activities:
+                raise OperationFailure(
+                    "unsupported",
+                    "breakpoint set requires at least one activity",
+                )
+            resp = machine.breakpoint_set(list(activities))
+        elif command == "breakpoint_clear":
+            if not activities:
+                raise OperationFailure(
+                    "unsupported",
+                    "breakpoint clear requires at least one activity",
+                )
+            resp = machine.breakpoint_delete(list(activities))
+        elif command == "breakpoint_list":
+            resp = machine.breakpoint_query()
+        else:
+            raise OperationFailure("unsupported", f"unknown machine command: {command}")
+
+        accepted = self._command_accepted(resp)
+        machine_state = None
+        response_payload = None
+        if isinstance(resp, dict):
+            ms = resp.get("machineState")
+            if isinstance(ms, dict):
+                machine_state = dict(ms)
+            response_payload = resp.get("response")
+
+        payload: dict[str, Any] = {
+            "scope": scope,
+            "command": command,
+            "accepted": accepted,
+            "machine_state": machine_state,
+            "response": response_payload,
+        }
+        if scope == "function":
+            payload["function"] = hex(int(getattr(owner, "start", 0)))
+        if command == "breakpoint_list":
+            bp_activities: list[str] = []
+            if isinstance(response_payload, dict):
+                items = response_payload.get("activities")
+                if isinstance(items, list):
+                    bp_activities = [str(item) for item in items]
+            payload["activities"] = bp_activities
+        if command in ("breakpoint_set", "breakpoint_clear"):
+            payload["requested_activities"] = list(activities or [])
+        if command in ("run", "resume"):
+            payload["options"] = {
+                "advanced": bool(advanced) if advanced is not None else True,
+                "incremental": bool(incremental) if incremental is not None else False,
+            }
+        return payload
+
+    def _workflow_machine_call(
+        self,
+        selector: str | None,
+        verb: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        bv = self._resolve_view(selector)
+        function = params.get("function")
+        scope = "binaryview" if function is None else "function"
+        owner = bv if function is None else self._find_function(bv, function)
+        wf = getattr(owner, "workflow", None)
+        envelope: dict[str, Any] = {"available": False, "scope": scope, verb: None}
+        if wf is None:
+            envelope["reason"] = "no workflow bound"
+            return envelope
+        try:
+            machine = wf.machine
+        except AttributeError:
+            envelope["reason"] = "machine not enabled"
+            return envelope
+        if machine is None:
+            envelope["reason"] = "machine not enabled"
+            return envelope
+        if verb == "status":
+            result = machine.status()
+        elif verb == "dump":
+            result = machine.dump()
+        elif verb == "overrides":
+            activity = params.get("activity") or ""
+            result = machine.override_query(activity)
+        else:
+            raise RuntimeError(f"Unknown machine verb: {verb}")
+        envelope.update({"available": True, verb: result})
+        if scope == "function":
+            envelope["function"] = hex(int(getattr(owner, "start", 0)))
+        return envelope
 
     def _resolve_view(self, selector: str | None):
         return self.targets.resolve(selector)
