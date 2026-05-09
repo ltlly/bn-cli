@@ -479,6 +479,97 @@ def _render_refresh_text(value: Any) -> str:
     return _render_fallback_text(value)
 
 
+def _render_workflow_list_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no workflows"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        flag = "registered" if item.get("registered") else "unregistered"
+        lines.append(f"{item.get('name', '<unknown>')}  [{flag}]")
+    return "\n".join(lines)
+
+
+def _render_workflow_show_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    name = value.get("name", "<unknown>")
+    flag = "registered" if value.get("registered") else "unregistered"
+    lines = [f"{name}  [{flag}]"]
+    if value.get("scope_activity"):
+        lines.append(f"scope: {value['scope_activity']}")
+    if value.get("depth"):
+        lines.append(f"depth: {value['depth']}")
+    roots = list(value.get("roots") or [])
+    lines.append("")
+    lines.append("roots:")
+    if roots:
+        lines.extend(f"- {r}" for r in roots)
+    else:
+        lines.append("- none")
+    activities = list(value.get("activities") or [])
+    lines.append("")
+    lines.append(f"activities ({len(activities)}):")
+    if activities:
+        lines.extend(f"- {a}" for a in activities)
+    else:
+        lines.append("- none")
+    eligibility = list(value.get("eligibility_settings") or [])
+    if eligibility:
+        lines.append("")
+        lines.append("eligibility:")
+        lines.extend(f"- {e}" for e in eligibility)
+    if "configuration" in value:
+        lines.append("")
+        lines.append("configuration:")
+        lines.append(str(value.get("configuration") or ""))
+    elif "configuration_error" in value:
+        lines.append("")
+        lines.append(f"configuration error: {value['configuration_error']}")
+    return "\n".join(lines)
+
+
+def _render_workflow_active_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    scope = value.get("scope") or "binaryview"
+    wf = value.get("workflow")
+    if wf is None:
+        return f"no workflow bound ({scope})"
+    name = wf.get("name", "<unknown>")
+    flag = "registered" if wf.get("registered") else "unregistered"
+    lines = [f"{name}  [{flag}]  ({scope})"]
+    if "function" in wf:
+        lines.append(f"function: {wf['function']}")
+    lines.append(f"activities: {wf.get('activity_count', 0)}")
+    roots = list(wf.get("roots") or [])
+    if roots:
+        lines.append("roots:")
+        lines.extend(f"- {r}" for r in roots)
+    return "\n".join(lines)
+
+
+def _render_workflow_machine_text(verb: str) -> Callable[[Any], str]:
+    def render(value: Any) -> str:
+        if not isinstance(value, dict):
+            return _render_fallback_text(value)
+        if not value.get("available"):
+            reason = value.get("reason") or "unavailable"
+            return f"machine {verb}: unavailable ({reason})"
+        scope = value.get("scope") or "binaryview"
+        body = value.get(verb)
+        head = f"machine {verb} ({scope})"
+        if "function" in value:
+            head += f" function={value['function']}"
+        return f"{head}\n{_render_fallback_text(body)}"
+
+    return render
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
     label = value.get("selector") or value.get("target_id") or "<unknown>"
     lines = [str(label)]
@@ -1034,6 +1125,221 @@ def _refresh(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_refresh_text,
         stem="refresh",
+    )
+
+
+def _workflow_list(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "workflow_list",
+        {"registered_only": bool(args.registered_only)},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_list_text,
+        stem="workflows",
+    )
+
+
+def _workflow_show(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {
+        "name": args.name,
+        "depth": args.depth,
+        "with_config": bool(args.with_config),
+    }
+    if args.activity is not None:
+        params["activity"] = args.activity
+    return _call(
+        args,
+        "workflow_show",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_show_text,
+        stem="workflow-show",
+    )
+
+
+def _workflow_active(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.function is not None:
+        params["function"] = args.function
+    return _call(
+        args,
+        "workflow_active",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_active_text,
+        stem="workflow-active",
+    )
+
+
+def _workflow_machine_status(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.function is not None:
+        params["function"] = args.function
+    return _call(
+        args,
+        "workflow_machine_status",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_machine_text("status"),
+        stem="workflow-machine-status",
+    )
+
+
+def _workflow_machine_dump(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.function is not None:
+        params["function"] = args.function
+    return _call(
+        args,
+        "workflow_machine_dump",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="workflow-machine-dump",
+    )
+
+
+def _render_workflow_override_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    activity = value.get("activity", "<unknown>")
+    scope = value.get("scope") or "binaryview"
+    status = value.get("status") or ("previewed" if value.get("preview") else "")
+    head = f"override {value.get('applied', '?')} {activity} ({scope})"
+    if value.get("function"):
+        head += f" function={value['function']}"
+    lines = [head, f"status: {status}"]
+
+    def _fmt(v: Any) -> str:
+        if v is None:
+            return "(none)"
+        return str(v).lower() if isinstance(v, bool) else str(v)
+
+    lines.append(f"before: {_fmt(value.get('before'))}")
+    lines.append(f"after: {_fmt(value.get('after'))}")
+    if value.get("preview"):
+        lines.append(f"reverted: {bool(value.get('reverted'))}")
+    if not value.get("verified", True):
+        lines.append(f"verified: false")
+    return "\n".join(lines)
+
+
+def _workflow_override_set(args: argparse.Namespace) -> int:
+    enable = args.enable
+    if enable is None:
+        print("error: must pass --enable or --disable", file=sys.stderr)
+        return 2
+    params: dict[str, Any] = {
+        "activity": args.activity,
+        "enable": bool(enable),
+        "preview": bool(args.preview),
+    }
+    if args.function is not None:
+        params["function"] = args.function
+    return _call(
+        args,
+        "workflow_override_set",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_override_text,
+        result_exit_code=_mutation_exit_code,
+        stem="workflow-override-set",
+    )
+
+
+def _workflow_override_clear(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {
+        "activity": args.activity,
+        "preview": bool(args.preview),
+    }
+    if args.function is not None:
+        params["function"] = args.function
+    return _call(
+        args,
+        "workflow_override_clear",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_override_text,
+        result_exit_code=_mutation_exit_code,
+        stem="workflow-override-clear",
+    )
+
+
+def _render_workflow_machine_command_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    command = value.get("command", "?")
+    scope = value.get("scope") or "binaryview"
+    head = f"machine {command} ({scope})"
+    if value.get("function"):
+        head += f" function={value['function']}"
+    accepted = bool(value.get("accepted"))
+    lines = [head, f"accepted: {str(accepted).lower()}"]
+    state = value.get("machine_state")
+    if isinstance(state, dict):
+        activity = state.get("activity", "<unknown>")
+        s = state.get("state", "<unknown>")
+        lines.append(f"machine state: {s} (activity={activity})")
+    if command == "breakpoint_list":
+        activities = list(value.get("activities") or [])
+        lines.append(f"breakpoints ({len(activities)}):")
+        if activities:
+            lines.extend(f"- {a}" for a in activities)
+        else:
+            lines.append("- none")
+    elif command in ("breakpoint_set", "breakpoint_clear"):
+        requested = list(value.get("requested_activities") or [])
+        if requested:
+            lines.append("activities:")
+            lines.extend(f"- {a}" for a in requested)
+    return "\n".join(lines)
+
+
+def _workflow_machine_command_handler(
+    op: str, *, options: bool = False, activities: bool = False
+) -> Callable[[argparse.Namespace], int]:
+    def handler(args: argparse.Namespace) -> int:
+        params: dict[str, Any] = {}
+        if args.function is not None:
+            params["function"] = args.function
+        if options:
+            params["advanced"] = bool(getattr(args, "advanced", True))
+            params["incremental"] = bool(getattr(args, "incremental", False))
+        if activities:
+            params["activities"] = list(getattr(args, "activities", []) or [])
+        return _call(
+            args,
+            op,
+            params,
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=_render_workflow_machine_command_text,
+            stem=op.replace("_", "-"),
+        )
+
+    return handler
+
+
+def _workflow_machine_overrides(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.function is not None:
+        params["function"] = args.function
+    if args.activity is not None:
+        params["activity"] = args.activity
+    return _call(
+        args,
+        "workflow_machine_overrides",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_workflow_machine_text("overrides"),
+        stem="workflow-machine-overrides",
     )
 
 
@@ -1678,6 +1984,177 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(refresh)
     _target_option(refresh, required=False)
     refresh.set_defaults(handler=_refresh)
+
+    workflow = subparsers.add_parser("workflow", help="Inspect Binary Ninja analysis workflows")
+    workflow_sub = workflow.add_subparsers(dest="workflow_command")
+
+    wf_list = workflow_sub.add_parser("list", help="List known workflows")
+    _common_io_options(wf_list)
+    _target_option(wf_list, required=False)
+    wf_list.add_argument(
+        "--registered-only",
+        action="store_true",
+        help="Only show workflows that have been registered",
+    )
+    wf_list.set_defaults(handler=_workflow_list)
+
+    wf_show = workflow_sub.add_parser("show", help="Show a workflow's activity DAG")
+    _common_io_options(wf_show)
+    _target_option(wf_show, required=False)
+    wf_show.add_argument("name", help="Workflow name (e.g. core.function.metaAnalysis)")
+    wf_show.add_argument(
+        "--activity",
+        help="Scope roots and subactivities to this activity",
+    )
+    wf_show.add_argument(
+        "--depth",
+        choices=("all", "immediate"),
+        default="all",
+        help="Whether to recurse into subactivities (default: all)",
+    )
+    wf_show.add_argument(
+        "--with-config",
+        action="store_true",
+        help="Include the JSON adjacency-list configuration",
+    )
+    wf_show.set_defaults(handler=_workflow_show)
+
+    wf_active = workflow_sub.add_parser(
+        "active",
+        help="Show the workflow currently bound to the BinaryView or function",
+    )
+    _common_io_options(wf_active)
+    _target_option(wf_active, required=False)
+    wf_active.add_argument(
+        "--function",
+        help="Inspect the function-level workflow (accepts the same identifier shape as `bn function info`)",
+    )
+    wf_active.set_defaults(handler=_workflow_active)
+
+    wf_override = workflow_sub.add_parser(
+        "override",
+        help="Toggle activity overrides on the WorkflowMachine",
+    )
+    wf_override_sub = wf_override.add_subparsers(dest="override_command")
+
+    wf_override_set = wf_override_sub.add_parser(
+        "set",
+        help="Enable or disable a specific activity",
+    )
+    _common_io_options(wf_override_set, default_format="json")
+    _target_option(wf_override_set, required=False)
+    wf_override_set.add_argument("--preview", action="store_true")
+    wf_override_set.add_argument("--function")
+    enable_group = wf_override_set.add_mutually_exclusive_group(required=True)
+    enable_group.add_argument(
+        "--enable",
+        dest="enable",
+        action="store_true",
+        default=None,
+        help="Force the activity to run",
+    )
+    enable_group.add_argument(
+        "--disable",
+        dest="enable",
+        action="store_false",
+        help="Skip the activity",
+    )
+    wf_override_set.add_argument("activity")
+    wf_override_set.set_defaults(handler=_workflow_override_set)
+
+    wf_override_clear = wf_override_sub.add_parser(
+        "clear",
+        help="Remove an existing activity override",
+    )
+    _common_io_options(wf_override_clear, default_format="json")
+    _target_option(wf_override_clear, required=False)
+    wf_override_clear.add_argument("--preview", action="store_true")
+    wf_override_clear.add_argument("--function")
+    wf_override_clear.add_argument("activity")
+    wf_override_clear.set_defaults(handler=_workflow_override_clear)
+
+    wf_machine = workflow_sub.add_parser("machine", help="Inspect WorkflowMachine state")
+    wf_machine_sub = wf_machine.add_subparsers(dest="machine_command")
+
+    wf_machine_status = wf_machine_sub.add_parser("status", help="Current machine status")
+    _common_io_options(wf_machine_status)
+    _target_option(wf_machine_status, required=False)
+    wf_machine_status.add_argument("--function")
+    wf_machine_status.set_defaults(handler=_workflow_machine_status)
+
+    wf_machine_dump = wf_machine_sub.add_parser("dump", help="Full machine state dump")
+    _common_io_options(wf_machine_dump, default_format="json")
+    _target_option(wf_machine_dump, required=False)
+    wf_machine_dump.add_argument("--function")
+    wf_machine_dump.set_defaults(handler=_workflow_machine_dump)
+
+    wf_machine_overrides = wf_machine_sub.add_parser(
+        "overrides",
+        help="Active activity overrides",
+    )
+    _common_io_options(wf_machine_overrides)
+    _target_option(wf_machine_overrides, required=False)
+    wf_machine_overrides.add_argument("--function")
+    wf_machine_overrides.add_argument("--activity")
+    wf_machine_overrides.set_defaults(handler=_workflow_machine_overrides)
+
+    for verb, helper, op_name in (
+        ("enable", "Enable the WorkflowMachine", "workflow_machine_enable"),
+        ("disable", "Disable the WorkflowMachine", "workflow_machine_disable"),
+        ("step", "Advance the machine by one activity", "workflow_machine_step"),
+        ("halt", "Halt the running machine", "workflow_machine_halt"),
+        ("reset", "Reset the machine to its initial state", "workflow_machine_reset"),
+    ):
+        p = wf_machine_sub.add_parser(verb, help=helper)
+        _common_io_options(p, default_format="json")
+        _target_option(p, required=False)
+        p.add_argument("--function")
+        p.set_defaults(handler=_workflow_machine_command_handler(op_name))
+
+    for verb, helper, op_name in (
+        ("run", "Run the machine until the next breakpoint", "workflow_machine_run"),
+        ("resume", "Resume after a halt or breakpoint", "workflow_machine_resume"),
+    ):
+        p = wf_machine_sub.add_parser(verb, help=helper)
+        _common_io_options(p, default_format="json")
+        _target_option(p, required=False)
+        p.add_argument("--function")
+        p.add_argument(
+            "--no-advanced",
+            dest="advanced",
+            action="store_false",
+            default=True,
+            help="Disable advanced analysis mode",
+        )
+        p.add_argument("--incremental", action="store_true")
+        p.set_defaults(handler=_workflow_machine_command_handler(op_name, options=True))
+
+    wf_machine_bp = wf_machine_sub.add_parser(
+        "breakpoint",
+        help="Manage activity breakpoints",
+    )
+    wf_machine_bp_sub = wf_machine_bp.add_subparsers(dest="breakpoint_command")
+
+    wf_machine_bp_list = wf_machine_bp_sub.add_parser("list", help="List active breakpoints")
+    _common_io_options(wf_machine_bp_list)
+    _target_option(wf_machine_bp_list, required=False)
+    wf_machine_bp_list.add_argument("--function")
+    wf_machine_bp_list.set_defaults(
+        handler=_workflow_machine_command_handler("workflow_machine_breakpoint_list")
+    )
+
+    for verb, helper, op_name in (
+        ("set", "Set breakpoints on activities", "workflow_machine_breakpoint_set"),
+        ("clear", "Remove breakpoints from activities", "workflow_machine_breakpoint_clear"),
+    ):
+        p = wf_machine_bp_sub.add_parser(verb, help=helper)
+        _common_io_options(p, default_format="json")
+        _target_option(p, required=False)
+        p.add_argument("--function")
+        p.add_argument("activities", nargs="+", help="One or more activity names")
+        p.set_defaults(
+            handler=_workflow_machine_command_handler(op_name, activities=True)
+        )
 
     function = subparsers.add_parser("function", help="Function discovery helpers")
     function_sub = function.add_subparsers(dest="function_command")

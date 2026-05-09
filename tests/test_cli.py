@@ -1329,3 +1329,580 @@ def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
 
     assert rc == 0
     assert capsys.readouterr().out == "return 7;\n"
+
+
+def test_workflow_list_renders_registered_flag(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {
+            "ok": True,
+            "result": [
+                {"name": "core.function.metaAnalysis", "registered": True},
+                {"name": "plugins.scratch", "registered": False},
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "list", "--target", "active"])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_list"
+    assert captured["params"] == {"registered_only": False}
+    assert captured["target"] == "active"
+    assert capsys.readouterr().out == (
+        "core.function.metaAnalysis  [registered]\n"
+        "plugins.scratch  [unregistered]\n"
+    )
+
+
+def test_workflow_list_forwards_registered_only_flag(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "list", "--target", "active", "--registered-only"])
+
+    assert rc == 0
+    assert captured["params"] == {"registered_only": True}
+
+
+def test_workflow_show_renders_roots_and_activities(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "name": "core.function.metaAnalysis",
+                "registered": True,
+                "scope_activity": None,
+                "depth": "all",
+                "roots": ["core.function.start"],
+                "activities": [
+                    "core.function.start",
+                    "core.function.generateHighLevelIL",
+                ],
+                "eligibility_settings": ["analysis.experimental"],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "show",
+        "--target",
+        "active",
+        "core.function.metaAnalysis",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_show"
+    assert captured["params"]["name"] == "core.function.metaAnalysis"
+    assert captured["params"]["depth"] == "all"
+    assert captured["params"]["with_config"] is False
+    assert "activity" not in captured["params"]
+    out = capsys.readouterr().out
+    assert "core.function.metaAnalysis  [registered]" in out
+    assert "- core.function.start" in out
+    assert "activities (2)" in out
+    assert "- analysis.experimental" in out
+
+
+def test_workflow_show_forwards_activity_and_with_config(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "name": "core.function.metaAnalysis",
+                "registered": True,
+                "scope_activity": "core.function.start",
+                "depth": "immediate",
+                "roots": [],
+                "activities": [],
+                "eligibility_settings": [],
+                "configuration": "[]",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "show",
+        "--target",
+        "active",
+        "--activity",
+        "core.function.start",
+        "--depth",
+        "immediate",
+        "--with-config",
+        "core.function.metaAnalysis",
+    ])
+
+    assert rc == 0
+    assert captured["params"]["activity"] == "core.function.start"
+    assert captured["params"]["depth"] == "immediate"
+    assert captured["params"]["with_config"] is True
+
+
+def test_workflow_active_renders_function_scope(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "scope": "function",
+                "workflow": {
+                    "name": "core.function.metaAnalysis",
+                    "registered": True,
+                    "roots": ["core.function.start"],
+                    "activity_count": 12,
+                    "function": "0x401000",
+                },
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "active",
+        "--target",
+        "active",
+        "--function",
+        "0x401000",
+    ])
+
+    assert rc == 0
+    assert captured["params"]["function"] == "0x401000"
+    out = capsys.readouterr().out
+    assert "core.function.metaAnalysis  [registered]  (function)" in out
+    assert "function: 0x401000" in out
+    assert "activities: 12" in out
+
+
+def test_workflow_active_renders_no_workflow(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {"ok": True, "result": {"scope": "binaryview", "workflow": None}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "active", "--target", "active"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "no workflow bound (binaryview)\n"
+
+
+def test_workflow_machine_status_text_render(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "available": True,
+                "scope": "binaryview",
+                "status": {"state": "halted", "current": "core.function.start"},
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "machine", "status", "--target", "active"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "machine status (binaryview)" in out
+    assert '"state": "halted"' in out
+
+
+def test_workflow_machine_status_unavailable_render(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "available": False,
+                "scope": "binaryview",
+                "status": None,
+                "reason": "machine not enabled",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "machine", "status", "--target", "active"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "machine status: unavailable (machine not enabled)\n"
+
+
+def test_workflow_machine_dump_uses_json_default(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "available": True,
+                "scope": "function",
+                "function": "0x401000",
+                "dump": {"trace": []},
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "machine",
+        "dump",
+        "--target",
+        "active",
+        "--function",
+        "0x401000",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_machine_dump"
+    assert captured["params"] == {"function": "0x401000"}
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["function"] == "0x401000"
+    assert payload["dump"] == {"trace": []}
+
+
+def test_workflow_override_set_forwards_enable_and_preview(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "preview": False,
+                "success": True,
+                "committed": True,
+                "status": "verified",
+                "applied": "set",
+                "activity": "core.function.analyzeTailCalls",
+                "scope": "binaryview",
+                "before": None,
+                "after": False,
+                "expected": False,
+                "verified": True,
+                "accepted": True,
+                "reverted": False,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "override",
+        "set",
+        "--target",
+        "active",
+        "--disable",
+        "core.function.analyzeTailCalls",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_override_set"
+    assert captured["params"]["activity"] == "core.function.analyzeTailCalls"
+    assert captured["params"]["enable"] is False
+    assert captured["params"]["preview"] is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "verified"
+
+
+def test_workflow_override_set_preview_emits_preview_status(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "preview": True,
+                "success": True,
+                "committed": False,
+                "status": "previewed",
+                "applied": "set",
+                "activity": "core.function.foo",
+                "scope": "binaryview",
+                "before": None,
+                "after": True,
+                "expected": True,
+                "verified": True,
+                "accepted": True,
+                "reverted": True,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "override",
+        "set",
+        "--target",
+        "active",
+        "--enable",
+        "--preview",
+        "core.function.foo",
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["preview"] is True
+    assert payload["status"] == "previewed"
+
+
+def test_workflow_override_set_verification_failure_exits_three(monkeypatch):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "preview": False,
+                "success": False,
+                "committed": False,
+                "status": "verification_failed",
+                "applied": "set",
+                "activity": "core.function.foo",
+                "scope": "binaryview",
+                "before": None,
+                "after": None,
+                "expected": True,
+                "verified": False,
+                "accepted": True,
+                "reverted": True,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "override",
+        "set",
+        "--target",
+        "active",
+        "--enable",
+        "core.function.foo",
+    ])
+
+    assert rc == 3
+
+
+def test_workflow_override_clear_forwards_function(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "preview": False,
+                "success": True,
+                "committed": True,
+                "status": "verified",
+                "applied": "clear",
+                "activity": "core.function.foo",
+                "scope": "function",
+                "function": "0x401000",
+                "before": True,
+                "after": None,
+                "expected": None,
+                "verified": True,
+                "accepted": True,
+                "reverted": False,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "override",
+        "clear",
+        "--target",
+        "active",
+        "--function",
+        "0x401000",
+        "core.function.foo",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_override_clear"
+    assert captured["params"]["function"] == "0x401000"
+    assert captured["params"]["preview"] is False
+
+
+def test_workflow_machine_enable_dispatches_op(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "scope": "binaryview",
+                "command": "enable",
+                "accepted": True,
+                "machine_state": {"activity": "undetermined", "state": "Idle"},
+                "response": None,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "machine", "enable", "--target", "active"])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_machine_enable"
+    assert captured["params"] == {}
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["accepted"] is True
+
+
+def test_workflow_machine_run_forwards_options(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "scope": "binaryview",
+                "command": "run",
+                "accepted": True,
+                "machine_state": None,
+                "response": None,
+                "options": {"advanced": False, "incremental": True},
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "machine",
+        "run",
+        "--target",
+        "active",
+        "--no-advanced",
+        "--incremental",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_machine_run"
+    assert captured["params"] == {"advanced": False, "incremental": True}
+
+
+def test_workflow_machine_breakpoint_set_passes_activity_list(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "scope": "binaryview",
+                "command": "breakpoint_set",
+                "accepted": True,
+                "machine_state": None,
+                "response": None,
+                "requested_activities": ["a", "b"],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "machine",
+        "breakpoint",
+        "set",
+        "--target",
+        "active",
+        "a",
+        "b",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "workflow_machine_breakpoint_set"
+    assert captured["params"] == {"activities": ["a", "b"]}
+
+
+def test_workflow_machine_breakpoint_list_renders_activities(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "scope": "binaryview",
+                "command": "breakpoint_list",
+                "accepted": True,
+                "machine_state": {"activity": "x", "state": "Idle"},
+                "response": {"activities": ["a", "b"]},
+                "activities": ["a", "b"],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["workflow", "machine", "breakpoint", "list", "--target", "active"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "machine breakpoint_list (binaryview)" in out
+    assert "breakpoints (2):" in out
+    assert "- a" in out and "- b" in out
+
+
+def test_workflow_machine_overrides_forwards_activity(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "available": True,
+                "scope": "binaryview",
+                "overrides": {},
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "workflow",
+        "machine",
+        "overrides",
+        "--target",
+        "active",
+        "--activity",
+        "core.function.analyzeTailCalls",
+    ])
+
+    assert rc == 0
+    assert captured["params"] == {"activity": "core.function.analyzeTailCalls"}

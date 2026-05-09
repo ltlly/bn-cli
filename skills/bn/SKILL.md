@@ -73,6 +73,77 @@ bn api-docs refresh                              # rebuild the on-disk index aft
 
 `show` requires a unique match. If you pass a bare name (e.g. `read`) and several symbols share it, the command prints the qualified candidates and exits non-zero — pass the qualified name to disambiguate.
 
+## Workflow Inspection
+
+`bn workflow` exposes Binary Ninja's analysis workflow DAG so you can see which activities run and which are overridden. v1 is read-only.
+
+```bash
+bn workflow list                                          # all known workflows
+bn workflow list --registered-only
+bn workflow show core.function.metaAnalysis               # full activity tree
+bn workflow show core.function.metaAnalysis --depth immediate
+bn workflow show core.function.metaAnalysis --activity core.function.start
+bn workflow show core.module.defaultAnalysis --with-config --out /tmp/wf.json
+bn workflow active                                        # workflow bound to BV
+bn workflow active --function 0x401000                    # function-level workflow
+bn workflow machine status
+bn workflow machine status --function 0x401000
+bn workflow machine dump --out /tmp/machine.json
+bn workflow machine overrides
+bn workflow machine overrides --activity core.function.analyzeTailCalls
+```
+
+Typical flow: `bn workflow active` to see what is bound, then `bn workflow show <name>` to inspect the activity DAG, then `bn workflow machine status` / `overrides` for runtime state. `--function <id>` accepts the same identifier shape as `bn function info` (address, mangled, or demangled name).
+
+`bn workflow machine` returns `available: false` with a `reason` when no machine is attached — that is normal for plain analysis sessions; the machine is opt-in.
+
+### Override Mutations (preview first)
+
+`bn workflow override set/clear` toggles individual activities on or off via the WorkflowMachine. They mutate runtime state outside Binary Ninja's undo system, so the bridge implements a snapshot+restore preview itself.
+
+```bash
+bn workflow override set core.function.analyzeTailCalls --disable --preview
+bn workflow override set core.function.analyzeTailCalls --disable
+bn workflow override clear core.function.analyzeTailCalls --preview
+bn workflow override clear core.function.analyzeTailCalls
+bn workflow override set core.function.analyzeTailCalls --enable --function 0x401000 --preview
+```
+
+Each call returns a JSON envelope with `before`, `after`, `expected`, `verified`, `accepted`, `reverted`, and a `status` field that follows the existing mutation vocabulary:
+
+- `verified` — applied and observed post-state matches the request.
+- `previewed` — `--preview` apply succeeded; the override was reverted to its prior state.
+- `verification_failed` — apply was accepted but the post-state did not change. Exits 3.
+- `unsupported` — the BN command was rejected (e.g. unknown activity). Exits 3.
+
+Re-run `bn workflow machine overrides --activity <name>` to confirm the live state independently after a non-preview write.
+
+### Machine Control + Breakpoints
+
+`bn workflow machine` exposes the imperative WorkflowMachine verbs. These mutate runtime state with no preview lane — Binary Ninja itself does not provide one. Each command surfaces BN's `accepted` flag plus the post-call `machine_state` snapshot.
+
+```bash
+bn workflow machine enable
+bn workflow machine disable
+bn workflow machine step
+bn workflow machine halt
+bn workflow machine reset
+bn workflow machine run                               # advanced=true, incremental=false
+bn workflow machine run --no-advanced --incremental
+bn workflow machine resume
+bn workflow machine breakpoint list
+bn workflow machine breakpoint set core.function.analyzeTailCalls core.function.checkForReturn
+bn workflow machine breakpoint clear core.function.analyzeTailCalls
+```
+
+`accepted: false` is **not** an error in this lane — `halt` is rejected when the machine is idle, `step` is rejected with no breakpoints set, and so on. The CLI exits 0 in either case; inspect `accepted` and `machine_state` to decide what to do next. A typical introspection loop:
+
+1. `bn workflow machine enable`
+2. `bn workflow machine breakpoint set <activity>`
+3. `bn workflow machine run`
+4. `bn workflow machine status` to see where it stopped
+5. `bn workflow machine step` / `resume` to continue
+
 ## Caller-Static Mapping
 
 Prefer `bn callsites` over ad hoc `py exec` when the task is "find exact native RNG return-address callers" or any similar direct-call mapping workflow.
