@@ -236,6 +236,47 @@ class _FakeBV:
         return b"\x90" * length
 
 
+class _FakeBVFile:
+    def __init__(self, filename: str = "", session_id: str = ""):
+        self.filename = filename
+        self.session_id = session_id
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeAnalysisProgress:
+    def __init__(self, state_name: str = "Idle", count: int = 0, total: int = 0):
+        self.state = types.SimpleNamespace(name=state_name)
+        self.count = count
+        self.total = total
+
+
+class _FakeHeadlessBV(_FakeBV):
+    def __init__(self, *, filename: str = "", session_id: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.file = _FakeBVFile(filename=filename, session_id=session_id)
+        self.analysis_progress = _FakeAnalysisProgress(state_name="Idle")
+        self.analysis_calls = 0
+        self.created_database_at: str | None = None
+        self.snapshots_saved = 0
+
+    def update_analysis_and_wait(self):
+        self.analysis_calls += 1
+        self.analysis_progress = _FakeAnalysisProgress(state_name="Idle")
+
+    def create_database(self, path: str):
+        self.created_database_at = str(path)
+        Path(path).write_bytes(b"fake-bndb")
+        self.file = _FakeBVFile(filename=str(path), session_id=self.file.session_id)
+        return True
+
+    def save_auto_snapshot(self):
+        self.snapshots_saved += 1
+        return True
+
+
 class _FakeType:
     def __init__(self, decl: str, *, width: int = 0, members=None, type_class: str = "StructureTypeClass"):
         self._decl = decl
@@ -1870,3 +1911,236 @@ def test_collect_open_views_uses_tabs_api(monkeypatch):
 
     assert len(views) == 3
     assert set(id(view) for view in views) == {id(view_a), id(view_b), id(view_c)}
+
+
+def test_target_manager_explicit_register_unregister_most_recent(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager(mode="headless")
+
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    bv_b = _FakeHeadlessBV(filename="/tmp/b.so", session_id="sess-b")
+
+    record_a = manager.register(bv_a)
+    record_b = manager.register(bv_b)
+
+    assert manager.most_recent() is bv_b
+
+    listed = manager.refresh()
+    actives = [item for item in listed if item["active"]]
+    assert len(actives) == 1
+    assert actives[0]["target_id"] == record_b.target_id()
+
+    removed = manager.unregister(record_b.view_id)
+    assert removed is not None
+    assert manager.most_recent() is bv_a
+    assert all(item["target_id"] != record_b.target_id() for item in manager.refresh())
+    assert manager.unregister(record_b.view_id) is None
+    # `record_a` is still alive
+    assert any(item["target_id"] == record_a.target_id() for item in manager.refresh())
+
+
+def test_load_target_op_registers_target_and_runs_analysis(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/app.so", session_id="sess-app")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+
+    result = instance._load_target(path="/tmp/app.so", analysis="wait", options=None)
+
+    assert bv.analysis_calls == 1
+    assert result["filename"] == "/tmp/app.so"
+    assert any(item["target_id"] == result["target_id"] for item in instance.targets.refresh())
+
+
+def test_load_target_op_respects_no_update_analysis(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/app.so", session_id="sess-app")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+
+    instance._load_target(path="/tmp/app.so", analysis="skip", options=None)
+
+    assert bv.analysis_calls == 0
+
+
+def test_load_target_op_async_returns_queued_immediately_and_loads_in_thread(monkeypatch):
+    import time
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/app.so", session_id="sess-app")
+    load_calls: list[tuple[str, dict]] = []
+
+    def fake_load(path, **kwargs):
+        load_calls.append((path, kwargs))
+        return bv
+
+    monkeypatch.setattr(bridge.bn, "load", fake_load, raising=False)
+
+    result = instance._load_target(path="/tmp/app.so", analysis="async", options=None)
+
+    assert result["queued"] is True
+    assert result["path"] == "/tmp/app.so"
+    assert "load_id" in result
+
+    deadline = time.time() + 1.0
+    while (not load_calls or bv.analysis_calls < 1) and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(load_calls) == 1
+    assert bv.analysis_calls == 1
+    assert any(item["target_id"] for item in instance.targets.refresh())
+
+    deadline = time.time() + 1.0
+    attempts = []
+    while time.time() < deadline:
+        attempts = instance._list_loads()
+        if attempts and attempts[-1]["status"] == "succeeded":
+            break
+        time.sleep(0.01)
+    assert attempts[-1]["status"] == "succeeded"
+    assert attempts[-1]["load_id"] == result["load_id"]
+    assert attempts[-1]["target_id"] is not None
+    assert attempts[-1]["error"] is None
+
+
+def test_load_target_op_async_records_load_failure(monkeypatch):
+    import time
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+
+    def fake_load(path, **kwargs):
+        raise RuntimeError("simulated load failure")
+
+    monkeypatch.setattr(bridge.bn, "load", fake_load, raising=False)
+
+    result = instance._load_target(path="/tmp/bad.so", analysis="async", options=None)
+    assert result["queued"] is True
+
+    deadline = time.time() + 1.0
+    attempts = []
+    while time.time() < deadline:
+        attempts = instance._list_loads()
+        if attempts and attempts[-1]["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert attempts[-1]["status"] == "failed"
+    assert "simulated load failure" in (attempts[-1]["error"] or "")
+    assert attempts[-1]["target_id"] is None
+    assert instance.targets.refresh() == []
+
+
+def test_list_loads_bounded_to_limit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    for i in range(bridge.LOAD_ATTEMPTS_LIMIT + 5):
+        instance._record_load_start(f"/tmp/x{i}.so")
+    attempts = instance._list_loads()
+    assert len(attempts) == bridge.LOAD_ATTEMPTS_LIMIT
+    # Oldest dropped (path x0..x4); newest preserved
+    assert attempts[0]["path"] == "/tmp/x5.so"
+    assert attempts[-1]["path"] == f"/tmp/x{bridge.LOAD_ATTEMPTS_LIMIT + 4}.so"
+
+
+def test_load_target_op_rejects_unknown_analysis_value(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: _FakeHeadlessBV(), raising=False)
+    with pytest.raises(RuntimeError, match="analysis must be one of"):
+        instance._load_target(path="/tmp/x.so", analysis="nonsense", options=None)
+
+
+def test_load_target_op_rejected_in_gui_mode(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="gui")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: _FakeHeadlessBV(), raising=False)
+
+    with pytest.raises(RuntimeError, match="headless mode"):
+        instance._load_target(path="/tmp/app.so", analysis="skip", options=None)
+
+
+def test_close_target_op_unregisters_and_closes_file(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/app.so", session_id="sess-app")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path="/tmp/app.so", analysis="skip", options=None)
+
+    result = instance._close_target("active")
+
+    assert result["closed"] is True
+    assert bv.file.closed is True
+    assert instance.targets.refresh() == []
+
+
+def test_save_target_op_creates_new_database(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/raw.bin", session_id="sess-raw")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path="/tmp/raw.bin", analysis="skip", options=None)
+
+    out = tmp_path / "raw.bndb"
+    result = instance._save_target("active", path=str(out))
+
+    assert result["saved_to"] == str(out)
+    assert result["is_new_database"] is True
+    assert out.exists()
+
+
+def test_save_target_op_rejects_raw_binary_without_path(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/raw.bin", session_id="sess-raw")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path="/tmp/raw.bin", analysis="skip", options=None)
+
+    with pytest.raises(RuntimeError, match="No .bndb path"):
+        instance._save_target("active", path=None)
+
+
+def test_save_target_op_overwrites_existing_bndb(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    existing = tmp_path / "existing.bndb"
+    existing.write_bytes(b"old")
+    bv = _FakeHeadlessBV(filename=str(existing), session_id="sess-existing")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path=str(existing), analysis="skip", options=None)
+
+    result = instance._save_target("active", path=None)
+
+    assert result["saved_to"] == str(existing)
+    assert result["is_new_database"] is False
+    assert bv.snapshots_saved == 1
+
+
+def test_analysis_status_op_returns_progress(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/app.so", session_id="sess-app")
+    bv.analysis_progress = _FakeAnalysisProgress(state_name="Analyzing", count=3, total=10)
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path="/tmp/app.so", analysis="skip", options=None)
+
+    status = instance._analysis_status("active")
+
+    assert status["state"] == "Analyzing"
+    assert status["count"] == 3
+    assert status["total"] == 10
+    assert status["done"] is False
+
+
+def test_active_resolves_to_most_recent_in_headless(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    bv_b = _FakeHeadlessBV(filename="/tmp/b.so", session_id="sess-b")
+
+    loads = iter([bv_a, bv_b])
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: next(loads), raising=False)
+    instance._load_target(path="/tmp/a.so", analysis="skip", options=None)
+    instance._load_target(path="/tmp/b.so", analysis="skip", options=None)
+
+    assert instance._resolve_view("active") is bv_b
+    assert instance._resolve_view(None) is bv_b

@@ -11,13 +11,25 @@ from typing import Any, Callable
 from . import api_docs
 from .output import write_output_result
 from .paths import (
+    DAEMON_MODES,
     SKILL_CLIENTS,
+    bridge_registry_path,
+    bridge_socket_path,
+    current_daemon_mode_path,
     plugin_install_dir,
     plugin_source_dir,
     skill_install_dir_for,
     skill_source_dir,
 )
-from .transport import BridgeError, _send_request_to_instance, list_instances, send_request
+from .transport import (
+    BridgeError,
+    BridgeInstance,
+    _send_request_to_instance,
+    list_instances,
+    read_current_daemon_mode,
+    send_request,
+    write_current_daemon_mode,
+)
 from .version import VERSION, build_id_for_file
 
 FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
@@ -229,10 +241,16 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
     )
     targets = list(response["result"])
+    if not targets:
+        raise BridgeError(
+            "No BinaryView targets are loaded. "
+            "Load one with `bn target load <path>` (headless) or open it in Binary Ninja."
+        )
     if len(targets) == 1:
         return "active"
-    if not targets:
-        raise BridgeError("No BinaryView targets are open in the GUI")
+    active_count = sum(1 for item in targets if isinstance(item, dict) and item.get("active"))
+    if active_count == 1:
+        return "active"
     raise BridgeError(
         "This command requires --target when multiple targets are open.\n"
         f"Open targets:\n{_render_target_choices(targets)}"
@@ -1093,6 +1111,236 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_daemon_mode_for_action(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "mode", None)
+    if explicit:
+        return explicit
+    sticky = read_current_daemon_mode()
+    if sticky:
+        return sticky
+    instances = list_instances()
+    if len(instances) == 1:
+        return instances[0].mode
+    if not instances:
+        raise BridgeError(
+            "No running daemon to act on. Start one with `bn daemon start` or pass `--mode <mode>`."
+        )
+    modes = sorted({instance.mode for instance in instances})
+    raise BridgeError(
+        f"Multiple daemons are running ({', '.join(modes)}); pass `--mode <mode>` or run `bn daemon use <mode>`."
+    )
+
+
+def _find_instance(mode: str) -> BridgeInstance | None:
+    for instance in list_instances():
+        if instance.mode == mode:
+            return instance
+    return None
+
+
+def _render_daemon_list_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    instances = list(value.get("instances") or [])
+    sticky = value.get("sticky_mode")
+    if not instances:
+        suffix = f"\nsticky mode: {sticky}" if sticky else ""
+        return "no running daemons" + suffix
+    lines = []
+    if sticky:
+        lines.append(f"sticky mode: {sticky}")
+    else:
+        lines.append("sticky mode: <unset>")
+    lines.append("")
+    for item in instances:
+        flag = " [current]" if sticky and item.get("mode") == sticky else ""
+        lines.append(
+            f"- mode={item.get('mode', '<unknown>')}  pid={item.get('pid', '?')}  "
+            f"socket={item.get('socket_path', '<unknown>')}  targets={item.get('target_count', '?')}{flag}"
+        )
+    return "\n".join(lines)
+
+
+def _render_daemon_status_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if not value.get("running"):
+        return f"daemon mode={value.get('mode', '<unknown>')} is not running"
+    lines = [
+        f"mode: {value.get('mode')}",
+        f"pid: {value.get('pid')}",
+        f"socket: {value.get('socket_path')}",
+        f"registry: {value.get('registry_path')}",
+        f"plugin_version: {value.get('plugin_version')}",
+        f"target_count: {value.get('target_count')}",
+    ]
+    if value.get("started_at"):
+        lines.append(f"started_at: {value['started_at']}")
+    return "\n".join(lines)
+
+
+def _render_daemon_use_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    mode = value.get("mode")
+    if mode is None:
+        return "sticky daemon mode cleared"
+    return f"sticky daemon mode set to: {mode}"
+
+
+def _instance_summary(instance: BridgeInstance) -> dict[str, Any]:
+    return {
+        "mode": instance.mode,
+        "pid": instance.pid,
+        "socket_path": str(instance.socket_path),
+        "registry_path": str(instance.registry_path),
+        "plugin_version": instance.plugin_version,
+        "started_at": instance.started_at,
+    }
+
+
+def _query_target_count(instance: BridgeInstance) -> int | None:
+    try:
+        response = _send_request_to_instance(
+            instance, "list_targets", params={}, target=None, timeout=2.0
+        )
+    except Exception:
+        return None
+    result = response.get("result")
+    if isinstance(result, list):
+        return len(result)
+    return None
+
+
+def _daemon_start(args: argparse.Namespace) -> int:
+    mode = args.mode or "headless"
+    if mode == "gui":
+        raise BridgeError(
+            "GUI bridge is started automatically by the Binary Ninja plugin; use Binary Ninja itself."
+        )
+    existing = _find_instance(mode)
+    if existing is not None:
+        raise BridgeError(
+            f"Daemon mode `{mode}` is already running (pid {existing.pid}). "
+            "Stop it first with `bn daemon stop`."
+        )
+    plugin_root = plugin_source_dir().parent
+    if str(plugin_root) not in sys.path:
+        sys.path.insert(0, str(plugin_root))
+    try:
+        from bn_agent_bridge import bridge as headless_bridge  # noqa: WPS433
+    except ImportError as exc:
+        raise BridgeError(
+            f"Failed to import Binary Ninja headless bridge ({exc}). "
+            "Ensure Binary Ninja is installed and `binaryninja` is on PYTHONPATH."
+        ) from exc
+    return headless_bridge._run_headless(foreground=args.foreground)
+
+
+def _daemon_stop(args: argparse.Namespace) -> int:
+    import signal
+
+    mode = _resolve_daemon_mode_for_action(args)
+    instance = _find_instance(mode)
+    if instance is None:
+        raise BridgeError(f"No `{mode}` daemon is running")
+    if mode == "gui":
+        raise BridgeError(
+            "Refusing to stop the GUI bridge from the CLI; quit Binary Ninja itself."
+        )
+    try:
+        os.kill(instance.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    _render_result(
+        {
+            "stopped": True,
+            "mode": mode,
+            "pid": instance.pid,
+            "warning": "Any unsaved analysis on running targets has been discarded.",
+        },
+        fmt=args.format,
+        out_path=args.out,
+        stem="daemon-stop",
+    )
+    return 0
+
+
+def _daemon_status(args: argparse.Namespace) -> int:
+    mode = args.mode or read_current_daemon_mode()
+    if mode is None:
+        instances = list_instances()
+        if len(instances) == 1:
+            mode = instances[0].mode
+        elif not instances:
+            raise BridgeError("No running daemon. Pass --mode to ask about a specific mode.")
+        else:
+            modes = sorted({i.mode for i in instances})
+            raise BridgeError(
+                f"Multiple daemons running ({', '.join(modes)}); pass --mode <mode>."
+            )
+
+    instance = _find_instance(mode)
+    if instance is None:
+        payload: dict[str, Any] = {"mode": mode, "running": False}
+    else:
+        payload = {"mode": mode, "running": True, **_instance_summary(instance)}
+        target_count = _query_target_count(instance)
+        if target_count is not None:
+            payload["target_count"] = target_count
+
+    if args.format == "text":
+        result = _render_daemon_status_text(payload)
+    else:
+        result = payload
+    _render_result(result, fmt=args.format, out_path=args.out, stem="daemon-status")
+    return 0
+
+
+def _daemon_list(args: argparse.Namespace) -> int:
+    instances = list_instances()
+    sticky = read_current_daemon_mode()
+    items: list[dict[str, Any]] = []
+    for instance in instances:
+        item = _instance_summary(instance)
+        count = _query_target_count(instance)
+        if count is not None:
+            item["target_count"] = count
+        items.append(item)
+    payload = {"sticky_mode": sticky, "instances": items}
+    if args.format == "text":
+        result = _render_daemon_list_text(payload)
+    else:
+        result = payload
+    _render_result(result, fmt=args.format, out_path=args.out, stem="daemon-list")
+    return 0
+
+
+def _daemon_use(args: argparse.Namespace) -> int:
+    if args.clear:
+        if args.mode_value is not None:
+            raise BridgeError("Pass either <mode> or --clear, not both")
+        write_current_daemon_mode(None)
+        result: dict[str, Any] = {"mode": None}
+    else:
+        if args.mode_value is None:
+            raise BridgeError("Pass a daemon mode (gui|headless) or --clear")
+        if args.mode_value not in DAEMON_MODES:
+            raise BridgeError(
+                f"Unknown daemon mode: {args.mode_value!r} (expected one of {DAEMON_MODES})"
+            )
+        write_current_daemon_mode(args.mode_value)
+        result = {"mode": args.mode_value}
+
+    if args.format == "text":
+        rendered = _render_daemon_use_text(result)
+    else:
+        rendered = result
+    _render_result(rendered, fmt=args.format, out_path=args.out, stem="daemon-use")
+    return 0
+
+
 def _target_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1125,6 +1373,147 @@ def _refresh(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_refresh_text,
         stem="refresh",
+    )
+
+
+def _parse_option_kv(entry: str) -> tuple[str, Any]:
+    if "=" not in entry:
+        raise BridgeError(f"--option expects KEY=VALUE, got: {entry!r}")
+    key, _, raw = entry.partition("=")
+    key = key.strip()
+    if not key:
+        raise BridgeError(f"--option key is empty in: {entry!r}")
+    raw = raw.strip()
+    try:
+        value: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        value = raw
+    return key, value
+
+
+def _collect_load_options(args: argparse.Namespace) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    if args.options_json:
+        try:
+            parsed = json.loads(args.options_json)
+        except json.JSONDecodeError as exc:
+            raise BridgeError(f"--options-json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise BridgeError("--options-json must encode a JSON object")
+        merged.update(parsed)
+    for entry in args.options or []:
+        key, value = _parse_option_kv(entry)
+        merged[key] = value
+    return merged or None
+
+
+def _target_load(args: argparse.Namespace) -> int:
+    if not args.update_analysis:
+        analysis = "skip"
+    elif args.async_load:
+        analysis = "async"
+    else:
+        analysis = "wait"
+    params: dict[str, Any] = {
+        "path": str(Path(args.path).expanduser().resolve()),
+        "analysis": analysis,
+    }
+    options = _collect_load_options(args)
+    if options is not None:
+        params["options"] = options
+    response = send_request("load_target", params=params, target=None)
+    _render_result(
+        response["result"],
+        fmt=args.format,
+        out_path=args.out,
+        stem="target-load",
+    )
+    return 0
+
+
+def _target_close(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "close_target",
+        {"target": args.target or "active"},
+        require_target=False,
+        stem="target-close",
+    )
+
+
+def _target_save(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.path is not None:
+        params["path"] = str(Path(args.path).expanduser().resolve())
+    return _call(
+        args,
+        "save_target",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="target-save",
+    )
+
+
+def _render_analysis_status_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    state = value.get("state") or "<unknown>"
+    count = value.get("count")
+    total = value.get("total")
+    done = value.get("done")
+    pieces = [f"state: {state}"]
+    if count is not None and total is not None:
+        pieces.append(f"progress: {count}/{total}")
+    pieces.append(f"done: {bool(done)}")
+    return "\n".join(pieces)
+
+
+def _target_status(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "analysis_status",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_analysis_status_text,
+        stem="target-status",
+    )
+
+
+def _render_target_loads_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "no recent load attempts"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        load_id = item.get("load_id", "?")
+        status = item.get("status", "?")
+        path = item.get("path", "?")
+        lines.append(f"- {load_id}  {status:<10}  {path}")
+        if item.get("started_at"):
+            lines.append(f"    started:   {item['started_at']}")
+        if item.get("completed_at"):
+            lines.append(f"    completed: {item['completed_at']}")
+        if item.get("target_id"):
+            lines.append(f"    target_id: {item['target_id']}")
+        if item.get("error"):
+            lines.append(f"    error:     {item['error']}")
+    return "\n".join(lines)
+
+
+def _target_loads(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_loads",
+        {},
+        require_target=False,
+        text_renderer=_render_target_loads_text,
+        stem="target-loads",
     )
 
 
@@ -1970,6 +2359,73 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(skill_install, default_format="json")
     skill_install.set_defaults(handler=_skill_install)
 
+    daemon = subparsers.add_parser(
+        "daemon",
+        help="Manage bn bridge daemons (GUI bridge and headless daemon)",
+    )
+    daemon_sub = daemon.add_subparsers(dest="daemon_command")
+
+    daemon_start = daemon_sub.add_parser(
+        "start",
+        help="Start a headless bridge daemon (GUI bridge is auto-started by Binary Ninja itself)",
+    )
+    daemon_start.add_argument(
+        "--mode",
+        choices=DAEMON_MODES,
+        default="headless",
+        help="Daemon mode to start (default: headless)",
+    )
+    daemon_start.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Block on the daemon process (for Docker PID 1 / systemd usage); "
+        "without this flag, only --foreground is currently supported",
+    )
+    _common_io_options(daemon_start, default_format="json")
+    daemon_start.set_defaults(handler=_daemon_start)
+
+    daemon_stop = daemon_sub.add_parser("stop", help="Stop a running daemon")
+    daemon_stop.add_argument(
+        "--mode",
+        choices=DAEMON_MODES,
+        help="Mode of the daemon to stop; defaults to the sticky mode or the only running daemon",
+    )
+    _common_io_options(daemon_stop, default_format="json")
+    daemon_stop.set_defaults(handler=_daemon_stop)
+
+    daemon_status = daemon_sub.add_parser(
+        "status",
+        help="Show one daemon's pid, socket, and target count",
+    )
+    daemon_status.add_argument("--mode", choices=DAEMON_MODES)
+    _common_io_options(daemon_status)
+    daemon_status.set_defaults(handler=_daemon_status)
+
+    daemon_list = daemon_sub.add_parser(
+        "list",
+        help="List all running daemons and which one is sticky",
+    )
+    _common_io_options(daemon_list)
+    daemon_list.set_defaults(handler=_daemon_list)
+
+    daemon_use = daemon_sub.add_parser(
+        "use",
+        help="Pin the current daemon mode; subsequent commands route to it",
+    )
+    daemon_use.add_argument(
+        "mode_value",
+        nargs="?",
+        metavar="MODE",
+        help=f"Daemon mode to make sticky ({'/'.join(DAEMON_MODES)}); omit when using --clear",
+    )
+    daemon_use.add_argument(
+        "--clear",
+        action="store_true",
+        help="Remove the sticky daemon selection",
+    )
+    _common_io_options(daemon_use, default_format="json")
+    daemon_use.set_defaults(handler=_daemon_use)
+
     target = subparsers.add_parser("target", help="Inspect Binary Ninja targets")
     target_sub = target.add_subparsers(dest="target_command")
     target_list = target_sub.add_parser("list", help="List open BinaryView targets")
@@ -1979,6 +2435,82 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(target_info)
     _target_option(target_info, required=False)
     target_info.set_defaults(handler=_target_info)
+
+    target_load = target_sub.add_parser(
+        "load",
+        help="Load a binary into the headless daemon",
+    )
+    target_load.add_argument("path", help="Filesystem path to a binary or .bndb")
+    analysis_group = target_load.add_mutually_exclusive_group()
+    analysis_group.add_argument(
+        "--async",
+        dest="async_load",
+        action="store_true",
+        help="Kick off analysis in the background and return immediately (GUI-style); "
+        "subsequent commands see analysis-in-progress state. Poll `bn target status` for completion.",
+    )
+    analysis_group.add_argument(
+        "--no-update-analysis",
+        dest="update_analysis",
+        action="store_false",
+        default=True,
+        help="Load the BinaryView without starting analysis at all. Run `bn refresh` later when you need it.",
+    )
+    target_load.add_argument(
+        "--option",
+        dest="options",
+        action="append",
+        metavar="KEY=VALUE",
+        help=(
+            "Binary Ninja load option (repeatable). Value is parsed as JSON when possible, "
+            "otherwise passed as a string. Examples: "
+            "--option loader.imageBase=0 --option analysis.mode=full "
+            "--option analysis.linearSweep.autorun=true"
+        ),
+    )
+    target_load.add_argument(
+        "--options-json",
+        dest="options_json",
+        help="Raw JSON object of load options; merged with --option entries (--option wins on conflict)",
+    )
+    _common_io_options(target_load, default_format="json")
+    target_load.set_defaults(handler=_target_load)
+
+    target_close = target_sub.add_parser(
+        "close",
+        help="Close a loaded target (headless daemon only)",
+    )
+    _common_io_options(target_close, default_format="json")
+    _target_option(target_close, required=False)
+    target_close.set_defaults(handler=_target_close)
+
+    target_save = target_sub.add_parser(
+        "save",
+        help="Save the target's analysis database (.bndb)",
+    )
+    target_save.add_argument(
+        "--path",
+        type=Path,
+        help="Write a new .bndb at this path (required the first time)",
+    )
+    _common_io_options(target_save, default_format="json")
+    _target_option(target_save, required=False)
+    target_save.set_defaults(handler=_target_save)
+
+    target_status = target_sub.add_parser(
+        "status",
+        help="Show analysis progress for a target (use after `bn target load --async`)",
+    )
+    _common_io_options(target_status)
+    _target_option(target_status, required=False)
+    target_status.set_defaults(handler=_target_status)
+
+    target_loads = target_sub.add_parser(
+        "loads",
+        help="List recent `--async` load attempts (status + errors)",
+    )
+    _common_io_options(target_loads)
+    target_loads.set_defaults(handler=_target_loads)
 
     refresh = subparsers.add_parser("refresh", help="Refresh analysis for the selected target")
     _common_io_options(refresh)
