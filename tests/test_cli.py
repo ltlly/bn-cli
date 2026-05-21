@@ -2191,3 +2191,51 @@ def test_daemon_list_shows_no_running_daemons_when_empty(monkeypatch, tmp_path, 
     assert rc == 0
     out = capsys.readouterr().out
     assert "no running daemons" in out
+
+
+def test_daemon_start_background_spawns_subprocess_and_waits_for_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    captured_cmd: list[list[str]] = []
+
+    class _FakePopen:
+        pid = 4242
+
+        def __init__(self, cmd, **kwargs):
+            captured_cmd.append(cmd)
+            registry = tmp_path / "daemons" / "headless.json"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            socket_path = tmp_path / "fake.sock"
+            socket_path.write_text("")
+            registry.write_text(
+                '{"pid": 4242, "socket_path": "' + str(socket_path) + '", '
+                '"plugin_name": "bn_agent_bridge", "plugin_version": "0.1.0", "mode": "headless"}'
+            )
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    monkeypatch.setattr("bn.transport._socket_probe_error", lambda *_a, **_kw: None)
+
+    rc = bn.cli.main(["daemon", "start"])
+    assert rc == 0
+    assert captured_cmd, "background path must spawn a subprocess"
+    assert "--foreground" in captured_cmd[0]
+    assert "--mode" in captured_cmd[0]
+    assert "headless" in captured_cmd[0]
+
+
+def test_daemon_start_background_errors_when_registry_never_appears(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    class _FakePopen:
+        pid = 5151
+
+        def __init__(self, cmd, **kwargs):
+            pass
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    # Shrink the wait to a fraction of a second to keep tests fast.
+    monkeypatch.setattr("bn.cli._wait_for_registry", lambda mode, *, timeout: False)
+
+    rc = bn.cli.main(["daemon", "start"])
+    assert rc == 2
+    assert "did not register" in capsys.readouterr().err

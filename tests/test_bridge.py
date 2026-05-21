@@ -2042,6 +2042,136 @@ def test_list_loads_bounded_to_limit(monkeypatch):
     assert attempts[-1]["path"] == f"/tmp/x{bridge.LOAD_ATTEMPTS_LIMIT + 4}.so"
 
 
+def test_per_target_locks_allow_concurrent_reads_on_distinct_targets(monkeypatch):
+    import threading
+    import time
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    bv_b = _FakeHeadlessBV(filename="/tmp/b.so", session_id="sess-b")
+    record_a = instance.targets.register(bv_a)
+    record_b = instance.targets.register(bv_b)
+    lock_a = instance._get_target_lock(record_a.view_id)
+    lock_b = instance._get_target_lock(record_b.view_id)
+    # Distinct locks — different view_ids must get different lock instances.
+    assert lock_a is not lock_b
+
+    # Hold A's write lock; B's read lock should still be acquirable without blocking.
+    barrier = threading.Event()
+    grabbed_b = threading.Event()
+
+    def hold_a():
+        with lock_a.write():
+            barrier.wait()
+
+    def grab_b():
+        with lock_b.read():
+            grabbed_b.set()
+
+    holder = threading.Thread(target=hold_a)
+    grabber = threading.Thread(target=grab_b)
+    holder.start()
+    grabber.start()
+    assert grabbed_b.wait(timeout=1.0), "per-target locks should not block across targets"
+    barrier.set()
+    holder.join(timeout=1.0)
+    grabber.join(timeout=1.0)
+
+
+def test_concurrent_loads_serialize_on_load_lock(monkeypatch):
+    import threading
+    import time
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+
+    active = [0]
+    peak = [0]
+    state_lock = threading.Lock()
+    block = threading.Event()
+    entered = threading.Event()
+
+    def slow_load(path, **kwargs):
+        with state_lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        entered.set()
+        block.wait(timeout=2.0)
+        with state_lock:
+            active[0] -= 1
+        return _FakeHeadlessBV(filename=path, session_id=f"sess-{path}")
+
+    monkeypatch.setattr(bridge.bn, "load", slow_load, raising=False)
+
+    threads = [
+        threading.Thread(
+            target=instance._load_target,
+            kwargs={"path": f"/tmp/{i}.so", "analysis": "skip", "options": None},
+        )
+        for i in range(3)
+    ]
+    for t in threads:
+        t.start()
+    entered.wait(timeout=1.0)
+    # First load is inside slow_load; the other two should be queued behind _load_lock.
+    time.sleep(0.05)
+    with state_lock:
+        assert active[0] == 1
+    block.set()
+    for t in threads:
+        t.join(timeout=2.0)
+    # Peak parallelism inside bn.load must never exceed 1.
+    assert peak[0] == 1
+    # All three loads registered their BVs.
+    assert len(instance.targets.refresh()) == 3
+
+
+def test_close_target_waits_for_in_flight_op_on_same_target(monkeypatch):
+    import threading
+    import time
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path="/tmp/x.so", analysis="skip", options=None)
+    view_id = instance.targets.view_id_for(bv)
+    assert view_id is not None
+    target_lock = instance._get_target_lock(view_id)
+
+    in_flight = threading.Event()
+    proceed = threading.Event()
+
+    def in_flight_read():
+        with target_lock.read():
+            in_flight.set()
+            proceed.wait()
+
+    reader = threading.Thread(target=in_flight_read)
+    reader.start()
+    in_flight.wait(timeout=1.0)
+
+    close_done = threading.Event()
+
+    def close_after_release():
+        instance._close_target(view_id)
+        close_done.set()
+
+    closer = threading.Thread(target=close_after_release)
+    closer.start()
+    # The closer must NOT finish while the read lock is held.
+    assert not close_done.wait(timeout=0.2)
+    proceed.set()
+    assert close_done.wait(timeout=1.0)
+
+    reader.join(timeout=1.0)
+    closer.join(timeout=1.0)
+    # After close, lock entry must be gone too.
+    with instance._target_locks_lock:
+        assert view_id not in instance._target_locks
+
+
 def test_load_target_op_rejects_unknown_analysis_value(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge(mode="headless")
