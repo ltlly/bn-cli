@@ -569,6 +569,7 @@ class LoadAttempt:
     status: str
     completed_at: str | None = None
     error: str | None = None
+    traceback: str | None = None
     target_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -579,6 +580,7 @@ class LoadAttempt:
             "status": self.status,
             "completed_at": self.completed_at,
             "error": self.error,
+            "traceback": self.traceback,
             "target_id": self.target_id,
         }
 
@@ -631,6 +633,7 @@ class BinaryNinjaBridge:
         *,
         success: bool,
         error: str | None = None,
+        traceback_text: str | None = None,
         target_id: str | None = None,
     ) -> None:
         with self._load_attempts_lock:
@@ -639,6 +642,7 @@ class BinaryNinjaBridge:
                     attempt.status = "succeeded" if success else "failed"
                     attempt.completed_at = datetime.now(timezone.utc).isoformat()
                     attempt.error = error
+                    attempt.traceback = traceback_text
                     attempt.target_id = target_id
                     return
 
@@ -966,7 +970,10 @@ class BinaryNinjaBridge:
                     self._record_load_done(load_id, success=True, target_id=target_id)
                 except Exception as exc:  # noqa: BLE001
                     self._record_load_done(
-                        load_id, success=False, error=f"{type(exc).__name__}: {exc}"
+                        load_id,
+                        success=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                        traceback_text=traceback.format_exc(),
                     )
 
             threading.Thread(

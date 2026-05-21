@@ -1581,6 +1581,10 @@ def _render_target_loads_text(value: Any) -> str:
             lines.append(f"    target_id: {item['target_id']}")
         if item.get("error"):
             lines.append(f"    error:     {item['error']}")
+        if item.get("traceback"):
+            lines.append("    traceback:")
+            for tb_line in item["traceback"].rstrip().splitlines():
+                lines.append(f"      {tb_line}")
     return "\n".join(lines)
 
 
