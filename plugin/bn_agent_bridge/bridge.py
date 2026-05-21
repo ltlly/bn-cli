@@ -142,9 +142,24 @@ WRITE_LOCKED_OPS = {
     "workflow_machine_resume",
     "workflow_machine_breakpoint_set",
     "workflow_machine_breakpoint_clear",
+    "save_target",
+}
+
+
+# Ops that operate on TargetManager structure (registry-level), not a specific BV.
+# Held under the bridge's global write lock so the locks dict stays consistent.
+GLOBAL_OPS = {
     "load_target",
     "close_target",
-    "save_target",
+}
+
+
+# Ops that maintain their own locking (no need to acquire bridge-level locks).
+NO_LOCK_OPS = {
+    "list_loads",
+    "list_targets",
+    "target_info",
+    "doctor",
 }
 
 
@@ -576,9 +591,24 @@ class BinaryNinjaBridge:
         self.registry_path = bridge_registry_path(mode)
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
-        self._target_lock = _ReadWriteLock()
+        self._target_locks: dict[str, _ReadWriteLock] = {}
+        self._target_locks_lock = threading.Lock()
+        self._global_lock = _ReadWriteLock()
         self._load_attempts: list[LoadAttempt] = []
         self._load_attempts_lock = threading.Lock()
+        self._load_lock = threading.Lock()
+
+    def _get_target_lock(self, view_id: str) -> _ReadWriteLock:
+        with self._target_locks_lock:
+            lock = self._target_locks.get(view_id)
+            if lock is None:
+                lock = _ReadWriteLock()
+                self._target_locks[view_id] = lock
+            return lock
+
+    def _remove_target_lock(self, view_id: str) -> None:
+        with self._target_locks_lock:
+            self._target_locks.pop(view_id, None)
 
     def _record_load_start(self, path: str) -> str:
         import uuid as _uuid
@@ -658,13 +688,30 @@ class BinaryNinjaBridge:
         params = payload.get("params") or {}
         target = payload.get("target")
         try:
-            lock = contextlib.nullcontext()
-            if op in WRITE_LOCKED_OPS:
-                lock = self._target_lock.write()
-            elif op in READ_LOCKED_OPS:
-                lock = self._target_lock.read()
-            with lock:
+            if op in NO_LOCK_OPS:
                 result = self._dispatch_on_main(op, params, target)
+                return _json_response(ok=True, result=result)
+            if op in GLOBAL_OPS:
+                with self._global_lock.write():
+                    result = self._dispatch_on_main(op, params, target)
+                return _json_response(ok=True, result=result)
+            if op in WRITE_LOCKED_OPS or op in READ_LOCKED_OPS:
+                # _global_lock.read protects target resolution + lock-dict lookup
+                # from racing with concurrent close_target (which holds .write).
+                with self._global_lock.read():
+                    bv = self.targets.resolve(target)
+                    view_id = self.targets.view_id_for(bv)
+                    if view_id is None:
+                        raise RuntimeError(f"Target not registered: {target!r}")
+                    target_lock = self._get_target_lock(view_id)
+                    lock_ctx = (
+                        target_lock.write() if op in WRITE_LOCKED_OPS else target_lock.read()
+                    )
+                    with lock_ctx:
+                        result = self._dispatch_on_main(op, params, target)
+                return _json_response(ok=True, result=result)
+            # Fallback for ops without a declared lock class.
+            result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
@@ -943,15 +990,19 @@ class BinaryNinjaBridge:
         load_kwargs: dict[str, Any] = {"update_analysis": False}
         if isinstance(options, dict):
             load_kwargs["options"] = options
-        try:
-            bv = bn.load(path, **load_kwargs)
-        except Exception as exc:
-            bn.log_error(f"bn load_target failed for {path}: {exc}")
-            raise
-        if bv is None:
-            bn.log_error(f"bn load_target returned None for {path}")
-            raise RuntimeError(f"Binary Ninja could not load: {path}")
-        record = self.targets.register(bv)
+        # Serialize concurrent bn.load() calls; BN core is not guaranteed
+        # thread-safe for simultaneous BinaryView creation. Analysis ran outside
+        # the lock so different BVs can analyze in parallel.
+        with self._load_lock:
+            try:
+                bv = bn.load(path, **load_kwargs)
+            except Exception as exc:
+                bn.log_error(f"bn load_target failed for {path}: {exc}")
+                raise
+            if bv is None:
+                bn.log_error(f"bn load_target returned None for {path}")
+                raise RuntimeError(f"Binary Ninja could not load: {path}")
+            record = self.targets.register(bv)
         if run_analysis:
             bv.update_analysis_and_wait()
         return self._target_info(record.target_id())
@@ -966,13 +1017,18 @@ class BinaryNinjaBridge:
         view_id = self.targets.view_id_for(bv)
         if view_id is None:
             raise RuntimeError(f"Target not found in registry: {selector}")
-        record = self.targets.unregister(view_id)
-        target_id = record.target_id() if record is not None else None
-        try:
-            if bv.file is not None:
-                bv.file.close()
-        except Exception:
-            pass
+        # Acquire the per-target write lock to wait for any in-flight ops on this BV
+        # before we unregister + close. dispatch() already holds _global_lock.write
+        # for close_target, so no new target-bound ops can start during this.
+        with self._get_target_lock(view_id).write():
+            record = self.targets.unregister(view_id)
+            self._remove_target_lock(view_id)
+            target_id = record.target_id() if record is not None else None
+            try:
+                if bv.file is not None:
+                    bv.file.close()
+            except Exception:
+                pass
         return {
             "closed": True,
             "target_id": target_id,

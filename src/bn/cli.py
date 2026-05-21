@@ -1212,6 +1212,57 @@ def _query_target_count(instance: BridgeInstance) -> int | None:
     return None
 
 
+def _default_daemon_log_path(mode: str) -> Path:
+    from .paths import cache_home
+
+    return cache_home() / "logs" / f"daemon-{mode}.log"
+
+
+def _spawn_detached_daemon(mode: str, *, log_path: Path) -> int:
+    import subprocess
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = log_path.open("ab", buffering=0)
+    try:
+        bn_exe = shutil.which("bn")
+        if bn_exe is not None:
+            cmd = [bn_exe, "daemon", "start", "--mode", mode, "--foreground"]
+        else:
+            cmd = [
+                sys.executable,
+                "-m",
+                "bn",
+                "daemon",
+                "start",
+                "--mode",
+                mode,
+                "--foreground",
+            ]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+    finally:
+        log_fh.close()
+    return proc.pid
+
+
+def _wait_for_registry(mode: str, *, timeout: float) -> bool:
+    import time
+
+    deadline = time.time() + timeout
+    registry = bridge_registry_path(mode)
+    while time.time() < deadline:
+        if registry.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _daemon_start(args: argparse.Namespace) -> int:
     mode = args.mode or "headless"
     if mode == "gui":
@@ -1224,17 +1275,44 @@ def _daemon_start(args: argparse.Namespace) -> int:
             f"Daemon mode `{mode}` is already running (pid {existing.pid}). "
             "Stop it first with `bn daemon stop`."
         )
-    plugin_root = plugin_source_dir().parent
-    if str(plugin_root) not in sys.path:
-        sys.path.insert(0, str(plugin_root))
-    try:
-        from bn_agent_bridge import bridge as headless_bridge  # noqa: WPS433
-    except ImportError as exc:
+
+    if args.foreground:
+        plugin_root = plugin_source_dir().parent
+        if str(plugin_root) not in sys.path:
+            sys.path.insert(0, str(plugin_root))
+        try:
+            from bn_agent_bridge import bridge as headless_bridge  # noqa: WPS433
+        except ImportError as exc:
+            raise BridgeError(
+                f"Failed to import Binary Ninja headless bridge ({exc}). "
+                "Ensure Binary Ninja is installed and `binaryninja` is on PYTHONPATH."
+            ) from exc
+        return headless_bridge._run_headless(foreground=True)
+
+    log_path = Path(args.log).expanduser() if args.log else _default_daemon_log_path(mode)
+    child_pid = _spawn_detached_daemon(mode, log_path=log_path)
+    ready = _wait_for_registry(mode, timeout=10.0)
+    if not ready:
         raise BridgeError(
-            f"Failed to import Binary Ninja headless bridge ({exc}). "
-            "Ensure Binary Ninja is installed and `binaryninja` is on PYTHONPATH."
-        ) from exc
-    return headless_bridge._run_headless(foreground=args.foreground)
+            f"Daemon spawned (pid {child_pid}) but did not register within 10s. "
+            f"Check the log at {log_path}."
+        )
+    instance = _find_instance(mode)
+    daemon_pid = instance.pid if instance is not None else child_pid
+    _render_result(
+        {
+            "started": True,
+            "mode": mode,
+            "pid": daemon_pid,
+            "spawned_pid": child_pid,
+            "log": str(log_path),
+            "message": f"Daemon running in background. Logs at {log_path}.",
+        },
+        fmt=args.format,
+        out_path=args.out,
+        stem="daemon-start",
+    )
+    return 0
 
 
 def _daemon_stop(args: argparse.Namespace) -> int:
@@ -2378,8 +2456,13 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_start.add_argument(
         "--foreground",
         action="store_true",
-        help="Block on the daemon process (for Docker PID 1 / systemd usage); "
-        "without this flag, only --foreground is currently supported",
+        help="Block on the daemon process (for Docker PID 1 / systemd usage). "
+        "Without this flag, the CLI spawns a detached background process and returns.",
+    )
+    daemon_start.add_argument(
+        "--log",
+        type=Path,
+        help="Log file for background daemon stdout/stderr (default: cache_home()/logs/daemon-<mode>.log)",
     )
     _common_io_options(daemon_start, default_format="json")
     daemon_start.set_defaults(handler=_daemon_start)
