@@ -2027,7 +2027,32 @@ def test_load_target_op_async_records_load_failure(monkeypatch):
     assert attempts[-1]["status"] == "failed"
     assert "simulated load failure" in (attempts[-1]["error"] or "")
     assert attempts[-1]["target_id"] is None
+    tb_text = attempts[-1]["traceback"] or ""
+    assert "Traceback" in tb_text
+    assert "simulated load failure" in tb_text
+    assert "fake_load" in tb_text
     assert instance.targets.refresh() == []
+
+
+def test_load_target_op_async_success_has_no_traceback(monkeypatch):
+    import time
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/ok.so", session_id="sess-ok")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv, raising=False)
+    instance._load_target(path="/tmp/ok.so", analysis="async", options=None)
+
+    deadline = time.time() + 1.0
+    attempts = []
+    while time.time() < deadline:
+        attempts = instance._list_loads()
+        if attempts and attempts[-1]["status"] == "succeeded":
+            break
+        time.sleep(0.01)
+    assert attempts[-1]["status"] == "succeeded"
+    assert attempts[-1]["traceback"] is None
+    assert attempts[-1]["error"] is None
 
 
 def test_list_loads_bounded_to_limit(monkeypatch):

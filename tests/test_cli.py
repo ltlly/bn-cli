@@ -2086,6 +2086,7 @@ def test_target_loads_renders_text(monkeypatch, capsys):
                     "completed_at": "2026-01-01T00:00:10+00:00",
                     "target_id": "1:1:1",
                     "error": None,
+                    "traceback": None,
                 },
                 {
                     "load_id": "def",
@@ -2095,6 +2096,12 @@ def test_target_loads_renders_text(monkeypatch, capsys):
                     "completed_at": "2026-01-01T00:01:01+00:00",
                     "target_id": None,
                     "error": "RuntimeError: boom",
+                    "traceback": (
+                        "Traceback (most recent call last):\n"
+                        "  File \"bridge.py\", line 999, in _detached\n"
+                        "    result = self._do_load(path, options, True)\n"
+                        "RuntimeError: boom"
+                    ),
                 },
             ],
         }
@@ -2107,6 +2114,11 @@ def test_target_loads_renders_text(monkeypatch, capsys):
     assert "failed" in out
     assert "/tmp/bad.so" in out
     assert "RuntimeError: boom" in out
+    assert "traceback:" in out
+    assert "  File \"bridge.py\", line 999, in _detached" in out
+    # Success row must not get a traceback header
+    succeeded_block, failed_block = out.split("- def")
+    assert "traceback:" not in succeeded_block
 
 
 def test_target_close_sends_active_when_no_target(monkeypatch):
