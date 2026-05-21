@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import bridge_registry_path
+from .paths import (
+    DAEMON_MODES,
+    bridge_registry_dir,
+    bridge_registry_path,
+    current_daemon_mode_path,
+)
 
 
 class BridgeError(RuntimeError):
@@ -37,6 +42,7 @@ class BridgeInstance:
     plugin_version: str
     started_at: str | None
     meta: dict[str, Any]
+    mode: str = "gui"
 
 
 def _purge_stale_registry(registry_path: Path) -> None:
@@ -52,6 +58,16 @@ def _socket_probe_error(socket_path: Path, timeout: float = 0.2) -> OSError | No
         return None
     except OSError as exc:
         return exc
+
+
+def _mode_for_registry(payload: dict[str, Any], path: Path) -> str:
+    mode = payload.get("mode")
+    if isinstance(mode, str) and mode in DAEMON_MODES:
+        return mode
+    stem = path.stem
+    if stem in DAEMON_MODES:
+        return stem
+    return "gui"
 
 
 def _load_instance(path: Path) -> BridgeInstance | None:
@@ -81,26 +97,87 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         plugin_version=str(payload.get("plugin_version", "0")),
         started_at=payload.get("started_at"),
         meta=payload,
+        mode=_mode_for_registry(payload, path),
     )
 
 
 def list_instances() -> list[BridgeInstance]:
-    fixed_registry = bridge_registry_path()
-    if not fixed_registry.exists():
-        return []
-
+    registry_dir = bridge_registry_dir()
     instances: list[BridgeInstance] = []
-    instance = _load_instance(fixed_registry)
-    if instance is not None:
-        instances.append(instance)
+    seen: set[Path] = set()
+    for mode in DAEMON_MODES:
+        candidate = bridge_registry_path(mode)
+        if not candidate.exists():
+            continue
+        seen.add(candidate)
+        instance = _load_instance(candidate)
+        if instance is not None:
+            instances.append(instance)
+
+    if registry_dir.is_dir():
+        for candidate in sorted(registry_dir.glob("*.json")):
+            if candidate in seen:
+                continue
+            instance = _load_instance(candidate)
+            if instance is not None:
+                instances.append(instance)
     return instances
+
+
+def read_current_daemon_mode() -> str | None:
+    path = current_daemon_mode_path()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text in DAEMON_MODES:
+        return text
+    return None
+
+
+def write_current_daemon_mode(mode: str | None) -> None:
+    path = current_daemon_mode_path()
+    if mode is None:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return
+    if mode not in DAEMON_MODES:
+        raise ValueError(f"Unknown daemon mode: {mode!r} (expected one of {DAEMON_MODES})")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(mode, encoding="utf-8")
+
+
+def _hint_for_multiple_instances(instances: list[BridgeInstance]) -> str:
+    modes = sorted({instance.mode for instance in instances})
+    options = ", ".join(modes)
+    return (
+        f"Multiple daemons are running ({options}). "
+        "Pick one with `bn daemon use <mode>` or unset with `bn daemon use --clear`."
+    )
 
 
 def choose_instance() -> BridgeInstance:
     instances = list_instances()
     if not instances:
-        raise BridgeError("No running Binary Ninja bridge instances found")
-    return instances[0]
+        raise BridgeError(
+            "No running Binary Ninja bridge instances found. "
+            "Start one with `bn daemon start` or open Binary Ninja."
+        )
+
+    sticky = read_current_daemon_mode()
+    if sticky is not None:
+        for instance in instances:
+            if instance.mode == sticky:
+                return instance
+        raise BridgeError(
+            f"Sticky daemon mode is `{sticky}` but no `{sticky}` daemon is running. "
+            "Run `bn daemon list` to see available daemons or `bn daemon use --clear` to drop the selection."
+        )
+
+    if len(instances) == 1:
+        return instances[0]
+
+    raise BridgeError(_hint_for_multiple_instances(instances))
 
 
 def _send_request_to_instance(

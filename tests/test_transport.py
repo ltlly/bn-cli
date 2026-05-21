@@ -11,8 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from bn.paths import bridge_registry_path
-from bn.transport import choose_instance, list_instances, send_request
+from bn.paths import bridge_registry_path, current_daemon_mode_path
+from bn.transport import (
+    BridgeError,
+    choose_instance,
+    list_instances,
+    read_current_daemon_mode,
+    send_request,
+    write_current_daemon_mode,
+)
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -40,7 +47,7 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
     socket_path = Path("/tmp") / f"bn-test-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-    registry_path = bridge_registry_path()
+    registry_path = bridge_registry_path("gui")
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     server = _Server(str(socket_path), _Handler)
@@ -75,7 +82,7 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    registry_path = bridge_registry_path()
+    registry_path = bridge_registry_path("gui")
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     stale_socket_path = Path("/tmp") / f"bn-stale-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
@@ -107,7 +114,7 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
 
 def test_list_instances_preserves_permission_denied_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    registry_path = bridge_registry_path()
+    registry_path = bridge_registry_path("gui")
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path = tmp_path / "bridge.sock"
     socket_path.write_text("", encoding="utf-8")
@@ -309,7 +316,7 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
 
 def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    registry_path = bridge_registry_path()
+    registry_path = bridge_registry_path("gui")
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     socket_path = Path("/tmp") / f"bn-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
@@ -348,7 +355,7 @@ def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    registry_path = bridge_registry_path()
+    registry_path = bridge_registry_path("gui")
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(
         json.dumps(
@@ -371,3 +378,131 @@ def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _write_registry(mode: str, *, pid: int, socket_path: Path) -> Path:
+    registry_path = bridge_registry_path(mode)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+                "mode": mode,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return registry_path
+
+
+def test_list_instances_discovers_both_modes(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+
+    gui_socket = Path("/tmp") / f"bn-gui-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    headless_socket = Path("/tmp") / f"bn-headless-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    gui_server = _Server(str(gui_socket), _Handler)
+    headless_server = _Server(str(headless_socket), _Handler)
+    threading.Thread(target=gui_server.serve_forever, daemon=True).start()
+    threading.Thread(target=headless_server.serve_forever, daemon=True).start()
+
+    try:
+        _write_registry("gui", pid=pid, socket_path=gui_socket)
+        _write_registry("headless", pid=pid, socket_path=headless_socket)
+
+        instances = list_instances()
+
+        assert {instance.mode for instance in instances} == {"gui", "headless"}
+    finally:
+        gui_server.shutdown()
+        gui_server.server_close()
+        headless_server.shutdown()
+        headless_server.server_close()
+
+
+def test_choose_instance_uses_sticky_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+    gui_socket = Path("/tmp") / f"bn-gui-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    headless_socket = Path("/tmp") / f"bn-headless-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    gui_server = _Server(str(gui_socket), _Handler)
+    headless_server = _Server(str(headless_socket), _Handler)
+    threading.Thread(target=gui_server.serve_forever, daemon=True).start()
+    threading.Thread(target=headless_server.serve_forever, daemon=True).start()
+
+    try:
+        _write_registry("gui", pid=pid, socket_path=gui_socket)
+        _write_registry("headless", pid=pid, socket_path=headless_socket)
+        write_current_daemon_mode("headless")
+
+        chosen = choose_instance()
+        assert chosen.mode == "headless"
+    finally:
+        gui_server.shutdown()
+        gui_server.server_close()
+        headless_server.shutdown()
+        headless_server.server_close()
+
+
+def test_choose_instance_errors_on_multiple_without_sticky(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+    gui_socket = Path("/tmp") / f"bn-gui-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    headless_socket = Path("/tmp") / f"bn-headless-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    gui_server = _Server(str(gui_socket), _Handler)
+    headless_server = _Server(str(headless_socket), _Handler)
+    threading.Thread(target=gui_server.serve_forever, daemon=True).start()
+    threading.Thread(target=headless_server.serve_forever, daemon=True).start()
+
+    try:
+        _write_registry("gui", pid=pid, socket_path=gui_socket)
+        _write_registry("headless", pid=pid, socket_path=headless_socket)
+
+        with pytest.raises(BridgeError, match="Multiple daemons"):
+            choose_instance()
+    finally:
+        gui_server.shutdown()
+        gui_server.server_close()
+        headless_server.shutdown()
+        headless_server.server_close()
+
+
+def test_choose_instance_errors_when_sticky_mode_not_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+    gui_socket = Path("/tmp") / f"bn-gui-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    gui_server = _Server(str(gui_socket), _Handler)
+    threading.Thread(target=gui_server.serve_forever, daemon=True).start()
+
+    try:
+        _write_registry("gui", pid=pid, socket_path=gui_socket)
+        write_current_daemon_mode("headless")
+
+        with pytest.raises(BridgeError, match="Sticky daemon mode is `headless`"):
+            choose_instance()
+    finally:
+        gui_server.shutdown()
+        gui_server.server_close()
+
+
+def test_sticky_mode_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    assert read_current_daemon_mode() is None
+    write_current_daemon_mode("gui")
+    assert read_current_daemon_mode() == "gui"
+    write_current_daemon_mode(None)
+    assert read_current_daemon_mode() is None
+    assert not current_daemon_mode_path().exists()
+
+
+def test_sticky_mode_ignores_invalid_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    sticky = current_daemon_mode_path()
+    sticky.parent.mkdir(parents=True, exist_ok=True)
+    sticky.write_text("nonsense", encoding="utf-8")
+
+    assert read_current_daemon_mode() is None

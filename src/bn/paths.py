@@ -47,12 +47,29 @@ def cache_home() -> Path:
     return home / ".cache" / "bn"
 
 
-def bridge_registry_path() -> Path:
-    return cache_home() / f"{PLUGIN_NAME}.json"
+DAEMON_MODES: tuple[str, ...] = ("gui", "headless")
 
 
-def bridge_socket_path() -> Path:
-    return cache_home() / f"{PLUGIN_NAME}.sock"
+def _validate_mode(mode: str) -> str:
+    if mode not in DAEMON_MODES:
+        raise ValueError(f"Unknown daemon mode: {mode!r} (expected one of {DAEMON_MODES})")
+    return mode
+
+
+def bridge_registry_dir() -> Path:
+    return cache_home() / "daemons"
+
+
+def bridge_registry_path(mode: str) -> Path:
+    return bridge_registry_dir() / f"{_validate_mode(mode)}.json"
+
+
+def bridge_socket_path(mode: str) -> Path:
+    return cache_home() / f"{PLUGIN_NAME}.{_validate_mode(mode)}.sock"
+
+
+def current_daemon_mode_path() -> Path:
+    return cache_home() / "current_daemon"
 
 
 def api_docs_index_path() -> Path:
