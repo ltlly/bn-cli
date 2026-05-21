@@ -1,27 +1,32 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing work when a Binary Ninja GUI session is already open. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, and inline Python execution through the bn bridge.
+description: Use the local bn CLI for Binary Ninja reversing work against either a running Binary Ninja GUI session or a headless daemon. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, headless target loading, and inline Python execution through the bn bridge.
 ---
 
 # bn
 
-Use this skill when the user wants reverse-engineering work against an already-open Binary Ninja database and the local `bn` CLI is available.
+Use this skill when the user wants reverse-engineering work driven by the local `bn` CLI. `bn` supports two backend modes that can coexist on the same machine:
+
+- **GUI bridge** — connects to a running Binary Ninja GUI; the user opens files in the GUI.
+- **Headless daemon** — long-running process that loads files explicitly via the CLI; used in Docker / container / agent-driver scenarios.
 
 ## Workflow
 
-1. Start with target discovery:
+1. Discover what's running:
 
 ```bash
-bn target list
 bn doctor
+bn daemon list                # see all running daemons + the sticky mode if set
+bn target list                # see loaded BinaryViews on the active daemon
 ```
 
-Use `bn doctor` when bridge state is unclear or `bn target list` does not show what you expect.
+If `bn daemon list` shows both `gui` and `headless` running and no sticky mode is set, every command that needs a bridge will error with a hint. Run `bn daemon use <mode>` to pin one, or `bn daemon use --clear` to drop the pin.
 
 2. Pick a target:
-- If there is exactly one open BinaryView, target-scoped commands can omit `--target` entirely.
-- If multiple targets are open, commands that omit `--target` fail; pass `--target <selector>` from `bn target list`.
-- Use `--target active` only when you explicitly mean the GUI-selected target.
+- If exactly one BinaryView is registered, target-scoped commands can omit `--target` entirely.
+- If multiple targets are loaded and exactly one is `active` (GUI focus / most-recent headless load), omitting `--target` also works.
+- Otherwise pass `--target <selector>` from `bn target list`. `selector` is usually the basename (e.g. `libfoo.so`).
+- `--target active` always means "the active one" by the rules above.
 
 3. Pick the right output mode:
 - Read commands default to `text`.
@@ -29,6 +34,38 @@ Use `bn doctor` when bridge state is unclear or `bn target list` does not show w
 - Other options: `--format json`, `--format ndjson`, `--out <path>`.
 
 Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata as plain text, so do not chain `bn ... | rg ...` and expect to search the real output. Use `--out <path>` when you want the full body written to a known file.
+
+## Headless Daemon Workflow
+
+When you're driving `bn` from a container / CI / agent loop, you usually want headless mode. The daemon is started once (often as a container PID 1) and then receives per-task `bn target load` commands:
+
+```bash
+# One-time setup (the user / Docker image runs this once)
+bn daemon start --foreground               # blocks; needs BN headless license
+
+# Per-task
+bn daemon use headless                     # pin the CLI to headless (skip if it's the only daemon)
+bn target load /path/to/app.so             # sync: blocks until full analysis is done
+bn target load /path/to/app.so --async     # detach: load + analysis in background, returns immediately
+bn target load /path/to/app.so \
+    --option loader.imageBase=0 \
+    --option analysis.mode=full \
+    --option analysis.linearSweep.autorun=true
+
+bn target loads                            # check status / errors for recent --async loads
+bn target status                           # analysis progress on the active target
+bn target save --path /tmp/app.bndb        # first save: choose .bndb path
+bn target save                             # subsequent: save_auto_snapshot to the same .bndb
+bn target close                            # unload, free the BV
+```
+
+Notes that bite agents:
+
+- **Big `.so` + `linearSweep.autorun=true` can take **minutes** synchronously.** Prefer `--async` and poll `bn target status` until `done: true`, OR drop linear sweep with `--option analysis.linearSweep.autorun=false` for a much faster analysis at the cost of some discovery.
+- **`--async` returns `{queued, load_id, path}` immediately.** The target only shows up in `bn target list` after `bn.load()` returns inside the daemon's worker thread. If the daemon-side load throws, the error surfaces in `bn target loads`, not in the original `bn target load --async` response.
+- **During `state: AnalyzeState`**, read commands like `bn function list` may return partial or empty results. Wait until `done: true` for stable views.
+- **Detached failures are not raised in the CLI.** Always check `bn target loads` after `--async` if the target doesn't appear in `bn target list` within the expected time.
+- **`--no-update-analysis`** skips analysis entirely; run `bn refresh` later to trigger it synchronously.
 
 ## High-Value Read Commands
 
