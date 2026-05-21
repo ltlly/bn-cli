@@ -33,7 +33,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
     assert '"name"' not in output
 
 
-def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
+def test_function_list_requires_target_when_multiple_targets_have_no_active(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
         if op == "list_targets":
             return {
@@ -42,7 +42,7 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
                     {
                         "target_id": "123:1:7",
                         "selector": "SnailMail_unwrapped.exe.bndb",
-                        "active": True,
+                        "active": False,
                     },
                     {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
                 ],
@@ -57,9 +57,37 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
     assert capsys.readouterr().err == (
         "This command requires --target when multiple targets are open.\n"
         "Open targets:\n"
-        "- SnailMail_unwrapped.exe.bndb [active] (target_id: 123:1:7)\n"
+        "- SnailMail_unwrapped.exe.bndb (target_id: 123:1:7)\n"
         "- other.exe.bndb (target_id: 123:2:8)\n"
     )
+
+
+def test_function_list_uses_implicit_target_when_one_target_is_active(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        calls.append({"op": op, "target": target})
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [
+                    {
+                        "target_id": "123:1:7",
+                        "selector": "primary.bndb",
+                        "active": True,
+                    },
+                    {"target_id": "123:2:8", "selector": "other.bndb", "active": False},
+                ],
+            }
+        if op == "list_functions":
+            return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "list"])
+    assert rc == 0
+    assert calls[-1]["target"] == "active"
 
 
 def test_function_list_returns_full_result_set(monkeypatch, capsys):
@@ -330,7 +358,7 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypat
     assert calls[1]["target"] == "active"
 
 
-def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
+def test_symbol_rename_requires_target_when_no_active_target(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
         if op == "list_targets":
             return {
@@ -339,7 +367,7 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
                     {
                         "target_id": "123:1:7",
                         "selector": "SnailMail_unwrapped.exe.bndb",
-                        "active": True,
+                        "active": False,
                     },
                     {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
                 ],
@@ -354,7 +382,7 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
     assert capsys.readouterr().err == (
         "This command requires --target when multiple targets are open.\n"
         "Open targets:\n"
-        "- SnailMail_unwrapped.exe.bndb [active] (target_id: 123:1:7)\n"
+        "- SnailMail_unwrapped.exe.bndb (target_id: 123:1:7)\n"
         "- other.exe.bndb (target_id: 123:2:8)\n"
     )
 
@@ -1906,3 +1934,260 @@ def test_workflow_machine_overrides_forwards_activity(monkeypatch):
 
     assert rc == 0
     assert captured["params"] == {"activity": "core.function.analyzeTailCalls"}
+
+
+def test_target_load_sends_path_and_update_analysis(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {"ok": True, "result": {"target_id": "1:1:1", "filename": params["path"]}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "load", "/tmp/sample.so"])
+
+    assert rc == 0
+    assert captured["op"] == "load_target"
+    assert captured["params"]["analysis"] == "wait"
+    assert captured["params"]["path"].endswith("/tmp/sample.so")
+    assert captured["target"] is None
+
+
+def test_target_load_default_analysis_is_wait(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": {"target_id": "1:1:1"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["target", "load", "/tmp/x.so"])
+    assert rc == 0
+    assert captured["params"]["analysis"] == "wait"
+
+
+def test_target_load_async_sets_analysis_async(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": {"target_id": "1:1:1"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["target", "load", "--async", "/tmp/sample.so"])
+    assert rc == 0
+    assert captured["params"]["analysis"] == "async"
+
+
+def test_target_load_no_update_analysis_sets_analysis_skip(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": {"target_id": "1:1:1"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["target", "load", "--no-update-analysis", "/tmp/sample.so"])
+    assert rc == 0
+    assert captured["params"]["analysis"] == "skip"
+
+
+def test_target_load_async_and_no_update_analysis_are_mutually_exclusive(monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "send_request", lambda *a, **kw: {"ok": True, "result": {}})
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["target", "load", "--async", "--no-update-analysis", "/tmp/x.so"])
+    assert exc.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_target_load_parses_option_kv_with_json_fallback(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": {"target_id": "1:1:1"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "target", "load", "/tmp/x.so",
+        "--option", "loader.imageBase=0",
+        "--option", "analysis.linearSweep.autorun=true",
+        "--option", "analysis.mode=full",
+        "--option", "loader.entryPoints=[1024, 2048]",
+    ])
+
+    assert rc == 0
+    assert captured["params"]["options"] == {
+        "loader.imageBase": 0,
+        "analysis.linearSweep.autorun": True,
+        "analysis.mode": "full",
+        "loader.entryPoints": [1024, 2048],
+    }
+
+
+def test_target_load_options_json_merges_with_option_flag(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": {"target_id": "1:1:1"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "target", "load", "/tmp/x.so",
+        "--options-json", '{"analysis.mode": "basic", "loader.imageBase": 0}',
+        "--option", "analysis.mode=full",
+    ])
+
+    assert rc == 0
+    assert captured["params"]["options"] == {
+        "analysis.mode": "full",
+        "loader.imageBase": 0,
+    }
+
+
+def test_target_load_rejects_malformed_option(monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "send_request", lambda *args, **kwargs: {"ok": True, "result": {}})
+    rc = bn.cli.main(["target", "load", "/tmp/x.so", "--option", "no-equals-sign"])
+    assert rc == 2
+    assert "KEY=VALUE" in capsys.readouterr().err
+
+
+def test_target_load_omits_options_when_unspecified(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": {"target_id": "1:1:1"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "load", "/tmp/x.so"])
+    assert rc == 0
+    assert "options" not in captured["params"]
+
+
+def test_target_loads_renders_text(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        assert op == "list_loads"
+        return {
+            "ok": True,
+            "result": [
+                {
+                    "load_id": "abc",
+                    "path": "/tmp/ok.so",
+                    "status": "succeeded",
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "completed_at": "2026-01-01T00:00:10+00:00",
+                    "target_id": "1:1:1",
+                    "error": None,
+                },
+                {
+                    "load_id": "def",
+                    "path": "/tmp/bad.so",
+                    "status": "failed",
+                    "started_at": "2026-01-01T00:01:00+00:00",
+                    "completed_at": "2026-01-01T00:01:01+00:00",
+                    "target_id": None,
+                    "error": "RuntimeError: boom",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["target", "loads"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "succeeded" in out
+    assert "failed" in out
+    assert "/tmp/bad.so" in out
+    assert "RuntimeError: boom" in out
+
+
+def test_target_close_sends_active_when_no_target(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"closed": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "close"])
+    assert rc == 0
+    assert captured["op"] == "close_target"
+    assert captured["params"] == {"target": "active"}
+
+
+def test_target_save_passes_path_param(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x", "active": True}]}
+        return {"ok": True, "result": {"saved": True, "saved_to": params.get("path")}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bndb = tmp_path / "out.bndb"
+    rc = bn.cli.main(["target", "save", "--path", str(bndb)])
+
+    assert rc == 0
+    assert captured["op"] == "save_target"
+    assert captured["params"]["path"] == str(bndb.resolve())
+
+
+def test_target_status_uses_implicit_target(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x", "active": True}]}
+        if op == "analysis_status":
+            return {"ok": True, "result": {"state": "Idle", "count": 10, "total": 10, "done": True}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "status"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "state: Idle" in out
+    assert "done: True" in out
+
+
+def test_daemon_use_writes_sticky_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    rc = bn.cli.main(["daemon", "use", "headless"])
+    assert rc == 0
+    sticky = (tmp_path / "current_daemon").read_text(encoding="utf-8")
+    assert sticky == "headless"
+
+    rc = bn.cli.main(["daemon", "use", "--clear"])
+    assert rc == 0
+    assert not (tmp_path / "current_daemon").exists()
+
+
+def test_daemon_use_rejects_unknown_mode(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    rc = bn.cli.main(["daemon", "use", "nope"])
+    assert rc == 2
+    assert "Unknown daemon mode" in capsys.readouterr().err
+
+
+def test_daemon_list_shows_no_running_daemons_when_empty(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+
+    rc = bn.cli.main(["daemon", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no running daemons" in out

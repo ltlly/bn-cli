@@ -27,7 +27,7 @@ from .version import VERSION, build_id_for_file
 
 try:
     import binaryninjaui as ui
-except ImportError:  # pragma: no cover - GUI plugin only
+except Exception:  # pragma: no cover - headless raises UIPluginInHeadlessError; CI just lacks the module
     ui = None
 
 
@@ -113,6 +113,7 @@ READ_LOCKED_OPS = {
     "workflow_machine_dump",
     "workflow_machine_overrides",
     "workflow_machine_breakpoint_list",
+    "analysis_status",
 }
 
 
@@ -141,6 +142,9 @@ WRITE_LOCKED_OPS = {
     "workflow_machine_resume",
     "workflow_machine_breakpoint_set",
     "workflow_machine_breakpoint_clear",
+    "load_target",
+    "close_target",
+    "save_target",
 }
 
 
@@ -295,17 +299,21 @@ class TargetRecord:
     filename: str
     basename: str
     view_name: str
+    source: str = "gui"
 
     def target_id(self) -> str:
         return f"{os.getpid()}:{self.view_id}:{self.session_id}"
 
 
 class TargetManager:
-    def __init__(self):
+    def __init__(self, mode: str = "gui"):
+        self._mode = mode
         self._lock = threading.RLock()
         self._records: dict[str, TargetRecord] = {}
         self._ids_by_object: dict[int, str] = {}
         self._next_id = 1
+        self._explicit_refs: dict[str, Any] = {}
+        self._load_order: list[str] = []
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -335,7 +343,74 @@ class TargetManager:
             record.basename,
         )
 
+    def _build_record(self, bv, *, source: str) -> TargetRecord:
+        key = id(bv)
+        view_id = self._ids_by_object.get(key)
+        if view_id is None:
+            view_id = str(self._next_id)
+            self._next_id += 1
+            self._ids_by_object[key] = view_id
+
+        try:
+            session_id = str(bv.file.session_id) if bv.file else str(key)
+        except Exception:
+            session_id = str(key)
+        try:
+            filename = str(getattr(bv.file, "filename", "")) if bv.file else ""
+        except Exception:
+            filename = ""
+
+        return TargetRecord(
+            view_id=view_id,
+            ref=weakref.ref(bv),
+            session_id=session_id,
+            filename=filename,
+            basename=os.path.basename(filename) if filename else "",
+            view_name=self._view_name(bv),
+            source=source,
+        )
+
+    def register(self, bv) -> TargetRecord:
+        """Explicit registration used by headless `load_target`. Holds a strong reference."""
+        with self._lock:
+            record = self._build_record(bv, source="explicit")
+            self._records[record.view_id] = record
+            self._explicit_refs[record.view_id] = bv
+            if record.view_id in self._load_order:
+                self._load_order.remove(record.view_id)
+            self._load_order.append(record.view_id)
+            return record
+
+    def unregister(self, view_id: str) -> TargetRecord | None:
+        with self._lock:
+            record = self._records.pop(view_id, None)
+            self._explicit_refs.pop(view_id, None)
+            try:
+                self._load_order.remove(view_id)
+            except ValueError:
+                pass
+            if record is not None:
+                bv = record.ref()
+                if bv is not None:
+                    self._ids_by_object.pop(id(bv), None)
+            return record
+
+    def view_id_for(self, bv) -> str | None:
+        with self._lock:
+            return self._ids_by_object.get(id(bv))
+
+    def most_recent(self):
+        with self._lock:
+            for view_id in reversed(self._load_order):
+                bv = self._explicit_refs.get(view_id)
+                if bv is not None:
+                    return bv
+        return None
+
     def _default_view(self):
+        if self._mode == "headless":
+            return self.most_recent()
+
         active = _active_binary_view()
         if active is not None:
             return active
@@ -347,53 +422,24 @@ class TargetManager:
             return live_views[0]
         return None
 
-    def refresh(self) -> list[dict[str, Any]]:
-        views = _collect_open_views()
-        focused = _active_binary_view()
-
+    def _serialize_records(self, *, focused) -> list[dict[str, Any]]:
         with self._lock:
-            alive: dict[str, TargetRecord] = {}
-            for bv in views:
-                key = id(bv)
-                view_id = self._ids_by_object.get(key)
-                if view_id is None:
-                    view_id = str(self._next_id)
-                    self._next_id += 1
-                    self._ids_by_object[key] = view_id
-
-                try:
-                    session_id = str(bv.file.session_id)
-                except Exception:
-                    session_id = str(key)
-                try:
-                    filename = str(getattr(bv.file, "filename", "")) if bv.file else ""
-                except Exception:
-                    filename = ""
-
-                alive[view_id] = TargetRecord(
-                    view_id=view_id,
-                    ref=weakref.ref(bv),
-                    session_id=session_id,
-                    filename=filename,
-                    basename=os.path.basename(filename) if filename else "",
-                    view_name=self._view_name(bv),
-                )
-
-            self._records = alive
-            active = focused
-            if active is None and len(self._records) == 1:
-                active = next(iter(self._records.values())).ref()
             basename_counts: dict[str, int] = {}
             for record in self._records.values():
                 if record.basename:
                     basename_counts[record.basename] = basename_counts.get(record.basename, 0) + 1
 
-            result = []
+            recent_view_id = self._load_order[-1] if self._load_order else None
+            result: list[dict[str, Any]] = []
             for view_id in sorted(self._records, key=lambda item: int(item)):
                 record = self._records[view_id]
-                view = record.ref()
+                view = self._explicit_refs.get(view_id) or record.ref()
                 if view is None:
                     continue
+                if focused is None and self._mode == "headless":
+                    is_active = view_id == recent_view_id
+                else:
+                    is_active = bool(view is focused)
                 result.append(
                     {
                         "target_id": record.target_id(),
@@ -403,15 +449,35 @@ class TargetManager:
                         "basename": record.basename,
                         "selector": self._preferred_selector(record, basename_counts),
                         "view_name": record.view_name,
-                        "active": bool(view is active),
+                        "active": is_active,
+                        "source": record.source,
                     }
                 )
             return result
 
+    def refresh(self) -> list[dict[str, Any]]:
+        if self._mode == "headless":
+            return self._serialize_records(focused=None)
+
+        views = _collect_open_views()
+        focused = _active_binary_view()
+
+        with self._lock:
+            alive: dict[str, TargetRecord] = {}
+            for bv in views:
+                record = self._build_record(bv, source="gui")
+                alive[record.view_id] = record
+            self._records = alive
+            if focused is None and len(self._records) == 1:
+                focused = next(iter(self._records.values())).ref()
+
+        return self._serialize_records(focused=focused)
+
     def resolve(self, selector: str | None):
         targets = self.refresh()
         if not targets:
-            raise RuntimeError("No BinaryView targets are open in the GUI")
+            scope = "headless daemon" if self._mode == "headless" else "Binary Ninja GUI"
+            raise RuntimeError(f"No BinaryView targets are loaded in the {scope}")
 
         if selector in (None, "", "active"):
             active = self._default_view()
@@ -422,7 +488,7 @@ class TargetManager:
         with self._lock:
             for record in self._records.values():
                 if self._matches_record(record, selector):
-                    view = record.ref()
+                    view = self._explicit_refs.get(record.view_id) or record.ref()
                     if view is not None:
                         return view
         raise RuntimeError(f"Unknown target selector: {selector}")
@@ -477,14 +543,78 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         super().__init__(socket_path, handler)
 
 
+LOAD_ATTEMPTS_LIMIT = 50
+
+
+@dataclass(slots=True)
+class LoadAttempt:
+    load_id: str
+    path: str
+    started_at: str
+    status: str
+    completed_at: str | None = None
+    error: str | None = None
+    target_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "load_id": self.load_id,
+            "path": self.path,
+            "started_at": self.started_at,
+            "status": self.status,
+            "completed_at": self.completed_at,
+            "error": self.error,
+            "target_id": self.target_id,
+        }
+
+
 class BinaryNinjaBridge:
-    def __init__(self):
-        self.targets = TargetManager()
-        self.socket_path = bridge_socket_path()
-        self.registry_path = bridge_registry_path()
+    def __init__(self, mode: str = "gui"):
+        self.mode = mode
+        self.targets = TargetManager(mode=mode)
+        self.socket_path = bridge_socket_path(mode)
+        self.registry_path = bridge_registry_path(mode)
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
         self._target_lock = _ReadWriteLock()
+        self._load_attempts: list[LoadAttempt] = []
+        self._load_attempts_lock = threading.Lock()
+
+    def _record_load_start(self, path: str) -> str:
+        import uuid as _uuid
+
+        attempt = LoadAttempt(
+            load_id=_uuid.uuid4().hex[:12],
+            path=path,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            status="loading",
+        )
+        with self._load_attempts_lock:
+            self._load_attempts.append(attempt)
+            while len(self._load_attempts) > LOAD_ATTEMPTS_LIMIT:
+                self._load_attempts.pop(0)
+        return attempt.load_id
+
+    def _record_load_done(
+        self,
+        load_id: str,
+        *,
+        success: bool,
+        error: str | None = None,
+        target_id: str | None = None,
+    ) -> None:
+        with self._load_attempts_lock:
+            for attempt in self._load_attempts:
+                if attempt.load_id == load_id:
+                    attempt.status = "succeeded" if success else "failed"
+                    attempt.completed_at = datetime.now(timezone.utc).isoformat()
+                    attempt.error = error
+                    attempt.target_id = target_id
+                    return
+
+    def _list_loads(self) -> list[dict[str, Any]]:
+        with self._load_attempts_lock:
+            return [attempt.to_dict() for attempt in self._load_attempts]
 
     def start(self):  # pragma: no cover - requires GUI runtime
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -518,7 +648,9 @@ class BinaryNinjaBridge:
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
+            "mode": self.mode,
         }
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
@@ -680,6 +812,20 @@ class BinaryNinjaBridge:
             return self._bundle_function(target, params["identifier"], params.get("out_path"))
         if op == "py_exec":
             return self._py_exec(target, str(params["script"]))
+        if op == "load_target":
+            return self._load_target(
+                path=str(params["path"]),
+                analysis=str(params.get("analysis", "wait")),
+                options=params.get("options"),
+            )
+        if op == "close_target":
+            return self._close_target(str(params["target"]))
+        if op == "save_target":
+            return self._save_target(target, path=params.get("path"))
+        if op == "analysis_status":
+            return self._analysis_status(target)
+        if op == "list_loads":
+            return self._list_loads()
 
         if op == "rename_symbol":
             return self._mutation(target, bool(params.get("preview")), [params])
@@ -719,6 +865,7 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "pid": os.getpid(),
             "socket_path": str(self.socket_path),
+            "mode": self.mode,
             "targets": self.targets.refresh(),
         }
 
@@ -750,6 +897,140 @@ class BinaryNinjaBridge:
             "refreshed": True,
             "target": self._target_info(selector),
         }
+
+    def _load_target(self, *, path: str, analysis: str = "wait", options: Any = None):
+        if self.mode != "headless":
+            raise RuntimeError(
+                "load_target is only supported in headless mode; "
+                "open files via Binary Ninja itself in GUI mode."
+            )
+        if analysis not in ("wait", "async", "skip"):
+            raise RuntimeError(
+                f"analysis must be one of 'wait', 'async', 'skip'; got {analysis!r}"
+            )
+
+        if analysis == "async":
+            load_id = self._record_load_start(path)
+
+            def _detached() -> None:
+                try:
+                    result = self._do_load(path, options, True)
+                    target_id = result.get("target_id") if isinstance(result, dict) else None
+                    self._record_load_done(load_id, success=True, target_id=target_id)
+                except Exception as exc:  # noqa: BLE001
+                    self._record_load_done(
+                        load_id, success=False, error=f"{type(exc).__name__}: {exc}"
+                    )
+
+            threading.Thread(
+                target=_detached,
+                daemon=True,
+                name=f"bn-load-{os.path.basename(path)}",
+            ).start()
+            return {
+                "queued": True,
+                "load_id": load_id,
+                "path": path,
+                "message": (
+                    "Load detached. Poll `bn target list` for the target to appear, "
+                    "or `bn target loads` to see per-load status / errors."
+                ),
+            }
+
+        return self._do_load(path, options, analysis == "wait")
+
+    def _do_load(self, path: str, options: Any, run_analysis: bool):
+        load_kwargs: dict[str, Any] = {"update_analysis": False}
+        if isinstance(options, dict):
+            load_kwargs["options"] = options
+        try:
+            bv = bn.load(path, **load_kwargs)
+        except Exception as exc:
+            bn.log_error(f"bn load_target failed for {path}: {exc}")
+            raise
+        if bv is None:
+            bn.log_error(f"bn load_target returned None for {path}")
+            raise RuntimeError(f"Binary Ninja could not load: {path}")
+        record = self.targets.register(bv)
+        if run_analysis:
+            bv.update_analysis_and_wait()
+        return self._target_info(record.target_id())
+
+    def _close_target(self, selector: str):
+        if self.mode != "headless":
+            raise RuntimeError(
+                "close_target is only supported in headless mode; "
+                "close files via Binary Ninja itself in GUI mode."
+            )
+        bv = self._resolve_view(selector)
+        view_id = self.targets.view_id_for(bv)
+        if view_id is None:
+            raise RuntimeError(f"Target not found in registry: {selector}")
+        record = self.targets.unregister(view_id)
+        target_id = record.target_id() if record is not None else None
+        try:
+            if bv.file is not None:
+                bv.file.close()
+        except Exception:
+            pass
+        return {
+            "closed": True,
+            "target_id": target_id,
+            "selector": selector,
+        }
+
+    def _save_target(self, selector: str | None, *, path: Any):
+        bv = self._resolve_view(selector)
+        path_text = str(path) if path else None
+        if path_text:
+            ok = bv.create_database(path_text)
+            if not ok:
+                raise RuntimeError(f"Binary Ninja refused to write database to: {path_text}")
+            saved_to = path_text
+            is_new = True
+        else:
+            current = ""
+            try:
+                current = str(getattr(bv.file, "filename", "")) if bv.file else ""
+            except Exception:
+                current = ""
+            if not current.endswith(".bndb"):
+                raise RuntimeError(
+                    "No .bndb path on record for this target; pass --path to choose one."
+                )
+            ok = bv.save_auto_snapshot()
+            if not ok:
+                raise RuntimeError(f"save_auto_snapshot() failed for: {current}")
+            saved_to = current
+            is_new = False
+        try:
+            size = os.path.getsize(saved_to)
+        except OSError:
+            size = None
+        return {
+            "saved": True,
+            "saved_to": saved_to,
+            "is_new_database": is_new,
+            "bytes": size,
+        }
+
+    def _analysis_status(self, selector: str | None):
+        bv = self._resolve_view(selector)
+        progress = getattr(bv, "analysis_progress", None)
+        state = getattr(progress, "state", None)
+        count = getattr(progress, "count", None)
+        total = getattr(progress, "total", None)
+        state_name = getattr(state, "name", None) or (str(state) if state is not None else None)
+        info: dict[str, Any] = {
+            "state": state_name,
+            "count": int(count) if isinstance(count, int) else count,
+            "total": int(total) if isinstance(total, int) else total,
+        }
+        if state_name and "Idle" in state_name:
+            info["done"] = True
+        else:
+            info["done"] = bool(state_name and "Done" in state_name)
+        return info
 
     def _workflow_list(self, selector: str | None, *, registered_only: bool = False):
         workflows = list(getattr(bn.Workflow, "list", []) or [])
@@ -3216,31 +3497,59 @@ _bridge: BinaryNinjaBridge | None = None
 
 
 def _start_bridge_command(_):  # pragma: no cover - GUI runtime
-    start_bridge()
+    start_bridge(mode="gui")
 
 
-def start_bridge():  # pragma: no cover - GUI runtime
+def start_bridge(mode: str = "gui"):  # pragma: no cover - exercised in real bridges
     global _bridge
-    if ui is None:
-        bn.log_warn("BN Agent Bridge requires the Binary Ninja GUI")
-        return
+    if mode == "gui" and ui is None:
+        bn.log_warn("BN Agent Bridge GUI mode requires Binary Ninja GUI; refusing to start")
+        return None
     if _bridge is not None:
-        return
-    _bridge = BinaryNinjaBridge()
+        return _bridge
+    _bridge = BinaryNinjaBridge(mode=mode)
     _bridge.start()
+    return _bridge
 
 
-def _stop_bridge():  # pragma: no cover - GUI runtime
+def _stop_bridge():  # pragma: no cover - exercised in real bridges
     global _bridge
     if _bridge is not None:
         _bridge.stop()
         _bridge = None
 
 
+def _run_headless(*, foreground: bool = True) -> int:  # pragma: no cover - requires BN headless license
+    import signal
+    import threading as _threading
+
+    bridge = start_bridge(mode="headless")
+    if bridge is None:
+        return 1
+
+    if not foreground:
+        return 0
+
+    stop_event = _threading.Event()
+
+    def _handle_signal(signum, _frame):
+        bn.log_info(f"BN Agent Bridge received signal {signum}; shutting down")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    try:
+        stop_event.wait()
+    finally:
+        _stop_bridge()
+    return 0
+
+
 atexit.register(_stop_bridge)
 
-PluginCommand.register(
-    "BN Agent Bridge\\Restart Bridge",
-    "Restart the bn CLI socket bridge",
-    _start_bridge_command,
-)
+if ui is not None:
+    PluginCommand.register(
+        "BN Agent Bridge\\Restart Bridge",
+        "Restart the bn CLI socket bridge",
+        _start_bridge_command,
+    )
