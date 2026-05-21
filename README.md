@@ -43,12 +43,16 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 - `bn` has two parts:
   - a normal Python CLI that you can run from your shell or agent tool harness
-  - a Binary Ninja GUI plugin that owns all Binary Ninja API access
-- The plugin creates one fixed bridge socket and one fixed registry file.
-- The CLI discovers that bridge, connects to it, and forwards commands into the live GUI session.
-- Because the Binary Ninja side runs as a GUI plugin, it works with a personal license and does not require a commercial headless license.
+  - a Binary Ninja bridge that exposes the API over a Unix-domain socket
+- The bridge runs in one of two **modes**:
+  - **`gui`** — loaded as a Binary Ninja plugin inside the GUI process. Works with a personal license. Started automatically when Binary Ninja opens with the plugin installed.
+  - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
+- Each mode has its own socket and registry file under `~/Library/Caches/bn/` (or your platform's cache dir), so both can run simultaneously on the same machine.
+- The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
 
 ## Quick Start
+
+### GUI mode
 
 Open a binary or `.bndb` in Binary Ninja, then run:
 
@@ -60,7 +64,19 @@ bn function list
 bn decompile sub_401000
 ```
 
-If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`.
+### Headless daemon mode
+
+```bash
+bn daemon start --foreground &        # or run as PID 1 in Docker
+bn daemon list                        # confirm it's up
+bn target load /path/to/binary.so     # blocks until analysis is done
+bn function list
+bn target save --path /tmp/binary.bndb
+bn target close
+bn daemon stop
+```
+
+If exactly one BinaryView is loaded, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or rely on the implicit fallback to the "active" target — the GUI-focused tab in GUI mode, or the most recently loaded BV in headless mode.
 
 ## Target Selection
 
@@ -77,7 +93,7 @@ Targets can be selected with:
 - the BinaryView basename
 - the full filename
 - the view id
-- `active` when you explicitly want the GUI-selected target
+- `active` — the GUI-focused tab in GUI mode, or the most recently loaded target in headless mode
 
 In normal use, prefer the `selector` field. For a single open database, this is usually just the `.bndb` basename:
 
@@ -85,7 +101,61 @@ In normal use, prefer the `selector` field. For a single open database, this is 
 bn decompile update_player_movement_flags --target SnailMail_unwrapped.exe.bndb
 ```
 
-Omitting `--target` only works when exactly one target is open. If multiple targets are open, the CLI rejects the command instead of silently falling back to `active`.
+Omitting `--target` works when exactly one target is open, or when exactly one target reports `active: true` (one focused GUI tab, or one most-recently-loaded headless target). With multiple targets and no clear "active" pick, the CLI rejects the command.
+
+## Daemon Mode Selection
+
+`bn` supports two daemon modes — `gui` and `headless` — that can run side by side on the same machine. Use `bn daemon list` to see which are alive, and `bn daemon use <mode>` to pin which one subsequent commands talk to:
+
+```bash
+bn daemon list                # show all running daemons + sticky mode
+bn daemon use headless        # pin subsequent commands to the headless daemon
+bn daemon use gui             # switch to the GUI bridge
+bn daemon use --clear         # drop the pin; CLI auto-picks when only one runs
+```
+
+Resolution order when routing a command:
+
+1. **Sticky mode** from `bn daemon use <mode>` if set
+2. **Single running daemon** — auto-picked when only one mode is alive
+3. **Multiple running, no sticky** — CLI errors with a hint to run `bn daemon use <mode>`
+
+### Headless Daemon Lifecycle
+
+The headless daemon imports `binaryninja` and requires a Binary Ninja commercial (headless) license on `PYTHONPATH`. The GUI bridge is auto-started by Binary Ninja itself; the headless daemon needs to be started explicitly:
+
+```bash
+bn daemon start --foreground   # block in foreground (Docker PID 1 / systemd)
+bn daemon status               # pid, socket, target count
+bn daemon stop                 # SIGTERM + clean socket / registry
+```
+
+`--foreground` is currently the only supported run mode. For true background usage, wrap with `&`, `nohup`, `screen`/`tmux`, or a process supervisor like `systemd`.
+
+### Target Lifecycle (headless only)
+
+In headless mode, targets are loaded explicitly via the CLI rather than by opening files in a GUI:
+
+```bash
+bn target load /path/to/binary.so                         # sync: block until analysis is done
+bn target load /path/to/binary.so --async                 # detach: load + analysis run in background
+bn target load /path/to/binary.so --no-update-analysis    # load only, no analysis (run `bn refresh` later)
+
+bn target load /path/to/binary.so \
+    --option loader.imageBase=0 \
+    --option analysis.mode=full \
+    --option analysis.linearSweep.autorun=true
+
+bn target loads               # list recent --async load attempts with status + errors
+bn target status              # analysis progress for the active target (poll after --async)
+bn target save --path /tmp/binary.bndb   # first save: must specify path
+bn target save                # subsequent saves: writes back to the same .bndb
+bn target close               # unload a target, free the BinaryView
+```
+
+`--option KEY=VALUE` is repeatable; the value is JSON-parsed when possible (`true`/`false`/numbers/lists), otherwise treated as a string. `--options-json '{...}'` accepts an entire JSON object at once.
+
+With `--async`, `bn target load` returns immediately with `{queued: true, load_id, path}`. The actual load + analysis happen in a background thread on the daemon. Poll `bn target list` to see when the target shows up, `bn target status` to track analysis progress, and `bn target loads` to see per-attempt status and any failure messages.
 
 ## Output Behavior
 
