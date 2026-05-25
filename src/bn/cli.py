@@ -3316,6 +3316,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
+    setup = subparsers.add_parser(
+        "setup",
+        help="One-command setup: install the BN plugin and agent skill into all clients",
+    )
+    setup.add_argument("--force", action="store_true", help="Overwrite existing installations")
+    _common_io_options(setup, default_format="json")
+    setup.set_defaults(handler=_setup)
+
     doctor = subparsers.add_parser("doctor", help="Validate bridge discovery and installation")
     _common_io_options(doctor)
     doctor.set_defaults(handler=_doctor)
@@ -4779,27 +4787,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _auto_install_skill() -> None:
-    """Silently install the bundled skill into supported agent clients if not already present."""
-    if os.environ.get("BN_NO_AUTO_SKILL"):
-        return
+def _setup(args: argparse.Namespace) -> int:
+    """One-command setup: install plugin + skill into all supported clients."""
+    source_plugin = plugin_source_dir()
+    dest_plugin = plugin_install_dir()
+    plugin_ok = False
     try:
-        source = skill_source_dir()
-        if not source.exists():
-            return
-        for client in SKILL_CLIENTS:
-            dest = skill_install_dir_for(client)
-            if dest.exists() or dest.is_symlink():
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(source, dest, target_is_directory=True)
-    except Exception:
-        pass  # best-effort; never block normal CLI usage
+        _install_tree(source_plugin, dest_plugin, mode="symlink", force=args.force)
+        plugin_ok = True
+    except BridgeError as exc:
+        plugin_err = str(exc)
+
+    source_skill = skill_source_dir()
+    skill_installations = []
+    for client in SKILL_CLIENTS:
+        dest = skill_install_dir_for(client)
+        try:
+            _install_tree(source_skill, dest, mode="symlink", force=args.force)
+            skill_installations.append({"client": client, "destination": str(dest), "ok": True})
+        except BridgeError as exc:
+            skill_installations.append({"client": client, "destination": str(dest), "ok": False, "error": str(exc)})
+
+    result = {
+        "plugin": {"installed": plugin_ok, "source": str(source_plugin), "destination": str(dest_plugin)},
+        "skill": {"source": str(source_skill), "installations": skill_installations},
+    }
+    if not plugin_ok:
+        result["plugin"]["error"] = plugin_err
+
+    _render_result(result, fmt=args.format, out_path=args.out, stem="setup")
+    all_ok = plugin_ok and all(i["ok"] for i in skill_installations)
+    return 0 if all_ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
-    _auto_install_skill()
-
     parser = build_parser()
     args = parser.parse_args(argv)
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)

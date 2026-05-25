@@ -14,33 +14,31 @@ English | [中文](README_CN.md)
 
 ## Install
 
-Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled Codex skill.
-
 Install the CLI on your PATH:
 
 ```bash
 uv tool install -e .
 ```
 
-Install the Binary Ninja companion plugin:
+Then run the one-command setup to install both the Binary Ninja companion plugin and the agent skill:
 
 ```bash
-bn plugin install
+bn setup
 ```
 
-That links `plugin/bn_agent_bridge` into your Binary Ninja plugins directory.
+This does two things:
 
-Install the bundled skill:
+1. Symlinks `plugin/bn_agent_bridge` into your Binary Ninja plugins directory
+2. Installs the bundled skill into both Codex (`~/.codex/skills/bn`) and Claude Code (`~/.claude/skills/bn`)
+
+Pass `--force` to overwrite existing installations. If you only need one piece, the individual commands are still available:
 
 ```bash
-bn skill install
+bn plugin install          # plugin only
+bn skill install           # skill only (supports --client, --mode, --dest)
 ```
 
-By default this installs into both Codex (`$CODEX_HOME/skills/bn`, default `~/.codex/skills/bn`) and Claude Code (`$CLAUDE_CONFIG_DIR/skills/bn`, default `~/.claude/skills/bn`). Both clients consume the same `SKILL.md` frontmatter format, so the same skill content drives both.
-
-The skill is also **auto-installed** on first CLI invocation: if the skill directory does not already exist in either client, `bn` silently creates a symlink. This means running `uv tool install -e .` followed by any `bn` command is enough — no separate `bn skill install` step required. Set `BN_NO_AUTO_SKILL=1` to disable this behavior.
-
-Limit installation to one client with `--client codex` or `--client claude-code`. Use `--mode copy` if you want a standalone copy instead of a symlink. Pass `--dest <path>` (with a single `--client`) to install elsewhere. Restart your agent to pick up a new or renamed skill.
+Limit skill installation to one client with `--client codex` or `--client claude-code`. Use `--mode copy` if you want a standalone copy instead of a symlink. Pass `--dest <path>` (with a single `--client`) to install elsewhere. Restart your agent to pick up a new or renamed skill.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 
@@ -90,6 +88,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 
 | Command | Description |
 |---------|-------------|
+| `bn setup` | One-command setup: install plugin + skill into all clients |
 | `bn doctor` | Validate bridge discovery and installation |
 | `bn plugin` | Install the Binary Ninja companion plugin |
 | `bn skill` | Install the bundled skill into Codex and/or Claude Code |

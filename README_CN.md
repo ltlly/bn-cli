@@ -66,21 +66,25 @@ MCP 方案中 `binja.eval` 的 23.1% 错误率主要因未获取 BinaryView。bn
 uv tool install -e .
 ```
 
-安装 Binary Ninja 伴随插件：
+然后运行一键安装，同时安装 Binary Ninja 插件和 Agent skill：
 
 ```bash
-bn plugin install
+bn setup
 ```
 
-安装 Agent skill（Codex + Claude Code）：
+这会完成两件事：
+
+1. 将 `plugin/bn_agent_bridge` symlink 到 Binary Ninja 插件目录
+2. 将 bundled skill 安装到 Codex（`~/.codex/skills/bn`）和 Claude Code（`~/.claude/skills/bn`）
+
+用 `--force` 覆盖已有安装。也可以单独执行：
 
 ```bash
-bn skill install
+bn plugin install          # 只安装插件
+bn skill install           # 只安装 skill（支持 --client, --mode, --dest）
 ```
 
-默认同时安装到 Codex（`~/.codex/skills/bn`）和 Claude Code（`~/.claude/skills/bn`）。用 `--client codex` 或 `--client claude-code` 限定平台。
-
-Skill 也支持**自动安装**：首次执行任何 `bn` 命令时，如果目标目录不存在，CLI 会静默创建 symlink。也就是说 `uv tool install -e .` 之后直接使用即可，无需手动执行 `bn skill install`。设置 `BN_NO_AUTO_SKILL=1` 可禁用此行为。
+用 `--client codex` 或 `--client claude-code` 限定平台。
 
 ## 快速开始
 
@@ -113,6 +117,7 @@ bn daemon stop                        # 停止守护进程
 
 | 命令 | 描述 |
 |------|------|
+| `bn setup` | 一键安装：插件 + skill 全部就位 |
 | `bn doctor` | 验证 bridge 连接和安装状态 |
 | `bn plugin` | 安装 Binary Ninja 伴随插件 |
 | `bn skill` | 安装 Agent skill 到 Codex/Claude Code |
