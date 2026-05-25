@@ -38,6 +38,8 @@ bn skill install
 
 By default this installs into both Codex (`$CODEX_HOME/skills/bn`, default `~/.codex/skills/bn`) and Claude Code (`$CLAUDE_CONFIG_DIR/skills/bn`, default `~/.claude/skills/bn`). Both clients consume the same `SKILL.md` frontmatter format, so the same skill content drives both.
 
+The skill is also **auto-installed** on first CLI invocation: if the skill directory does not already exist in either client, `bn` silently creates a symlink. This means running `uv tool install -e .` followed by any `bn` command is enough — no separate `bn skill install` step required. Set `BN_NO_AUTO_SKILL=1` to disable this behavior.
+
 Limit installation to one client with `--client codex` or `--client claude-code`. Use `--mode copy` if you want a standalone copy instead of a symlink. Pass `--dest <path>` (with a single `--client`) to install elsewhere. Restart your agent to pick up a new or renamed skill.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.

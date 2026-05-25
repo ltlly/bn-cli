@@ -80,6 +80,8 @@ bn skill install
 
 默认同时安装到 Codex（`~/.codex/skills/bn`）和 Claude Code（`~/.claude/skills/bn`）。用 `--client codex` 或 `--client claude-code` 限定平台。
 
+Skill 也支持**自动安装**：首次执行任何 `bn` 命令时，如果目标目录不存在，CLI 会静默创建 symlink。也就是说 `uv tool install -e .` 之后直接使用即可，无需手动执行 `bn skill install`。设置 `BN_NO_AUTO_SKILL=1` 可禁用此行为。
+
 ## 快速开始
 
 ### GUI 模式

@@ -4779,7 +4779,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _auto_install_skill() -> None:
+    """Silently install the bundled skill into supported agent clients if not already present."""
+    if os.environ.get("BN_NO_AUTO_SKILL"):
+        return
+    try:
+        source = skill_source_dir()
+        if not source.exists():
+            return
+        for client in SKILL_CLIENTS:
+            dest = skill_install_dir_for(client)
+            if dest.exists() or dest.is_symlink():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source, dest, target_is_directory=True)
+    except Exception:
+        pass  # best-effort; never block normal CLI usage
+
+
 def main(argv: list[str] | None = None) -> int:
+    _auto_install_skill()
+
     parser = build_parser()
     args = parser.parse_args(argv)
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
