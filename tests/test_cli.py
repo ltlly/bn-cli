@@ -478,6 +478,90 @@ def test_skill_install_rejects_dest_with_both(tmp_path, capsys):
     assert "--dest cannot be combined with --client both" in capsys.readouterr().err
 
 
+def test_setup_installs_plugin_and_skill(monkeypatch, tmp_path, capsys):
+    plugin_dest = tmp_path / "plugins" / "bn_agent_bridge"
+    codex_dest = tmp_path / "codex" / "bn"
+    claude_dest = tmp_path / "claude" / "bn"
+
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: plugin_dest)
+
+    def fake_install_dir_for(client):
+        if client == "codex":
+            return codex_dest
+        if client == "claude-code":
+            return claude_dest
+        raise AssertionError(f"unexpected client: {client}")
+
+    monkeypatch.setattr(bn.cli, "skill_install_dir_for", fake_install_dir_for)
+
+    rc = bn.cli.main(["setup"])
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["plugin"]["installed"] is True
+    assert all(i["ok"] for i in payload["skill"]["installations"])
+    # Plugin destination should exist (symlink to source)
+    assert plugin_dest.exists() or plugin_dest.is_symlink()
+    # Skill destinations should exist
+    assert codex_dest.exists() or codex_dest.is_symlink()
+    assert claude_dest.exists() or claude_dest.is_symlink()
+
+
+def test_setup_reports_failure_when_destination_exists(monkeypatch, tmp_path, capsys):
+    plugin_dest = tmp_path / "plugins" / "bn_agent_bridge"
+    plugin_dest.mkdir(parents=True)
+    (plugin_dest / "dummy").write_text("x")
+
+    codex_dest = tmp_path / "codex" / "bn"
+    claude_dest = tmp_path / "claude" / "bn"
+
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: plugin_dest)
+
+    def fake_install_dir_for(client):
+        if client == "codex":
+            return codex_dest
+        if client == "claude-code":
+            return claude_dest
+        raise AssertionError(f"unexpected client: {client}")
+
+    monkeypatch.setattr(bn.cli, "skill_install_dir_for", fake_install_dir_for)
+
+    rc = bn.cli.main(["setup"])
+    # Should fail because plugin destination already exists (no --force)
+    assert rc == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["plugin"]["installed"] is False
+    assert "error" in payload["plugin"]
+
+
+def test_setup_force_overwrites_existing(monkeypatch, tmp_path, capsys):
+    plugin_dest = tmp_path / "plugins" / "bn_agent_bridge"
+    plugin_dest.mkdir(parents=True)
+    (plugin_dest / "dummy").write_text("x")
+
+    codex_dest = tmp_path / "codex" / "bn"
+    claude_dest = tmp_path / "claude" / "bn"
+
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: plugin_dest)
+
+    def fake_install_dir_for(client):
+        if client == "codex":
+            return codex_dest
+        if client == "claude-code":
+            return claude_dest
+        raise AssertionError(f"unexpected client: {client}")
+
+    monkeypatch.setattr(bn.cli, "skill_install_dir_for", fake_install_dir_for)
+
+    rc = bn.cli.main(["setup", "--force"])
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["plugin"]["installed"] is True
+    assert all(i["ok"] for i in payload["skill"]["installations"])
+
+
 def test_target_list_text_format_renders_summary(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
         assert op == "list_targets"
