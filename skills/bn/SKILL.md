@@ -1,6 +1,6 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing work against either a running Binary Ninja GUI session or a headless daemon. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, headless target loading, and inline Python execution through the bn bridge.
+description: Use the local bn CLI for Binary Ninja reversing work against either a running Binary Ninja GUI session or a headless daemon. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, headless target loading, inline Python execution, database operations, annotation, metadata, memory read/write, binary patching, and analysis control through the bn bridge.
 ---
 
 # bn
@@ -9,6 +9,20 @@ Use this skill when the user wants reverse-engineering work driven by the local 
 
 - **GUI bridge** — connects to a running Binary Ninja GUI; the user opens files in the GUI.
 - **Headless daemon** — long-running process that loads files explicitly via the CLI; used in Docker / container / agent-driver scenarios.
+
+## Setup
+
+```bash
+bn setup                      # one-command: install BN plugin + agent skill into all clients
+bn setup --force              # overwrite existing installations
+```
+
+Individual pieces if needed:
+
+```bash
+bn plugin install             # BN companion plugin only
+bn skill install              # agent skill only (supports --client, --mode, --dest)
+```
 
 ## Workflow
 
@@ -84,6 +98,8 @@ bn local list sample_track_floor_height_at_position
 bn decompile sample_track_floor_height_at_position
 bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
+bn disasm-linear 0x401000 --count 20
+bn disasm-range 0x401000 0x401100
 bn xrefs sample_track_floor_height_at_position
 bn xrefs field TrackRowCell.tile_type
 bn comment get --address 0x401000
@@ -92,9 +108,142 @@ bn types show Player
 bn struct show Player
 bn strings --query follow
 bn imports
+bn segments
+bn sections
+bn data-vars
 ```
 
 `bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
+
+## Extended Read Commands
+
+### Cross-References (Extended)
+
+```bash
+bn xref-ext code-refs-to 0x401000         # code references TO an address
+bn xref-ext code-refs-from 0x401000       # code references FROM an address
+bn xref-ext data-refs-to 0x401000         # data references TO an address
+bn xref-ext data-refs-from 0x401000       # data references FROM an address
+bn xref-ext type-refs MyStruct            # references to a named type
+```
+
+### IL Navigation
+
+```bash
+bn il-nav get-index-for-addr 0x401000     # address → IL index
+bn il-nav get-addr-for-index 42           # IL index → address
+```
+
+### Memory and Binary Content
+
+```bash
+bn memory read 0x401000 --length 64       # raw memory read (hex output)
+bn memory write 0x401000 --hex "90909090" # raw memory write
+bn search --bytes "48 89 5c 24"           # search binary content by byte pattern
+bn search --text "error"                  # search binary content by text
+bn data-typed-at 0x601000                 # typed data variable at address
+bn binary-bbs-at 0x401000                 # basic blocks at address (binary-wide)
+```
+
+### Value Analysis
+
+```bash
+bn value --address 0x401000 --reg rax     # register value at IL instruction
+bn value --address 0x401000 --stack -8    # stack value at IL instruction
+```
+
+### Architecture
+
+```bash
+bn arch                                   # architecture info for the target
+```
+
+## Database & Undo
+
+```bash
+bn database info                          # show database (bndb) information
+bn database snapshots                     # list database snapshots
+bn undo begin                             # begin an undo group
+bn undo commit                            # commit the current undo group
+bn undo revert                            # revert the current undo group
+bn undo undo                              # undo the last action
+bn undo redo                              # redo the last undone action
+```
+
+## Type & Annotation Extensions
+
+```bash
+bn type-ext parse "int (*)(void*, int)"   # parse a C type string
+bn type-ext library-list                  # list available type libraries
+bn type-ext library-query libc            # query types in a library
+
+bn annotation get-tags --function sub_401000     # get tags for a function
+bn annotation get-tags --address 0x401000        # get tags at an address
+bn annotation create-tag "Important" "star"      # create a tag type
+bn annotation add-tag --function sub_401000 "Important" "review needed"
+bn annotation remove-tag --function sub_401000 "Important"
+bn annotation list-tag-types                     # list all tag types
+```
+
+## Analysis & Metadata
+
+```bash
+bn analysis status                        # show analysis progress
+bn analysis update                        # trigger analysis update
+
+bn metadata store mykey '{"foo": "bar"}'  # store metadata key-value
+bn metadata query mykey                   # query metadata by key
+bn metadata remove mykey                  # remove metadata by key
+bn metadata keys                          # list all metadata keys
+```
+
+## Advanced Operations
+
+### Loader & Rebase
+
+```bash
+bn loader settings                        # show loader settings
+bn loader rebase 0x10000                  # rebase the binary
+```
+
+### External Libraries
+
+```bash
+bn external library-list                  # list external libraries
+bn external library-add libfoo.so         # add an external library
+bn external location-list                 # list external locations
+bn external location-add libfoo.so foo 0x1000  # add an external location
+```
+
+### User-Defined IL Data Flow
+
+```bash
+bn uidf from-address 0x401000            # user IL data flow from address
+```
+
+### User Sections & Segments
+
+```bash
+bn section-user create .mytext 0x1000 0x100   # create a user section
+bn section-user delete .mytext                # delete a user section
+bn segment-user create 0x1000 0x100 --flags r-x  # create a user segment
+bn segment-user delete 0x1000                    # delete a user segment
+```
+
+### Debug Info & Plugin Commands
+
+```bash
+bn debug-info list                        # list debug info parsers/types/functions
+bn plugin-cmd list                        # list registered plugin commands
+bn plugin-cmd run "My Plugin Command"     # run a registered plugin command
+```
+
+### Binary Patching
+
+```bash
+bn patch --address 0x401000 --hex "90"    # patch bytes at address
+bn patch --address 0x401000 --asm "nop"   # patch assembly at address
+```
 
 ## API Documentation Lookup
 
@@ -272,6 +421,9 @@ bn symbol rename sub_401000 player_update --preview
 bn proto get sub_401000
 bn local list sub_401000
 bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
+bn local rename sub_401000 <local_id> speed --preview
+bn local retype sub_401000 <local_id> float --preview
+bn comment set --address 0x401000 "interesting branch" --preview
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
@@ -310,3 +462,47 @@ If you need to force BN to recalculate presentation after a type change, run:
 ```bash
 bn refresh
 ```
+
+## Batch Manifests
+
+`bn batch apply` accepts a JSON manifest for atomic multi-operation mutations:
+
+```json
+{
+  "target": "binary.bndb",
+  "preview": true,
+  "ops": [
+    {"op": "rename_symbol", "kind": "function", "identifier": "sub_401000", "new_name": "main_loop"},
+    {"op": "set_prototype", "identifier": "main_loop", "prototype": "int main_loop(void)"}
+  ]
+}
+```
+
+```bash
+bn batch apply manifest.json
+```
+
+If any op fails verification, the entire batch is reverted.
+
+## Full Command Quick-Reference
+
+### Core
+`bn setup`, `bn doctor`, `bn plugin install`, `bn skill install`, `bn daemon {start,stop,status,list,use}`, `bn target {list,load,close,save,status,loads,info}`, `bn refresh`
+
+### Read / Inspect
+`bn function {list,search,info}`, `bn decompile`, `bn il`, `bn disasm`, `bn disasm-linear`, `bn disasm-range`, `bn xrefs`, `bn xref-ext`, `bn callsites`, `bn types`, `bn strings`, `bn imports`, `bn segments`, `bn sections`, `bn data-vars`, `bn data-typed-at`, `bn binary-bbs-at`, `bn il-nav`, `bn proto get`, `bn local list`, `bn comment get`, `bn arch`, `bn search`, `bn value`, `bn memory read`, `bn workflow`, `bn api-docs`, `bn bundle function`
+
+### Mutate
+`bn symbol rename`, `bn comment set`, `bn proto set`, `bn local rename`, `bn local retype`, `bn struct field set`, `bn types declare`, `bn batch apply`, `bn patch`, `bn memory write`
+
+### Database & Undo
+`bn database {info,snapshots}`, `bn undo {begin,commit,revert,undo,redo}`
+
+### Type & Annotation
+`bn type-ext {parse,library-list,library-query}`, `bn annotation {get-tags,create-tag,add-tag,remove-tag,list-tag-types}`
+
+### Analysis & Metadata
+`bn analysis {status,update}`, `bn metadata {store,query,remove,keys}`
+
+### Advanced
+`bn loader {settings,rebase}`, `bn external {library-list,library-add,location-list,location-add}`, `bn uidf from-address`, `bn section-user {create,delete}`, `bn segment-user {create,delete}`, `bn debug-info list`, `bn plugin-cmd {list,run}`, `bn py exec`
