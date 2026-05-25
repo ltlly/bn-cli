@@ -1,5 +1,7 @@
 # bn
 
+English | [中文](README_CN.md)
+
 `bn` is a coding agent-first CLI for Binary Ninja. It gives a shell session or tool-calling agent stable commands, structured output, and access to the same live Binary Ninja database you already have open in the GUI — or running headlessly in a daemon.
 
 ## Headline Features
