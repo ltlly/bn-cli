@@ -10,3 +10,4 @@ wheels/
 .venv
 .pytest_cache/
 *.sock
+tests/fixtures/binaries/

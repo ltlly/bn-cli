@@ -1,6 +1,6 @@
 # bn
 
-`bn` is a coding agent-first CLI for Binary Ninja. It gives a shell session or tool-calling agent stable commands, structured output, and access to the same live Binary Ninja database you already have open in the GUI.
+`bn` is a coding agent-first CLI for Binary Ninja. It gives a shell session or tool-calling agent stable commands, structured output, and access to the same live Binary Ninja database you already have open in the GUI — or running headlessly in a daemon.
 
 ## Headline Features
 
@@ -8,6 +8,7 @@
 - Execute Python inside the Binary Ninja process instead of maintaining a separate headless workflow.
 - Apply mutations with `--preview`, capture decompile diffs, and verify the live post-state before reporting success.
 - Emit structured `json` or `ndjson` output, auto-spill large results to files, and return token counts so agents can budget context intelligently.
+- Full Binary Ninja API coverage: 60+ commands spanning analysis, annotation, database, debugging info, IL navigation, type extensions, metadata, undo/redo, loader, external libraries, plugin commands, and more.
 
 ## Install
 
@@ -25,7 +26,7 @@ Install the Binary Ninja companion plugin:
 bn plugin install
 ```
 
-That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
+That links `plugin/bn_agent_bridge` into your Binary Ninja plugins directory.
 
 Install the bundled skill:
 
@@ -49,6 +50,7 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
   - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
 - Each mode has its own socket and registry file under `~/Library/Caches/bn/` (or your platform's cache dir), so both can run simultaneously on the same machine.
 - The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
+- **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation just opens a socket, sends a JSON request, and reads the response — the binary is never re-imported.
 
 ## Quick Start
 
@@ -77,6 +79,124 @@ bn daemon stop
 ```
 
 If exactly one BinaryView is loaded, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or rely on the implicit fallback to the "active" target — the GUI-focused tab in GUI mode, or the most recently loaded BV in headless mode.
+
+## Command Reference
+
+### Core Commands
+
+| Command | Description |
+|---------|-------------|
+| `bn doctor` | Validate bridge discovery and installation |
+| `bn plugin` | Install the Binary Ninja companion plugin |
+| `bn skill` | Install the bundled skill into Codex and/or Claude Code |
+| `bn daemon` | Manage bn bridge daemons (start/stop/status/list/use) |
+| `bn target` | Inspect/load/close/save Binary Ninja targets |
+| `bn refresh` | Refresh analysis for the selected target |
+
+### Read / Inspection Commands
+
+| Command | Description |
+|---------|-------------|
+| `bn function list` | List all functions (supports `--min-address`, `--max-address`) |
+| `bn function search` | Search functions by name (substring or `--regex`) |
+| `bn function info` | Detailed function info (locals, params, local_ids) |
+| `bn decompile` | Render HLIL-style decompile text |
+| `bn il` | Dump IL for a function (HLIL/MLIL/LLIL variants) |
+| `bn disasm` | Disassemble a function |
+| `bn disasm-linear` | Disassemble linearly from an address |
+| `bn disasm-range` | Disassemble an address range |
+| `bn xrefs` | List xrefs to an address/function/struct field |
+| `bn xref-ext` | Extended cross-references (code-refs-from/to, data-refs-from/to, type-refs) |
+| `bn callsites` | Find direct native callsites with exact caller_static addresses |
+| `bn types` | List or search types |
+| `bn strings` | List or search strings |
+| `bn imports` | List imports |
+| `bn segments` | List binary segments |
+| `bn sections` | List binary sections |
+| `bn data-vars` | List data variables |
+| `bn data-typed-at` | Get typed data variable at address |
+| `bn binary-bbs-at` | Get basic blocks at address (binary-wide) |
+| `bn il-nav` | IL navigation (get-index-for-addr, get-addr-for-index) |
+| `bn proto get` | Inspect a function prototype |
+| `bn local list` | List locals and parameters of a function |
+| `bn comment get` | Get comment at address |
+| `bn arch` | Architecture information and utilities |
+| `bn search` | Search binary content |
+| `bn value` | Register/stack value analysis at IL instructions |
+| `bn memory` | Raw memory read/write operations |
+| `bn workflow` | Inspect Binary Ninja analysis workflows |
+| `bn api-docs` | Query Binary Ninja's local Python API docs (no target needed) |
+
+### Mutation Commands
+
+| Command | Description |
+|---------|-------------|
+| `bn symbol rename` | Rename functions or data symbols |
+| `bn comment set` | Set or delete comments |
+| `bn proto set` | Set a user prototype |
+| `bn local rename` | Rename a local variable |
+| `bn local retype` | Retype a local variable |
+| `bn struct field set` | Field-first structure editing |
+| `bn types declare` | Declare types from C source |
+| `bn batch apply` | Apply a batch manifest (multiple ops atomically) |
+| `bn patch` | Binary patching operations |
+
+### Database & Undo
+
+| Command | Description |
+|---------|-------------|
+| `bn database info` | Show database (bndb) information |
+| `bn database snapshots` | List database snapshots |
+| `bn undo begin` | Begin an undo group |
+| `bn undo commit` | Commit the current undo group |
+| `bn undo revert` | Revert the current undo group |
+| `bn undo undo` | Undo the last action |
+| `bn undo redo` | Redo the last undone action |
+
+### Type & Annotation Extensions
+
+| Command | Description |
+|---------|-------------|
+| `bn type-ext parse` | Parse a C type string |
+| `bn type-ext library-list` | List type libraries |
+| `bn type-ext library-query` | Query a type library |
+| `bn annotation get-tags` | Get tags (function or address) |
+| `bn annotation create-tag` | Create a tag |
+| `bn annotation add-tag` | Add a tag to a function/address |
+| `bn annotation remove-tag` | Remove a tag |
+| `bn annotation list-tag-types` | List tag types |
+
+### Analysis & Metadata
+
+| Command | Description |
+|---------|-------------|
+| `bn analysis status` | Show analysis progress |
+| `bn analysis update` | Trigger analysis update |
+| `bn metadata store` | Store metadata key-value |
+| `bn metadata query` | Query metadata by key |
+| `bn metadata remove` | Remove metadata by key |
+| `bn metadata keys` | List all metadata keys |
+
+### Advanced Operations
+
+| Command | Description |
+|---------|-------------|
+| `bn loader settings` | Show loader settings |
+| `bn loader rebase` | Rebase the binary |
+| `bn external library-list` | List external libraries |
+| `bn external library-add` | Add an external library |
+| `bn external location-list` | List external locations |
+| `bn external location-add` | Add an external location |
+| `bn uidf from-address` | User IL data flow from address |
+| `bn section-user create` | Create a user section |
+| `bn section-user delete` | Delete a user section |
+| `bn segment-user create` | Create a user segment |
+| `bn segment-user delete` | Delete a user segment |
+| `bn debug-info list` | List debug info parsers/types/functions |
+| `bn plugin-cmd list` | List registered plugin commands |
+| `bn plugin-cmd run` | Run a registered plugin command |
+| `bn bundle function` | Export reusable function bundles |
+| `bn py exec` | Execute Python inside Binary Ninja |
 
 ## Target Selection
 
@@ -216,6 +336,13 @@ bn struct show Player
 bn types declare --file /path/to/win32_min.h --preview
 bn strings --query follow
 bn imports
+
+bn xref-ext code-refs-to 0x401000
+bn xref-ext data-refs-from 0x401000
+bn annotation get-tags --function sub_401000
+bn metadata keys
+bn analysis status
+bn database info
 ```
 
 `bn function search` stays case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address` to filter by function start address.
@@ -411,3 +538,7 @@ Run the CLI from the repo without installing it globally:
 ```bash
 uv run bn --help
 ```
+
+## License
+
+MIT

@@ -1901,6 +1901,439 @@ def _disasm(args: argparse.Namespace) -> int:
     )
 
 
+def _disasm_linear(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "disasm_linear",
+        {"address": args.address, "count": args.count},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="disasm-linear",
+    )
+
+
+def _disasm_range(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "disasm_range",
+        {"start": args.start, "end": args.end},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="disasm-range",
+    )
+
+
+# =========================================================================
+# Patch handlers
+# =========================================================================
+
+
+def _patch_status(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_status",
+        {"address": args.address},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-status",
+    )
+
+
+def _patch_assemble(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_assemble",
+        {"address": args.address, "asm": args.asm},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-assemble",
+    )
+
+
+def _patch_nop(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_nop",
+        {"address": args.address},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-nop",
+    )
+
+
+def _patch_always_branch(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_always_branch",
+        {"address": args.address},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-always-branch",
+    )
+
+
+def _patch_invert_branch(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_invert_branch",
+        {"address": args.address},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-invert-branch",
+    )
+
+
+def _patch_never_branch(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_never_branch",
+        {"address": args.address},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-never-branch",
+    )
+
+
+def _patch_skip_and_return(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "patch_skip_and_return",
+        {"address": args.address, "value": args.return_value},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="patch-skip-return",
+    )
+
+
+# =========================================================================
+# Memory handlers
+# =========================================================================
+
+
+def _memory_read(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "memory_read",
+        {"address": args.address, "length": args.length},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="memory-read",
+    )
+
+
+def _memory_write(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "memory_write",
+        {"address": args.address, "data_hex": args.hex_data},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="memory-write",
+    )
+
+
+def _memory_insert(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "memory_insert",
+        {"address": args.address, "data_hex": args.hex_data},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="memory-insert",
+    )
+
+
+def _memory_remove(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "memory_remove",
+        {"address": args.address, "length": args.length},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="memory-remove",
+    )
+
+
+def _memory_reader(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "memory_reader_read",
+        {"address": args.address, "width": args.width, "endian": args.endian},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="memory-reader",
+    )
+
+
+def _memory_writer(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "memory_writer_write",
+        {"address": args.address, "width": args.width, "value": args.value, "endian": args.endian},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="memory-writer",
+    )
+
+
+# =========================================================================
+# Value handlers
+# =========================================================================
+
+
+def _value_reg(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "value_reg",
+        {
+            "function_start": args.function,
+            "address": args.address,
+            "register": args.register,
+            "after": args.after,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        stem="value-reg",
+    )
+
+
+def _value_stack(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "value_stack",
+        {
+            "function_start": args.function,
+            "address": args.address,
+            "stack_offset": args.offset,
+            "size": args.size,
+            "after": args.after,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        stem="value-stack",
+    )
+
+
+def _value_possible(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "value_possible",
+        {
+            "function_start": args.function,
+            "address": args.address,
+            "level": args.level,
+            "ssa": args.ssa,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        stem="value-possible",
+    )
+
+
+def _value_flags(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "value_flags_at",
+        {
+            "function_start": args.function,
+            "address": args.address,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        stem="value-flags",
+    )
+
+
+# =========================================================================
+# Search handlers
+# =========================================================================
+
+
+def _search_bytes(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"data_hex": args.pattern}
+    if args.start:
+        params["start"] = args.start
+    if args.end:
+        params["end"] = args.end
+    if args.limit:
+        params["limit"] = args.limit
+    return _call(
+        args,
+        "search_bytes",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="search-bytes",
+    )
+
+
+def _search_constant(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"constant": args.value}
+    if args.limit:
+        params["limit"] = args.limit
+    return _call(
+        args,
+        "search_constant",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="search-constant",
+    )
+
+
+def _search_text_handler(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"query": args.pattern}
+    if args.regex:
+        params["regex"] = True
+    if args.il_type:
+        params["il_type"] = args.il_type
+    if args.limit:
+        params["limit"] = args.limit
+    return _call(
+        args,
+        "search_text",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="search-text",
+    )
+
+
+# =========================================================================
+# Arch handlers
+# =========================================================================
+
+
+def _arch_info(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "arch_info",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="arch-info",
+    )
+
+
+def _arch_assemble(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"asm": args.asm}
+    if args.address:
+        params["address"] = args.address
+    if hasattr(args, "arch_name") and args.arch_name:
+        params["arch_name"] = args.arch_name
+    return _call(
+        args,
+        "arch_assemble",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="arch-assemble",
+    )
+
+
+def _arch_disasm_bytes(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"data_hex": args.hex_bytes}
+    if args.address:
+        params["address"] = args.address
+    if hasattr(args, "arch_name") and args.arch_name:
+        params["arch_name"] = args.arch_name
+    return _call(
+        args,
+        "arch_disasm_bytes",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        stem="arch-disasm",
+    )
+
+
+# =========================================================================
+# Segments/Sections/DataVars handlers
+# =========================================================================
+
+
+def _list_segments(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_segments",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="segments",
+    )
+
+
+def _list_sections(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_sections",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="sections",
+    )
+
+
+def _list_data_vars(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_data_vars",
+        {"offset": args.offset, "limit": args.limit},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="data-vars",
+    )
+
+
+# =========================================================================
+# Function extended handlers
+# =========================================================================
+
+
+def _function_basic_blocks(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_basic_blocks",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="function-bbs",
+    )
+
+
+def _function_callers(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_callers",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="function-callers",
+    )
+
+
+def _function_callees(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_callees",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="function-callees",
+    )
+
+
+def _function_force_analysis(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_force_analysis",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        stem="function-force-analysis",
+    )
+
+
 def _xrefs(args: argparse.Namespace) -> int:
     if args.identifier == "field":
         if len(args.extra) != 1:
@@ -2407,6 +2840,476 @@ def _api_docs_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+# =========================================================================
+# Database handlers
+# =========================================================================
+
+
+def _database_info(args: argparse.Namespace) -> int:
+    return _call(args, "database_info", {}, require_target=True, allow_implicit_target=True, stem="database-info")
+
+
+def _database_read_global(args: argparse.Namespace) -> int:
+    return _call(args, "database_read_global", {"key": args.key}, require_target=True, allow_implicit_target=True, stem="database-read-global")
+
+
+def _database_write_global(args: argparse.Namespace) -> int:
+    return _call(args, "database_write_global", {"key": args.key, "value": args.value}, require_target=True, allow_implicit_target=True, stem="database-write-global")
+
+
+def _database_snapshots(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if hasattr(args, "offset") and args.offset:
+        params["offset"] = args.offset
+    if hasattr(args, "limit") and args.limit:
+        params["limit"] = args.limit
+    return _call(args, "database_snapshots", params, require_target=True, allow_implicit_target=True, stem="database-snapshots")
+
+
+def _database_save_auto_snapshot(args: argparse.Namespace) -> int:
+    return _call(args, "database_save_auto_snapshot", {}, require_target=True, allow_implicit_target=True, stem="database-save")
+
+
+def _database_create_bndb(args: argparse.Namespace) -> int:
+    return _call(args, "database_create_bndb", {"path": args.path}, require_target=True, allow_implicit_target=True, stem="database-create-bndb")
+
+
+# =========================================================================
+# Type extended handlers
+# =========================================================================
+
+
+def _type_rename(args: argparse.Namespace) -> int:
+    return _call(args, "type_rename", {"old_name": args.old_name, "new_name": args.new_name}, require_target=True, allow_implicit_target=True, stem="type-rename")
+
+
+def _type_undefine(args: argparse.Namespace) -> int:
+    return _call(args, "type_undefine_user", {"name": args.name}, require_target=True, allow_implicit_target=True, stem="type-undefine")
+
+
+def _type_parse(args: argparse.Namespace) -> int:
+    return _call(args, "type_parse_string", {"type_source": args.source}, require_target=True, allow_implicit_target=True, stem="type-parse")
+
+
+def _type_import(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"name": args.name}
+    if hasattr(args, "library") and args.library:
+        params["type_library_id"] = args.library
+    op = "type_import_library_type" if args.kind == "type" else "type_import_library_object"
+    return _call(args, op, params, require_target=True, allow_implicit_target=True, stem="type-import")
+
+
+def _type_export(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"type_library_id": args.library, "type_source": args.source}
+    if hasattr(args, "name") and args.name:
+        params["name"] = args.name
+    return _call(args, "type_export_to_library", params, require_target=True, allow_implicit_target=True, stem="type-export")
+
+
+def _type_library_list(args: argparse.Namespace) -> int:
+    return _call(args, "type_library_list", {}, require_target=True, allow_implicit_target=True, stem="type-library-list")
+
+
+def _type_library_get(args: argparse.Namespace) -> int:
+    return _call(args, "type_library_get", {"type_library_id": args.id}, require_target=True, allow_implicit_target=True, stem="type-library-get")
+
+
+def _type_library_create(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"name": args.name}
+    if hasattr(args, "path") and args.path:
+        params["path"] = args.path
+    if hasattr(args, "add_to_view") and args.add_to_view:
+        params["add_to_view"] = True
+    return _call(args, "type_library_create", params, require_target=True, allow_implicit_target=True, stem="type-library-create")
+
+
+def _type_library_load(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"path": args.path}
+    if hasattr(args, "no_add") and args.no_add:
+        params["add_to_view"] = False
+    return _call(args, "type_library_load", params, require_target=True, allow_implicit_target=True, stem="type-library-load")
+
+
+def _type_archive_list(args: argparse.Namespace) -> int:
+    return _call(args, "type_archive_list", {}, require_target=True, allow_implicit_target=True, stem="type-archive-list")
+
+
+def _type_archive_get(args: argparse.Namespace) -> int:
+    return _call(args, "type_archive_get", {"type_archive_id": args.id}, require_target=True, allow_implicit_target=True, stem="type-archive-get")
+
+
+def _type_archive_create(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"path": args.path}
+    if hasattr(args, "attach") and args.attach:
+        params["attach"] = True
+    return _call(args, "type_archive_create", params, require_target=True, allow_implicit_target=True, stem="type-archive-create")
+
+
+def _type_archive_open(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"path": args.path}
+    if hasattr(args, "attach") and args.attach:
+        params["attach"] = True
+    return _call(args, "type_archive_open", params, require_target=True, allow_implicit_target=True, stem="type-archive-open")
+
+
+def _type_archive_pull(args: argparse.Namespace) -> int:
+    return _call(args, "type_archive_pull", {"type_archive_id": args.id, "names": args.names}, require_target=True, allow_implicit_target=True, stem="type-archive-pull")
+
+
+def _type_archive_push(args: argparse.Namespace) -> int:
+    return _call(args, "type_archive_push", {"type_archive_id": args.id, "names": args.names}, require_target=True, allow_implicit_target=True, stem="type-archive-push")
+
+
+# =========================================================================
+# Annotation handlers
+# =========================================================================
+
+
+def _annotation_add_tag(args: argparse.Namespace) -> int:
+    return _call(args, "annotation_add_tag", {"address": args.address, "tag_type": args.tag_type, "data": args.data}, require_target=True, allow_implicit_target=True, stem="annotation-add-tag")
+
+
+def _annotation_get_tags(args: argparse.Namespace) -> int:
+    return _call(args, "annotation_get_tags", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="annotation-get-tags")
+
+
+def _annotation_define_data_var(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if hasattr(args, "type_name") and args.type_name:
+        params["type_name"] = args.type_name
+    if hasattr(args, "name") and args.name:
+        params["name"] = args.name
+    if hasattr(args, "width") and args.width:
+        params["width"] = args.width
+    return _call(args, "annotation_define_data_var", params, require_target=True, allow_implicit_target=True, stem="annotation-define-data-var")
+
+
+def _annotation_undefine_data_var(args: argparse.Namespace) -> int:
+    return _call(args, "annotation_undefine_data_var", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="annotation-undefine-data-var")
+
+
+def _annotation_define_symbol(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address, "name": args.name}
+    if hasattr(args, "symbol_type") and args.symbol_type:
+        params["symbol_type"] = args.symbol_type
+    return _call(args, "annotation_define_symbol", params, require_target=True, allow_implicit_target=True, stem="annotation-define-symbol")
+
+
+def _annotation_undefine_symbol(args: argparse.Namespace) -> int:
+    return _call(args, "annotation_undefine_symbol", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="annotation-undefine-symbol")
+
+
+def _annotation_rename_data_var(args: argparse.Namespace) -> int:
+    return _call(args, "annotation_rename_data_var", {"address": args.address, "new_name": args.new_name}, require_target=True, allow_implicit_target=True, stem="annotation-rename-data-var")
+
+
+# =========================================================================
+# Undo handlers
+# =========================================================================
+
+
+def _undo_begin(args: argparse.Namespace) -> int:
+    return _call(args, "undo_begin", {}, require_target=True, allow_implicit_target=True, stem="undo-begin")
+
+
+def _undo_commit(args: argparse.Namespace) -> int:
+    return _call(args, "undo_commit", {}, require_target=True, allow_implicit_target=True, stem="undo-commit")
+
+
+def _undo_revert(args: argparse.Namespace) -> int:
+    return _call(args, "undo_revert", {}, require_target=True, allow_implicit_target=True, stem="undo-revert")
+
+
+def _undo_undo(args: argparse.Namespace) -> int:
+    return _call(args, "undo_undo", {}, require_target=True, allow_implicit_target=True, stem="undo-undo")
+
+
+def _undo_redo(args: argparse.Namespace) -> int:
+    return _call(args, "undo_redo", {}, require_target=True, allow_implicit_target=True, stem="undo-redo")
+
+
+# =========================================================================
+# UIDF handlers
+# =========================================================================
+
+
+def _uidf_set(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {
+        "function_start": args.function_start,
+        "address": args.address,
+        "var_name": args.var_name,
+        "value": args.value,
+    }
+    if hasattr(args, "def_site_address") and args.def_site_address:
+        params["def_site_address"] = args.def_site_address
+    if hasattr(args, "state") and args.state:
+        params["state"] = args.state
+    return _call(args, "uidf_set_user_var_value", params, require_target=True, allow_implicit_target=True, stem="uidf-set")
+
+
+def _uidf_clear(args: argparse.Namespace) -> int:
+    return _call(args, "uidf_clear_user_var_value", {"function_start": args.function_start, "address": args.address, "var_name": args.var_name}, require_target=True, allow_implicit_target=True, stem="uidf-clear")
+
+
+def _uidf_list(args: argparse.Namespace) -> int:
+    return _call(args, "uidf_list_user_var_values", {"function_start": args.function_start}, require_target=True, allow_implicit_target=True, stem="uidf-list")
+
+
+def _uidf_parse(args: argparse.Namespace) -> int:
+    return _call(args, "uidf_parse_possible_value", {"value": args.value, "state": args.state}, require_target=True, allow_implicit_target=True, stem="uidf-parse")
+
+
+# =========================================================================
+# Loader handlers
+# =========================================================================
+
+
+def _loader_settings_get(args: argparse.Namespace) -> int:
+    return _call(args, "loader_load_settings_get", {"type_name": args.type_name}, require_target=True, allow_implicit_target=True, stem="loader-settings-get")
+
+
+def _loader_settings_set(args: argparse.Namespace) -> int:
+    return _call(args, "loader_load_settings_set", {"type_name": args.type_name, "key": args.key, "value": args.value}, require_target=True, allow_implicit_target=True, stem="loader-settings-set")
+
+
+def _loader_settings_types(args: argparse.Namespace) -> int:
+    return _call(args, "loader_load_settings_types", {}, require_target=True, allow_implicit_target=True, stem="loader-settings-types")
+
+
+def _loader_rebase(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if hasattr(args, "force") and args.force:
+        params["force"] = True
+    return _call(args, "loader_rebase", params, require_target=True, allow_implicit_target=True, stem="loader-rebase")
+
+
+# =========================================================================
+# External library handlers
+# =========================================================================
+
+
+def _external_library_add(args: argparse.Namespace) -> int:
+    return _call(args, "external_library_add", {"name": args.name}, require_target=True, allow_implicit_target=True, stem="external-library-add")
+
+
+def _external_library_list(args: argparse.Namespace) -> int:
+    return _call(args, "external_library_list", {}, require_target=True, allow_implicit_target=True, stem="external-library-list")
+
+
+def _external_library_remove(args: argparse.Namespace) -> int:
+    return _call(args, "external_library_remove", {"name": args.name}, require_target=True, allow_implicit_target=True, stem="external-library-remove")
+
+
+def _external_location_add(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"source_address": args.source_address}
+    if hasattr(args, "library_name") and args.library_name:
+        params["library_name"] = args.library_name
+    if hasattr(args, "target_symbol") and args.target_symbol:
+        params["target_symbol"] = args.target_symbol
+    if hasattr(args, "target_address") and args.target_address:
+        params["target_address"] = args.target_address
+    return _call(args, "external_location_add", params, require_target=True, allow_implicit_target=True, stem="external-location-add")
+
+
+def _external_location_get(args: argparse.Namespace) -> int:
+    return _call(args, "external_location_get", {"source_address": args.source_address}, require_target=True, allow_implicit_target=True, stem="external-location-get")
+
+
+def _external_location_remove(args: argparse.Namespace) -> int:
+    return _call(args, "external_location_remove", {"source_address": args.source_address}, require_target=True, allow_implicit_target=True, stem="external-location-remove")
+
+
+# =========================================================================
+# Analysis handlers
+# =========================================================================
+
+
+def _analysis_status(args: argparse.Namespace) -> int:
+    return _call(args, "analysis_status", {}, require_target=True, allow_implicit_target=True, stem="analysis-status")
+
+
+def _analysis_progress(args: argparse.Namespace) -> int:
+    return _call(args, "analysis_progress", {}, require_target=True, allow_implicit_target=True, stem="analysis-progress")
+
+
+def _analysis_abort(args: argparse.Namespace) -> int:
+    return _call(args, "analysis_abort", {}, require_target=True, allow_implicit_target=True, stem="analysis-abort")
+
+
+def _analysis_set_hold(args: argparse.Namespace) -> int:
+    return _call(args, "analysis_set_hold", {"hold": args.hold}, require_target=True, allow_implicit_target=True, stem="analysis-hold")
+
+
+def _analysis_update(args: argparse.Namespace) -> int:
+    return _call(args, "analysis_update", {}, require_target=True, allow_implicit_target=True, stem="analysis-update")
+
+
+def _analysis_update_and_wait(args: argparse.Namespace) -> int:
+    return _call(args, "analysis_update_and_wait", {}, require_target=True, allow_implicit_target=True, stem="analysis-update-wait")
+
+
+# =========================================================================
+# Metadata handlers
+# =========================================================================
+
+
+def _metadata_query(args: argparse.Namespace) -> int:
+    return _call(args, "metadata_query", {"key": args.key}, require_target=True, allow_implicit_target=True, stem="metadata-query")
+
+
+def _metadata_store(args: argparse.Namespace) -> int:
+    return _call(args, "metadata_store", {"key": args.key, "value": args.value}, require_target=True, allow_implicit_target=True, stem="metadata-store")
+
+
+def _metadata_remove(args: argparse.Namespace) -> int:
+    return _call(args, "metadata_remove", {"key": args.key}, require_target=True, allow_implicit_target=True, stem="metadata-remove")
+
+
+# =========================================================================
+# Data handlers
+# =========================================================================
+
+
+def _data_typed_at(args: argparse.Namespace) -> int:
+    return _call(args, "data_typed_at", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="data-typed-at")
+
+
+# =========================================================================
+# Xref extended handlers
+# =========================================================================
+
+
+def _xref_code_refs_from(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if hasattr(args, "length") and args.length:
+        params["length"] = args.length
+    return _call(args, "xref_code_refs_from", params, require_target=True, allow_implicit_target=True, stem="xref-code-refs-from")
+
+
+def _xref_code_refs_to(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if hasattr(args, "limit") and args.limit:
+        params["limit"] = args.limit
+    return _call(args, "xref_code_refs_to", params, require_target=True, allow_implicit_target=True, stem="xref-code-refs-to")
+
+
+def _xref_data_refs_from(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if hasattr(args, "length") and args.length:
+        params["length"] = args.length
+    return _call(args, "xref_data_refs_from", params, require_target=True, allow_implicit_target=True, stem="xref-data-refs-from")
+
+
+def _xref_data_refs_to(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"address": args.address}
+    if hasattr(args, "limit") and args.limit:
+        params["limit"] = args.limit
+    return _call(args, "xref_data_refs_to", params, require_target=True, allow_implicit_target=True, stem="xref-data-refs-to")
+
+
+# =========================================================================
+# IL extended handlers
+# =========================================================================
+
+
+def _il_address_to_index(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"function_start": args.function_start, "address": args.address}
+    if hasattr(args, "level") and args.level:
+        params["level"] = args.level
+    return _call(args, "il_address_to_index", params, require_target=True, allow_implicit_target=True, stem="il-addr-to-index")
+
+
+def _il_index_to_address(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"function_start": args.function_start, "index": args.index}
+    if hasattr(args, "level") and args.level:
+        params["level"] = args.level
+    return _call(args, "il_index_to_address", params, require_target=True, allow_implicit_target=True, stem="il-index-to-addr")
+
+
+def _il_instruction_by_addr(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"function_start": args.function_start, "address": args.address}
+    if hasattr(args, "level") and args.level:
+        params["level"] = args.level
+    return _call(args, "il_instruction_by_addr", params, require_target=True, allow_implicit_target=True, stem="il-instr-at")
+
+
+# =========================================================================
+# Section/Segment user handlers
+# =========================================================================
+
+
+def _section_add_user(args: argparse.Namespace) -> int:
+    return _call(args, "section_add_user", {"name": args.name, "start": args.start, "length": args.length}, require_target=True, allow_implicit_target=True, stem="section-add")
+
+
+def _section_remove_user(args: argparse.Namespace) -> int:
+    return _call(args, "section_remove_user", {"name": args.name}, require_target=True, allow_implicit_target=True, stem="section-remove")
+
+
+def _segment_add_user(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"start": args.start, "length": args.length}
+    if hasattr(args, "data_offset") and args.data_offset is not None:
+        params["data_offset"] = args.data_offset
+    if hasattr(args, "data_length") and args.data_length is not None:
+        params["data_length"] = args.data_length
+    if hasattr(args, "flags") and args.flags is not None:
+        params["flags"] = args.flags
+    return _call(args, "segment_add_user", params, require_target=True, allow_implicit_target=True, stem="segment-add")
+
+
+def _segment_remove_user(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"start": args.start}
+    if hasattr(args, "length") and args.length:
+        params["length"] = args.length
+    return _call(args, "segment_remove_user", params, require_target=True, allow_implicit_target=True, stem="segment-remove")
+
+
+# =========================================================================
+# Debug handlers
+# =========================================================================
+
+
+def _debug_parsers(args: argparse.Namespace) -> int:
+    return _call(args, "debug_parsers", {}, require_target=True, allow_implicit_target=True, stem="debug-parsers")
+
+
+def _debug_parse_and_apply(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if hasattr(args, "parser_name") and args.parser_name:
+        params["parser_name"] = args.parser_name
+    if hasattr(args, "debug_path") and args.debug_path:
+        params["debug_path"] = args.debug_path
+    return _call(args, "debug_parse_and_apply", params, require_target=True, allow_implicit_target=True, stem="debug-apply")
+
+
+# =========================================================================
+# Plugin handlers
+# =========================================================================
+
+
+def _plugin_valid_commands(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if hasattr(args, "address") and args.address:
+        params["address"] = args.address
+    return _call(args, "plugin_valid_commands", params, require_target=True, allow_implicit_target=True, stem="plugin-commands")
+
+
+def _plugin_execute(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"name": args.name}
+    if hasattr(args, "address") and args.address:
+        params["address"] = args.address
+    return _call(args, "plugin_execute", params, require_target=True, allow_implicit_target=True, stem="plugin-execute")
+
+
+# =========================================================================
+# Binary extended handlers
+# =========================================================================
+
+
+def _binary_basic_blocks_at(args: argparse.Namespace) -> int:
+    return _call(args, "binary_basic_blocks_at", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="binary-bbs-at")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
@@ -2798,6 +3701,26 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(function_info, required=False)
     function_info.add_argument("identifier")
     function_info.set_defaults(handler=_function_info)
+    function_bb = function_sub.add_parser("basic-blocks", help="List basic blocks for a function")
+    _common_io_options(function_bb)
+    _target_option(function_bb, required=False)
+    function_bb.add_argument("identifier")
+    function_bb.set_defaults(handler=_function_basic_blocks)
+    function_callers_p = function_sub.add_parser("callers", help="List callers of a function")
+    _common_io_options(function_callers_p)
+    _target_option(function_callers_p, required=False)
+    function_callers_p.add_argument("identifier")
+    function_callers_p.set_defaults(handler=_function_callers)
+    function_callees_p = function_sub.add_parser("callees", help="List callees from a function")
+    _common_io_options(function_callees_p)
+    _target_option(function_callees_p, required=False)
+    function_callees_p.add_argument("identifier")
+    function_callees_p.set_defaults(handler=_function_callees)
+    function_force = function_sub.add_parser("force-analysis", help="Force re-analysis of a function")
+    _common_io_options(function_force, default_format="json")
+    _target_option(function_force, required=False)
+    function_force.add_argument("identifier")
+    function_force.set_defaults(handler=_function_force_analysis)
 
     decompile = subparsers.add_parser("decompile", help="Render HLIL-style decompile text for a function")
     _common_io_options(decompile)
@@ -2818,6 +3741,20 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(disasm, required=False)
     disasm.add_argument("identifier")
     disasm.set_defaults(handler=_disasm)
+
+    disasm_linear = subparsers.add_parser("disasm-linear", help="Disassemble linearly from an address")
+    _common_io_options(disasm_linear)
+    _target_option(disasm_linear, required=False)
+    disasm_linear.add_argument("address")
+    disasm_linear.add_argument("--count", type=int, default=50, help="Number of instructions")
+    disasm_linear.set_defaults(handler=_disasm_linear)
+
+    disasm_range = subparsers.add_parser("disasm-range", help="Disassemble an address range")
+    _common_io_options(disasm_range)
+    _target_option(disasm_range, required=False)
+    disasm_range.add_argument("start")
+    disasm_range.add_argument("end")
+    disasm_range.set_defaults(handler=_disasm_range)
 
     xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function, or `field <Struct.field>`")
     _common_io_options(xrefs)
@@ -3014,6 +3951,187 @@ def build_parser() -> argparse.ArgumentParser:
     batch_apply.add_argument("manifest", type=Path)
     batch_apply.set_defaults(handler=_batch_apply)
 
+    # --- patch ---
+    patch = subparsers.add_parser("patch", help="Binary patching operations")
+    patch_sub = patch.add_subparsers(dest="patch_command")
+    patch_status_p = patch_sub.add_parser("status", help="Show current patch status")
+    _common_io_options(patch_status_p)
+    _target_option(patch_status_p, required=False)
+    patch_status_p.set_defaults(handler=_patch_status)
+    patch_assemble_p = patch_sub.add_parser("assemble", help="Assemble and patch at address")
+    _common_io_options(patch_assemble_p, default_format="json")
+    _target_option(patch_assemble_p, required=False)
+    patch_assemble_p.add_argument("address")
+    patch_assemble_p.add_argument("assembly")
+    patch_assemble_p.set_defaults(handler=_patch_assemble)
+    patch_nop_p = patch_sub.add_parser("nop", help="NOP out an address range")
+    _common_io_options(patch_nop_p, default_format="json")
+    _target_option(patch_nop_p, required=False)
+    patch_nop_p.add_argument("address")
+    patch_nop_p.add_argument("--length", type=int, default=4)
+    patch_nop_p.set_defaults(handler=_patch_nop)
+    patch_always_p = patch_sub.add_parser("always-branch", help="Force branch to always be taken")
+    _common_io_options(patch_always_p, default_format="json")
+    _target_option(patch_always_p, required=False)
+    patch_always_p.add_argument("address")
+    patch_always_p.set_defaults(handler=_patch_always_branch)
+    patch_invert_p = patch_sub.add_parser("invert-branch", help="Invert branch condition")
+    _common_io_options(patch_invert_p, default_format="json")
+    _target_option(patch_invert_p, required=False)
+    patch_invert_p.add_argument("address")
+    patch_invert_p.set_defaults(handler=_patch_invert_branch)
+    patch_never_p = patch_sub.add_parser("never-branch", help="Force branch to never be taken")
+    _common_io_options(patch_never_p, default_format="json")
+    _target_option(patch_never_p, required=False)
+    patch_never_p.add_argument("address")
+    patch_never_p.set_defaults(handler=_patch_never_branch)
+    patch_skip_p = patch_sub.add_parser("skip-and-return", help="Skip function call and return value")
+    _common_io_options(patch_skip_p, default_format="json")
+    _target_option(patch_skip_p, required=False)
+    patch_skip_p.add_argument("address")
+    patch_skip_p.add_argument("--return-value", type=int, default=0)
+    patch_skip_p.set_defaults(handler=_patch_skip_and_return)
+
+    # --- memory ---
+    memory = subparsers.add_parser("memory", help="Raw memory read/write operations")
+    memory_sub = memory.add_subparsers(dest="memory_command")
+    memory_read_p = memory_sub.add_parser("read", help="Read raw bytes from address")
+    _common_io_options(memory_read_p)
+    _target_option(memory_read_p, required=False)
+    memory_read_p.add_argument("address")
+    memory_read_p.add_argument("--length", type=int, default=256)
+    memory_read_p.set_defaults(handler=_memory_read)
+    memory_write_p = memory_sub.add_parser("write", help="Write raw bytes at address")
+    _common_io_options(memory_write_p, default_format="json")
+    _target_option(memory_write_p, required=False)
+    memory_write_p.add_argument("address")
+    memory_write_p.add_argument("hex_data", help="Hex string of bytes to write")
+    memory_write_p.set_defaults(handler=_memory_write)
+    memory_insert_p = memory_sub.add_parser("insert", help="Insert bytes at address")
+    _common_io_options(memory_insert_p, default_format="json")
+    _target_option(memory_insert_p, required=False)
+    memory_insert_p.add_argument("address")
+    memory_insert_p.add_argument("hex_data", help="Hex string of bytes to insert")
+    memory_insert_p.set_defaults(handler=_memory_insert)
+    memory_remove_p = memory_sub.add_parser("remove", help="Remove bytes at address")
+    _common_io_options(memory_remove_p, default_format="json")
+    _target_option(memory_remove_p, required=False)
+    memory_remove_p.add_argument("address")
+    memory_remove_p.add_argument("--length", type=int, required=True)
+    memory_remove_p.set_defaults(handler=_memory_remove)
+    memory_reader_p = memory_sub.add_parser("reader", help="Read using BinaryReader at address")
+    _common_io_options(memory_reader_p)
+    _target_option(memory_reader_p, required=False)
+    memory_reader_p.add_argument("address")
+    memory_reader_p.add_argument("--length", type=int, default=256)
+    memory_reader_p.set_defaults(handler=_memory_reader)
+    memory_writer_p = memory_sub.add_parser("writer", help="Write typed value using BinaryWriter")
+    _common_io_options(memory_writer_p, default_format="json")
+    _target_option(memory_writer_p, required=False)
+    memory_writer_p.add_argument("address")
+    memory_writer_p.add_argument("value", help="Integer value to write")
+    memory_writer_p.add_argument("--width", type=int, choices=(1, 2, 4, 8), default=4, help="Width in bytes")
+    memory_writer_p.add_argument("--endian", choices=("little", "big"), default="little")
+    memory_writer_p.set_defaults(handler=_memory_writer)
+
+    # --- value ---
+    value = subparsers.add_parser("value", help="Register/stack value analysis at IL instructions")
+    value_sub = value.add_subparsers(dest="value_command")
+    value_reg_p = value_sub.add_parser("reg", help="Get register value at an instruction")
+    _common_io_options(value_reg_p)
+    _target_option(value_reg_p, required=False)
+    value_reg_p.add_argument("function", help="Function identifier")
+    value_reg_p.add_argument("instr_index", type=int, help="IL instruction index")
+    value_reg_p.add_argument("register", help="Register name")
+    value_reg_p.set_defaults(handler=_value_reg)
+    value_stack_p = value_sub.add_parser("stack", help="Get stack value at an instruction")
+    _common_io_options(value_stack_p)
+    _target_option(value_stack_p, required=False)
+    value_stack_p.add_argument("function", help="Function identifier")
+    value_stack_p.add_argument("instr_index", type=int, help="IL instruction index")
+    value_stack_p.add_argument("offset", type=int, help="Stack offset")
+    value_stack_p.add_argument("--size", type=int, default=8)
+    value_stack_p.set_defaults(handler=_value_stack)
+    value_possible_p = value_sub.add_parser("possible", help="Get possible values at an instruction")
+    _common_io_options(value_possible_p)
+    _target_option(value_possible_p, required=False)
+    value_possible_p.add_argument("function", help="Function identifier")
+    value_possible_p.add_argument("instr_index", type=int, help="IL instruction index")
+    value_possible_p.add_argument("register", help="Register name")
+    value_possible_p.set_defaults(handler=_value_possible)
+    value_flags_p = value_sub.add_parser("flags", help="Get flag values at an instruction")
+    _common_io_options(value_flags_p)
+    _target_option(value_flags_p, required=False)
+    value_flags_p.add_argument("function", help="Function identifier")
+    value_flags_p.add_argument("instr_index", type=int, help="IL instruction index")
+    value_flags_p.add_argument("flag", help="Flag name")
+    value_flags_p.set_defaults(handler=_value_flags)
+
+    # --- search ---
+    search = subparsers.add_parser("search", help="Search binary content")
+    search_sub = search.add_subparsers(dest="search_command")
+    search_bytes_p = search_sub.add_parser("bytes", help="Search for byte pattern")
+    _common_io_options(search_bytes_p)
+    _target_option(search_bytes_p, required=False)
+    search_bytes_p.add_argument("pattern", help="Hex byte pattern (e.g. '48 8b 05 ?? ?? ?? ??')")
+    search_bytes_p.add_argument("--start", help="Start address")
+    search_bytes_p.add_argument("--end", help="End address")
+    search_bytes_p.add_argument("--limit", type=int, default=100)
+    search_bytes_p.set_defaults(handler=_search_bytes)
+    search_constant_p = search_sub.add_parser("constant", help="Search for numeric constant in IL")
+    _common_io_options(search_constant_p)
+    _target_option(search_constant_p, required=False)
+    search_constant_p.add_argument("value", help="Constant value (hex or decimal)")
+    search_constant_p.add_argument("--limit", type=int, default=100)
+    search_constant_p.set_defaults(handler=_search_constant)
+    search_text_p = search_sub.add_parser("text", help="Search for text/regex in decompiled output")
+    _common_io_options(search_text_p)
+    _target_option(search_text_p, required=False)
+    search_text_p.add_argument("pattern", help="Text or regex pattern")
+    search_text_p.add_argument("--regex", action="store_true", help="Interpret pattern as regex")
+    search_text_p.add_argument("--il-type", choices=("hlil", "mlil", "llil", "disasm"), default="hlil")
+    search_text_p.add_argument("--limit", type=int, default=50)
+    search_text_p.set_defaults(handler=_search_text_handler)
+
+    # --- arch ---
+    arch = subparsers.add_parser("arch", help="Architecture information and utilities")
+    arch_sub = arch.add_subparsers(dest="arch_command")
+    arch_info_p = arch_sub.add_parser("info", help="Show architecture info for target")
+    _common_io_options(arch_info_p)
+    _target_option(arch_info_p, required=False)
+    arch_info_p.set_defaults(handler=_arch_info)
+    arch_assemble_p = arch_sub.add_parser("assemble", help="Assemble instructions")
+    _common_io_options(arch_assemble_p)
+    _target_option(arch_assemble_p, required=False)
+    arch_assemble_p.add_argument("assembly", help="Assembly code to assemble")
+    arch_assemble_p.add_argument("--address", default="0x0", help="Address context for assembly")
+    arch_assemble_p.set_defaults(handler=_arch_assemble)
+    arch_disasm_p = arch_sub.add_parser("disasm-bytes", help="Disassemble raw bytes")
+    _common_io_options(arch_disasm_p)
+    _target_option(arch_disasm_p, required=False)
+    arch_disasm_p.add_argument("hex_bytes", help="Hex string of bytes to disassemble")
+    arch_disasm_p.add_argument("--address", default="0x0", help="Address context")
+    arch_disasm_p.add_argument("--count", type=int, help="Max instructions to decode")
+    arch_disasm_p.set_defaults(handler=_arch_disasm_bytes)
+
+    # --- segments / sections / data-vars ---
+    segments_p = subparsers.add_parser("segments", help="List binary segments")
+    _common_io_options(segments_p)
+    _target_option(segments_p, required=False)
+    segments_p.set_defaults(handler=_list_segments)
+
+    sections_p = subparsers.add_parser("sections", help="List binary sections")
+    _common_io_options(sections_p)
+    _target_option(sections_p, required=False)
+    sections_p.set_defaults(handler=_list_sections)
+
+    data_vars_p = subparsers.add_parser("data-vars", help="List data variables")
+    _common_io_options(data_vars_p)
+    _target_option(data_vars_p, required=False)
+    _add_paged_args(data_vars_p)
+    data_vars_p.add_argument("--query", help="Filter by name/address substring")
+    data_vars_p.set_defaults(handler=_list_data_vars)
+
     api_docs_parser = subparsers.add_parser(
         "api-docs",
         help="Query Binary Ninja's local Python API docs (no target needed)",
@@ -3088,6 +4206,575 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(api_docs_refresh, default_format="json")
     _docs_dir_arg(api_docs_refresh)
     api_docs_refresh.set_defaults(handler=_api_docs_refresh)
+
+    # -----------------------------------------------------------------
+    # database
+    # -----------------------------------------------------------------
+    database_p = subparsers.add_parser("database", help="Database operations (bndb)")
+    database_sub = database_p.add_subparsers(dest="database_command")
+
+    db_info = database_sub.add_parser("info", help="Show database info")
+    _common_io_options(db_info)
+    _target_option(db_info, required=False)
+    db_info.set_defaults(handler=_database_info)
+
+    db_read = database_sub.add_parser("read-global", help="Read a global database key")
+    _common_io_options(db_read)
+    _target_option(db_read, required=False)
+    db_read.add_argument("key", help="Key to read")
+    db_read.set_defaults(handler=_database_read_global)
+
+    db_write = database_sub.add_parser("write-global", help="Write a global database key")
+    _common_io_options(db_write, default_format="json")
+    _target_option(db_write, required=False)
+    db_write.add_argument("key", help="Key to write")
+    db_write.add_argument("value", help="Value to write")
+    db_write.set_defaults(handler=_database_write_global)
+
+    db_snaps = database_sub.add_parser("snapshots", help="List database snapshots")
+    _common_io_options(db_snaps)
+    _target_option(db_snaps, required=False)
+    _add_paged_args(db_snaps)
+    db_snaps.set_defaults(handler=_database_snapshots)
+
+    db_save = database_sub.add_parser("save", help="Save auto snapshot")
+    _common_io_options(db_save, default_format="json")
+    _target_option(db_save, required=False)
+    db_save.set_defaults(handler=_database_save_auto_snapshot)
+
+    db_create = database_sub.add_parser("create-bndb", help="Create a new .bndb file")
+    _common_io_options(db_create, default_format="json")
+    _target_option(db_create, required=False)
+    db_create.add_argument("path", help="Path for new .bndb")
+    db_create.set_defaults(handler=_database_create_bndb)
+
+    # -----------------------------------------------------------------
+    # type (extended) - add subcommands to existing type parser if needed
+    # -----------------------------------------------------------------
+    type_ext_p = subparsers.add_parser("type-ext", help="Extended type operations")
+    type_ext_sub = type_ext_p.add_subparsers(dest="type_ext_command")
+
+    te_rename = type_ext_sub.add_parser("rename", help="Rename a user type")
+    _common_io_options(te_rename, default_format="json")
+    _target_option(te_rename, required=False)
+    te_rename.add_argument("old_name")
+    te_rename.add_argument("new_name")
+    te_rename.set_defaults(handler=_type_rename)
+
+    te_undef = type_ext_sub.add_parser("undefine", help="Undefine a user type")
+    _common_io_options(te_undef, default_format="json")
+    _target_option(te_undef, required=False)
+    te_undef.add_argument("name")
+    te_undef.set_defaults(handler=_type_undefine)
+
+    te_parse = type_ext_sub.add_parser("parse", help="Parse a type string")
+    _common_io_options(te_parse)
+    _target_option(te_parse, required=False)
+    te_parse.add_argument("source", help="C type string to parse")
+    te_parse.set_defaults(handler=_type_parse)
+
+    te_import = type_ext_sub.add_parser("import", help="Import type/object from library")
+    _common_io_options(te_import, default_format="json")
+    _target_option(te_import, required=False)
+    te_import.add_argument("name", help="Name to import")
+    te_import.add_argument("--kind", choices=["type", "object"], default="type")
+    te_import.add_argument("--library", help="Specific type library to search")
+    te_import.set_defaults(handler=_type_import)
+
+    te_export = type_ext_sub.add_parser("export", help="Export type to library")
+    _common_io_options(te_export, default_format="json")
+    _target_option(te_export, required=False)
+    te_export.add_argument("library", help="Target type library ID/name")
+    te_export.add_argument("source", help="C type definition")
+    te_export.add_argument("--name", help="Override name")
+    te_export.set_defaults(handler=_type_export)
+
+    te_lib_list = type_ext_sub.add_parser("library-list", help="List type libraries")
+    _common_io_options(te_lib_list)
+    _target_option(te_lib_list, required=False)
+    te_lib_list.set_defaults(handler=_type_library_list)
+
+    te_lib_get = type_ext_sub.add_parser("library-get", help="Get type library detail")
+    _common_io_options(te_lib_get)
+    _target_option(te_lib_get, required=False)
+    te_lib_get.add_argument("id", help="Library name or GUID")
+    te_lib_get.set_defaults(handler=_type_library_get)
+
+    te_lib_create = type_ext_sub.add_parser("library-create", help="Create type library")
+    _common_io_options(te_lib_create, default_format="json")
+    _target_option(te_lib_create, required=False)
+    te_lib_create.add_argument("name")
+    te_lib_create.add_argument("--path", help="Save to file path")
+    te_lib_create.add_argument("--add-to-view", action="store_true")
+    te_lib_create.set_defaults(handler=_type_library_create)
+
+    te_lib_load = type_ext_sub.add_parser("library-load", help="Load type library from file")
+    _common_io_options(te_lib_load, default_format="json")
+    _target_option(te_lib_load, required=False)
+    te_lib_load.add_argument("path")
+    te_lib_load.add_argument("--no-add", action="store_true", help="Don't add to view")
+    te_lib_load.set_defaults(handler=_type_library_load)
+
+    te_arc_list = type_ext_sub.add_parser("archive-list", help="List type archives")
+    _common_io_options(te_arc_list)
+    _target_option(te_arc_list, required=False)
+    te_arc_list.set_defaults(handler=_type_archive_list)
+
+    te_arc_get = type_ext_sub.add_parser("archive-get", help="Get type archive detail")
+    _common_io_options(te_arc_get)
+    _target_option(te_arc_get, required=False)
+    te_arc_get.add_argument("id", help="Archive ID")
+    te_arc_get.set_defaults(handler=_type_archive_get)
+
+    te_arc_create = type_ext_sub.add_parser("archive-create", help="Create type archive")
+    _common_io_options(te_arc_create, default_format="json")
+    _target_option(te_arc_create, required=False)
+    te_arc_create.add_argument("path")
+    te_arc_create.add_argument("--attach", action="store_true")
+    te_arc_create.set_defaults(handler=_type_archive_create)
+
+    te_arc_open = type_ext_sub.add_parser("archive-open", help="Open type archive from file")
+    _common_io_options(te_arc_open, default_format="json")
+    _target_option(te_arc_open, required=False)
+    te_arc_open.add_argument("path")
+    te_arc_open.add_argument("--attach", action="store_true")
+    te_arc_open.set_defaults(handler=_type_archive_open)
+
+    te_arc_pull = type_ext_sub.add_parser("archive-pull", help="Pull types from archive")
+    _common_io_options(te_arc_pull, default_format="json")
+    _target_option(te_arc_pull, required=False)
+    te_arc_pull.add_argument("id", help="Archive ID")
+    te_arc_pull.add_argument("names", nargs="+", help="Type names to pull")
+    te_arc_pull.set_defaults(handler=_type_archive_pull)
+
+    te_arc_push = type_ext_sub.add_parser("archive-push", help="Push types to archive")
+    _common_io_options(te_arc_push, default_format="json")
+    _target_option(te_arc_push, required=False)
+    te_arc_push.add_argument("id", help="Archive ID")
+    te_arc_push.add_argument("names", nargs="+", help="Type names to push")
+    te_arc_push.set_defaults(handler=_type_archive_push)
+
+    # -----------------------------------------------------------------
+    # annotation
+    # -----------------------------------------------------------------
+    annot_p = subparsers.add_parser("annotation", help="Annotation operations (tags, data vars, symbols)")
+    annot_sub = annot_p.add_subparsers(dest="annotation_command")
+
+    annot_add_tag = annot_sub.add_parser("add-tag", help="Add tag at address")
+    _common_io_options(annot_add_tag, default_format="json")
+    _target_option(annot_add_tag, required=False)
+    annot_add_tag.add_argument("address")
+    annot_add_tag.add_argument("tag_type")
+    annot_add_tag.add_argument("data")
+    annot_add_tag.set_defaults(handler=_annotation_add_tag)
+
+    annot_get_tags = annot_sub.add_parser("get-tags", help="Get tags at address")
+    _common_io_options(annot_get_tags)
+    _target_option(annot_get_tags, required=False)
+    annot_get_tags.add_argument("address")
+    annot_get_tags.set_defaults(handler=_annotation_get_tags)
+
+    annot_def_dv = annot_sub.add_parser("define-data-var", help="Define data variable at address")
+    _common_io_options(annot_def_dv, default_format="json")
+    _target_option(annot_def_dv, required=False)
+    annot_def_dv.add_argument("address")
+    annot_def_dv.add_argument("--type-name", help="C type string")
+    annot_def_dv.add_argument("--name", help="Symbol name")
+    annot_def_dv.add_argument("--width", type=int, help="Width in bytes (if no type)")
+    annot_def_dv.set_defaults(handler=_annotation_define_data_var)
+
+    annot_undef_dv = annot_sub.add_parser("undefine-data-var", help="Undefine data variable")
+    _common_io_options(annot_undef_dv, default_format="json")
+    _target_option(annot_undef_dv, required=False)
+    annot_undef_dv.add_argument("address")
+    annot_undef_dv.set_defaults(handler=_annotation_undefine_data_var)
+
+    annot_def_sym = annot_sub.add_parser("define-symbol", help="Define user symbol at address")
+    _common_io_options(annot_def_sym, default_format="json")
+    _target_option(annot_def_sym, required=False)
+    annot_def_sym.add_argument("address")
+    annot_def_sym.add_argument("name")
+    annot_def_sym.add_argument("--symbol-type", choices=["function", "data", "import", "external"])
+    annot_def_sym.set_defaults(handler=_annotation_define_symbol)
+
+    annot_undef_sym = annot_sub.add_parser("undefine-symbol", help="Undefine user symbol")
+    _common_io_options(annot_undef_sym, default_format="json")
+    _target_option(annot_undef_sym, required=False)
+    annot_undef_sym.add_argument("address")
+    annot_undef_sym.set_defaults(handler=_annotation_undefine_symbol)
+
+    annot_rename_dv = annot_sub.add_parser("rename-data-var", help="Rename data variable")
+    _common_io_options(annot_rename_dv, default_format="json")
+    _target_option(annot_rename_dv, required=False)
+    annot_rename_dv.add_argument("address")
+    annot_rename_dv.add_argument("new_name")
+    annot_rename_dv.set_defaults(handler=_annotation_rename_data_var)
+
+    # -----------------------------------------------------------------
+    # undo
+    # -----------------------------------------------------------------
+    undo_p = subparsers.add_parser("undo", help="Undo/redo operations")
+    undo_sub = undo_p.add_subparsers(dest="undo_command")
+
+    undo_begin_p = undo_sub.add_parser("begin", help="Begin undo group")
+    _common_io_options(undo_begin_p, default_format="json")
+    _target_option(undo_begin_p, required=False)
+    undo_begin_p.set_defaults(handler=_undo_begin)
+
+    undo_commit_p = undo_sub.add_parser("commit", help="Commit undo group")
+    _common_io_options(undo_commit_p, default_format="json")
+    _target_option(undo_commit_p, required=False)
+    undo_commit_p.set_defaults(handler=_undo_commit)
+
+    undo_revert_p = undo_sub.add_parser("revert", help="Revert undo group")
+    _common_io_options(undo_revert_p, default_format="json")
+    _target_option(undo_revert_p, required=False)
+    undo_revert_p.set_defaults(handler=_undo_revert)
+
+    undo_undo_p = undo_sub.add_parser("undo", help="Undo last action")
+    _common_io_options(undo_undo_p, default_format="json")
+    _target_option(undo_undo_p, required=False)
+    undo_undo_p.set_defaults(handler=_undo_undo)
+
+    undo_redo_p = undo_sub.add_parser("redo", help="Redo last undone action")
+    _common_io_options(undo_redo_p, default_format="json")
+    _target_option(undo_redo_p, required=False)
+    undo_redo_p.set_defaults(handler=_undo_redo)
+
+    # -----------------------------------------------------------------
+    # uidf (User IL Data Flow)
+    # -----------------------------------------------------------------
+    uidf_p = subparsers.add_parser("uidf", help="User IL Data Flow operations")
+    uidf_sub = uidf_p.add_subparsers(dest="uidf_command")
+
+    uidf_set_p = uidf_sub.add_parser("set", help="Set user variable value")
+    _common_io_options(uidf_set_p, default_format="json")
+    _target_option(uidf_set_p, required=False)
+    uidf_set_p.add_argument("function_start", help="Function start address")
+    uidf_set_p.add_argument("address", help="Instruction address")
+    uidf_set_p.add_argument("var_name", help="Variable name")
+    uidf_set_p.add_argument("value", help="Constant value")
+    uidf_set_p.add_argument("--def-site-address", help="Definition site address")
+    uidf_set_p.add_argument("--state", default="ConstantValue", help="Value state type")
+    uidf_set_p.set_defaults(handler=_uidf_set)
+
+    uidf_clear_p = uidf_sub.add_parser("clear", help="Clear user variable value")
+    _common_io_options(uidf_clear_p, default_format="json")
+    _target_option(uidf_clear_p, required=False)
+    uidf_clear_p.add_argument("function_start")
+    uidf_clear_p.add_argument("address")
+    uidf_clear_p.add_argument("var_name")
+    uidf_clear_p.set_defaults(handler=_uidf_clear)
+
+    uidf_list_p = uidf_sub.add_parser("list", help="List user variable values for function")
+    _common_io_options(uidf_list_p)
+    _target_option(uidf_list_p, required=False)
+    uidf_list_p.add_argument("function_start")
+    uidf_list_p.set_defaults(handler=_uidf_list)
+
+    uidf_parse_p = uidf_sub.add_parser("parse", help="Parse possible value")
+    _common_io_options(uidf_parse_p)
+    _target_option(uidf_parse_p, required=False)
+    uidf_parse_p.add_argument("value")
+    uidf_parse_p.add_argument("state")
+    uidf_parse_p.set_defaults(handler=_uidf_parse)
+
+    # -----------------------------------------------------------------
+    # loader
+    # -----------------------------------------------------------------
+    loader_p = subparsers.add_parser("loader", help="Loader settings and rebase")
+    loader_sub = loader_p.add_subparsers(dest="loader_command")
+
+    loader_get = loader_sub.add_parser("settings-get", help="Get loader settings")
+    _common_io_options(loader_get)
+    _target_option(loader_get, required=False)
+    loader_get.add_argument("type_name", help="View type name (e.g. ELF)")
+    loader_get.set_defaults(handler=_loader_settings_get)
+
+    loader_set = loader_sub.add_parser("settings-set", help="Set a loader setting")
+    _common_io_options(loader_set, default_format="json")
+    _target_option(loader_set, required=False)
+    loader_set.add_argument("type_name")
+    loader_set.add_argument("key")
+    loader_set.add_argument("value")
+    loader_set.set_defaults(handler=_loader_settings_set)
+
+    loader_types = loader_sub.add_parser("settings-types", help="List available view types")
+    _common_io_options(loader_types)
+    _target_option(loader_types, required=False)
+    loader_types.set_defaults(handler=_loader_settings_types)
+
+    loader_rebase_p = loader_sub.add_parser("rebase", help="Rebase binary to new address")
+    _common_io_options(loader_rebase_p, default_format="json")
+    _target_option(loader_rebase_p, required=False)
+    loader_rebase_p.add_argument("address", help="New base address")
+    loader_rebase_p.add_argument("--force", action="store_true")
+    loader_rebase_p.set_defaults(handler=_loader_rebase)
+
+    # -----------------------------------------------------------------
+    # external
+    # -----------------------------------------------------------------
+    ext_p = subparsers.add_parser("external", help="External library/location operations")
+    ext_sub = ext_p.add_subparsers(dest="external_command")
+
+    ext_lib_add = ext_sub.add_parser("library-add", help="Add external library")
+    _common_io_options(ext_lib_add, default_format="json")
+    _target_option(ext_lib_add, required=False)
+    ext_lib_add.add_argument("name")
+    ext_lib_add.set_defaults(handler=_external_library_add)
+
+    ext_lib_list = ext_sub.add_parser("library-list", help="List external libraries")
+    _common_io_options(ext_lib_list)
+    _target_option(ext_lib_list, required=False)
+    ext_lib_list.set_defaults(handler=_external_library_list)
+
+    ext_lib_rm = ext_sub.add_parser("library-remove", help="Remove external library")
+    _common_io_options(ext_lib_rm, default_format="json")
+    _target_option(ext_lib_rm, required=False)
+    ext_lib_rm.add_argument("name")
+    ext_lib_rm.set_defaults(handler=_external_library_remove)
+
+    ext_loc_add = ext_sub.add_parser("location-add", help="Add external location")
+    _common_io_options(ext_loc_add, default_format="json")
+    _target_option(ext_loc_add, required=False)
+    ext_loc_add.add_argument("source_address")
+    ext_loc_add.add_argument("--library-name")
+    ext_loc_add.add_argument("--target-symbol")
+    ext_loc_add.add_argument("--target-address")
+    ext_loc_add.set_defaults(handler=_external_location_add)
+
+    ext_loc_get = ext_sub.add_parser("location-get", help="Get external location")
+    _common_io_options(ext_loc_get)
+    _target_option(ext_loc_get, required=False)
+    ext_loc_get.add_argument("source_address")
+    ext_loc_get.set_defaults(handler=_external_location_get)
+
+    ext_loc_rm = ext_sub.add_parser("location-remove", help="Remove external location")
+    _common_io_options(ext_loc_rm, default_format="json")
+    _target_option(ext_loc_rm, required=False)
+    ext_loc_rm.add_argument("source_address")
+    ext_loc_rm.set_defaults(handler=_external_location_remove)
+
+    # -----------------------------------------------------------------
+    # analysis
+    # -----------------------------------------------------------------
+    analysis_p = subparsers.add_parser("analysis", help="Analysis control")
+    analysis_sub = analysis_p.add_subparsers(dest="analysis_command")
+
+    analysis_stat = analysis_sub.add_parser("status", help="Get analysis status")
+    _common_io_options(analysis_stat)
+    _target_option(analysis_stat, required=False)
+    analysis_stat.set_defaults(handler=_analysis_status)
+
+    analysis_prog = analysis_sub.add_parser("progress", help="Get analysis progress")
+    _common_io_options(analysis_prog)
+    _target_option(analysis_prog, required=False)
+    analysis_prog.set_defaults(handler=_analysis_progress)
+
+    analysis_abort_p = analysis_sub.add_parser("abort", help="Abort analysis")
+    _common_io_options(analysis_abort_p, default_format="json")
+    _target_option(analysis_abort_p, required=False)
+    analysis_abort_p.set_defaults(handler=_analysis_abort)
+
+    analysis_hold_p = analysis_sub.add_parser("hold", help="Hold/resume analysis")
+    _common_io_options(analysis_hold_p, default_format="json")
+    _target_option(analysis_hold_p, required=False)
+    analysis_hold_p.add_argument("hold", type=lambda x: x.lower() in ("true", "1", "yes"), help="true to hold, false to release")
+    analysis_hold_p.set_defaults(handler=_analysis_set_hold)
+
+    analysis_upd = analysis_sub.add_parser("update", help="Trigger analysis update (async)")
+    _common_io_options(analysis_upd, default_format="json")
+    _target_option(analysis_upd, required=False)
+    analysis_upd.set_defaults(handler=_analysis_update)
+
+    analysis_upd_wait = analysis_sub.add_parser("update-wait", help="Trigger and wait for analysis")
+    _common_io_options(analysis_upd_wait, default_format="json")
+    _target_option(analysis_upd_wait, required=False)
+    analysis_upd_wait.set_defaults(handler=_analysis_update_and_wait)
+
+    # -----------------------------------------------------------------
+    # metadata (view-level)
+    # -----------------------------------------------------------------
+    meta_p = subparsers.add_parser("metadata", help="View-level metadata operations")
+    meta_sub = meta_p.add_subparsers(dest="metadata_command")
+
+    meta_query = meta_sub.add_parser("query", help="Query metadata key")
+    _common_io_options(meta_query)
+    _target_option(meta_query, required=False)
+    meta_query.add_argument("key")
+    meta_query.set_defaults(handler=_metadata_query)
+
+    meta_store = meta_sub.add_parser("store", help="Store metadata key-value")
+    _common_io_options(meta_store, default_format="json")
+    _target_option(meta_store, required=False)
+    meta_store.add_argument("key")
+    meta_store.add_argument("value")
+    meta_store.set_defaults(handler=_metadata_store)
+
+    meta_rm = meta_sub.add_parser("remove", help="Remove metadata key")
+    _common_io_options(meta_rm, default_format="json")
+    _target_option(meta_rm, required=False)
+    meta_rm.add_argument("key")
+    meta_rm.set_defaults(handler=_metadata_remove)
+
+    # -----------------------------------------------------------------
+    # data
+    # -----------------------------------------------------------------
+    data_typed_p = subparsers.add_parser("data-typed-at", help="Get typed data variable at address")
+    _common_io_options(data_typed_p)
+    _target_option(data_typed_p, required=False)
+    data_typed_p.add_argument("address")
+    data_typed_p.set_defaults(handler=_data_typed_at)
+
+    # -----------------------------------------------------------------
+    # xref extended
+    # -----------------------------------------------------------------
+    xref_ext_p = subparsers.add_parser("xref-ext", help="Extended cross-reference operations")
+    xref_ext_sub = xref_ext_p.add_subparsers(dest="xref_ext_command")
+
+    xref_cf = xref_ext_sub.add_parser("code-refs-from", help="Code references from address")
+    _common_io_options(xref_cf)
+    _target_option(xref_cf, required=False)
+    xref_cf.add_argument("address")
+    xref_cf.add_argument("--length", type=int)
+    xref_cf.set_defaults(handler=_xref_code_refs_from)
+
+    xref_ct = xref_ext_sub.add_parser("code-refs-to", help="Code references to address")
+    _common_io_options(xref_ct)
+    _target_option(xref_ct, required=False)
+    xref_ct.add_argument("address")
+    xref_ct.add_argument("--limit", type=int, default=100)
+    xref_ct.set_defaults(handler=_xref_code_refs_to)
+
+    xref_df = xref_ext_sub.add_parser("data-refs-from", help="Data references from address")
+    _common_io_options(xref_df)
+    _target_option(xref_df, required=False)
+    xref_df.add_argument("address")
+    xref_df.add_argument("--length", type=int)
+    xref_df.set_defaults(handler=_xref_data_refs_from)
+
+    xref_dt = xref_ext_sub.add_parser("data-refs-to", help="Data references to address")
+    _common_io_options(xref_dt)
+    _target_option(xref_dt, required=False)
+    xref_dt.add_argument("address")
+    xref_dt.add_argument("--limit", type=int, default=100)
+    xref_dt.set_defaults(handler=_xref_data_refs_to)
+
+    # -----------------------------------------------------------------
+    # il (extended)
+    # -----------------------------------------------------------------
+    il_p = subparsers.add_parser("il-nav", help="IL navigation operations")
+    il_sub = il_p.add_subparsers(dest="il_command")
+
+    il_a2i = il_sub.add_parser("addr-to-index", help="Address to IL instruction index")
+    _common_io_options(il_a2i)
+    _target_option(il_a2i, required=False)
+    il_a2i.add_argument("function_start")
+    il_a2i.add_argument("address")
+    il_a2i.add_argument("--level", choices=["hlil", "mlil", "llil"], default="hlil")
+    il_a2i.set_defaults(handler=_il_address_to_index)
+
+    il_i2a = il_sub.add_parser("index-to-addr", help="IL instruction index to address")
+    _common_io_options(il_i2a)
+    _target_option(il_i2a, required=False)
+    il_i2a.add_argument("function_start")
+    il_i2a.add_argument("index", type=int)
+    il_i2a.add_argument("--level", choices=["hlil", "mlil", "llil"], default="hlil")
+    il_i2a.set_defaults(handler=_il_index_to_address)
+
+    il_instr = il_sub.add_parser("instr-at", help="Get IL instruction at address")
+    _common_io_options(il_instr)
+    _target_option(il_instr, required=False)
+    il_instr.add_argument("function_start")
+    il_instr.add_argument("address")
+    il_instr.add_argument("--level", choices=["hlil", "mlil", "llil"], default="hlil")
+    il_instr.set_defaults(handler=_il_instruction_by_addr)
+
+    # -----------------------------------------------------------------
+    # section/segment user
+    # -----------------------------------------------------------------
+    sec_user_p = subparsers.add_parser("section-user", help="User section operations")
+    sec_user_sub = sec_user_p.add_subparsers(dest="section_user_command")
+
+    sec_add = sec_user_sub.add_parser("add", help="Add user section")
+    _common_io_options(sec_add, default_format="json")
+    _target_option(sec_add, required=False)
+    sec_add.add_argument("name")
+    sec_add.add_argument("start")
+    sec_add.add_argument("length", type=int)
+    sec_add.set_defaults(handler=_section_add_user)
+
+    sec_rm = sec_user_sub.add_parser("remove", help="Remove user section")
+    _common_io_options(sec_rm, default_format="json")
+    _target_option(sec_rm, required=False)
+    sec_rm.add_argument("name")
+    sec_rm.set_defaults(handler=_section_remove_user)
+
+    seg_user_p = subparsers.add_parser("segment-user", help="User segment operations")
+    seg_user_sub = seg_user_p.add_subparsers(dest="segment_user_command")
+
+    seg_add = seg_user_sub.add_parser("add", help="Add user segment")
+    _common_io_options(seg_add, default_format="json")
+    _target_option(seg_add, required=False)
+    seg_add.add_argument("start")
+    seg_add.add_argument("length", type=int)
+    seg_add.add_argument("--data-offset", type=int)
+    seg_add.add_argument("--data-length", type=int)
+    seg_add.add_argument("--flags", type=int, default=0)
+    seg_add.set_defaults(handler=_segment_add_user)
+
+    seg_rm = seg_user_sub.add_parser("remove", help="Remove user segment")
+    _common_io_options(seg_rm, default_format="json")
+    _target_option(seg_rm, required=False)
+    seg_rm.add_argument("start")
+    seg_rm.add_argument("--length", type=int)
+    seg_rm.set_defaults(handler=_segment_remove_user)
+
+    # -----------------------------------------------------------------
+    # debug
+    # -----------------------------------------------------------------
+    debug_p = subparsers.add_parser("debug-info", help="Debug info operations")
+    debug_sub = debug_p.add_subparsers(dest="debug_command")
+
+    debug_parsers_p = debug_sub.add_parser("parsers", help="List debug info parsers")
+    _common_io_options(debug_parsers_p)
+    _target_option(debug_parsers_p, required=False)
+    debug_parsers_p.set_defaults(handler=_debug_parsers)
+
+    debug_apply_p = debug_sub.add_parser("apply", help="Parse and apply debug info")
+    _common_io_options(debug_apply_p, default_format="json")
+    _target_option(debug_apply_p, required=False)
+    debug_apply_p.add_argument("--parser-name", help="Specific parser to use")
+    debug_apply_p.add_argument("--debug-path", help="Path to debug file")
+    debug_apply_p.set_defaults(handler=_debug_parse_and_apply)
+
+    # -----------------------------------------------------------------
+    # plugin
+    # -----------------------------------------------------------------
+    plugin_cmd_p = subparsers.add_parser("plugin-cmd", help="Plugin command operations")
+    plugin_cmd_sub = plugin_cmd_p.add_subparsers(dest="plugin_cmd_command")
+
+    plugin_list_p = plugin_cmd_sub.add_parser("list", help="List valid plugin commands")
+    _common_io_options(plugin_list_p)
+    _target_option(plugin_list_p, required=False)
+    plugin_list_p.add_argument("--address")
+    plugin_list_p.set_defaults(handler=_plugin_valid_commands)
+
+    plugin_exec_p = plugin_cmd_sub.add_parser("execute", help="Execute plugin command")
+    _common_io_options(plugin_exec_p, default_format="json")
+    _target_option(plugin_exec_p, required=False)
+    plugin_exec_p.add_argument("name", help="Plugin command name")
+    plugin_exec_p.add_argument("--address")
+    plugin_exec_p.set_defaults(handler=_plugin_execute)
+
+    # -----------------------------------------------------------------
+    # binary extended
+    # -----------------------------------------------------------------
+    bin_bbs_p = subparsers.add_parser("binary-bbs-at", help="Get basic blocks at address (binary-wide)")
+    _common_io_options(bin_bbs_p)
+    _target_option(bin_bbs_p, required=False)
+    bin_bbs_p.add_argument("address")
+    bin_bbs_p.set_defaults(handler=_binary_basic_blocks_at)
 
     return parser
 

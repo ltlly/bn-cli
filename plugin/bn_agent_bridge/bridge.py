@@ -114,6 +114,82 @@ READ_LOCKED_OPS = {
     "workflow_machine_overrides",
     "workflow_machine_breakpoint_list",
     "analysis_status",
+    # --- patch (read) ---
+    "patch_status",
+    # --- memory (read) ---
+    "memory_read",
+    "memory_reader_read",
+    # --- value ---
+    "value_flags_at",
+    "value_possible",
+    "value_reg",
+    "value_stack",
+    # --- search ---
+    "search_bytes",
+    "search_constant",
+    "search_text",
+    # --- arch (read) ---
+    "arch_info",
+    "arch_disasm_bytes",
+    # --- segments/sections/data_vars ---
+    "list_segments",
+    "list_sections",
+    "list_data_vars",
+    # --- disasm extended ---
+    "disasm_linear",
+    "disasm_range",
+    # --- function extended ---
+    "function_basic_blocks",
+    "function_callers",
+    "function_callees",
+    "function_ssa_var_def_use",
+    "function_ssa_memory_def_use",
+    "function_var_refs",
+    "function_var_refs_from",
+    "function_metadata_query",
+    # --- database ---
+    "database_info",
+    "database_read_global",
+    "database_snapshots",
+    # --- type extended ---
+    "type_parse_string",
+    "type_library_list",
+    "type_library_get",
+    "type_archive_list",
+    "type_archive_get",
+    # --- annotation ---
+    "annotation_get_tags",
+    # --- uidf ---
+    "uidf_list_user_var_values",
+    "uidf_parse_possible_value",
+    # --- loader ---
+    "loader_load_settings_get",
+    "loader_load_settings_types",
+    # --- external ---
+    "external_library_list",
+    "external_location_get",
+    # --- analysis ---
+    "analysis_status",
+    "analysis_progress",
+    # --- metadata (view-level) ---
+    "metadata_query",
+    # --- data ---
+    "data_typed_at",
+    # --- xref extended ---
+    "xref_code_refs_from",
+    "xref_code_refs_to",
+    "xref_data_refs_from",
+    "xref_data_refs_to",
+    # --- il extended ---
+    "il_address_to_index",
+    "il_index_to_address",
+    "il_instruction_by_addr",
+    # --- debug ---
+    "debug_parsers",
+    # --- plugin ---
+    "plugin_valid_commands",
+    # --- binary extended ---
+    "binary_basic_blocks_at",
 }
 
 
@@ -143,6 +219,81 @@ WRITE_LOCKED_OPS = {
     "workflow_machine_breakpoint_set",
     "workflow_machine_breakpoint_clear",
     "save_target",
+    # --- patch (write) ---
+    "patch_assemble",
+    "patch_nop",
+    "patch_always_branch",
+    "patch_invert_branch",
+    "patch_never_branch",
+    "patch_skip_and_return",
+    # --- memory (write) ---
+    "memory_write",
+    "memory_insert",
+    "memory_remove",
+    "memory_writer_write",
+    # --- arch (write — assembles) ---
+    "arch_assemble",
+    # --- function extended (write) ---
+    "function_force_analysis",
+    "function_metadata_store",
+    "function_metadata_remove",
+    # --- database (write) ---
+    "database_write_global",
+    "database_save_auto_snapshot",
+    "database_create_bndb",
+    # --- type extended (write) ---
+    "type_rename",
+    "type_undefine_user",
+    "type_import_library_type",
+    "type_import_library_object",
+    "type_export_to_library",
+    "type_library_create",
+    "type_library_load",
+    "type_archive_create",
+    "type_archive_open",
+    "type_archive_pull",
+    "type_archive_push",
+    # --- annotation (write) ---
+    "annotation_add_tag",
+    "annotation_define_data_var",
+    "annotation_undefine_data_var",
+    "annotation_define_symbol",
+    "annotation_undefine_symbol",
+    "annotation_rename_data_var",
+    # --- undo ---
+    "undo_begin",
+    "undo_commit",
+    "undo_revert",
+    "undo_undo",
+    "undo_redo",
+    # --- uidf (write) ---
+    "uidf_set_user_var_value",
+    "uidf_clear_user_var_value",
+    # --- loader (write) ---
+    "loader_load_settings_set",
+    "loader_rebase",
+    # --- external (write) ---
+    "external_library_add",
+    "external_library_remove",
+    "external_location_add",
+    "external_location_remove",
+    # --- analysis (write) ---
+    "analysis_abort",
+    "analysis_set_hold",
+    "analysis_update",
+    "analysis_update_and_wait",
+    # --- metadata (write) ---
+    "metadata_store",
+    "metadata_remove",
+    # --- section/segment (write) ---
+    "section_add_user",
+    "section_remove_user",
+    "segment_add_user",
+    "segment_remove_user",
+    # --- debug (write) ---
+    "debug_parse_and_apply",
+    # --- plugin (write) ---
+    "plugin_execute",
 }
 
 
@@ -906,6 +1057,342 @@ class BinaryNinjaBridge:
             target = str(manifest.get("target") or target)
             operations = list(manifest.get("ops") or [])
             return self._mutation(target, preview, operations)
+
+        # --- patch ops ---
+        if op == "patch_status":
+            return self._patch_status(target, params["address"])
+        if op == "patch_assemble":
+            return self._patch_assemble(target, params["address"], str(params["asm"]))
+        if op == "patch_nop":
+            return self._patch_nop(target, params["address"])
+        if op == "patch_always_branch":
+            return self._patch_always_branch(target, params["address"])
+        if op == "patch_invert_branch":
+            return self._patch_invert_branch(target, params["address"])
+        if op == "patch_never_branch":
+            return self._patch_never_branch(target, params["address"])
+        if op == "patch_skip_and_return":
+            return self._patch_skip_and_return(target, params["address"], int(params["value"]))
+
+        # --- memory ops ---
+        if op == "memory_read":
+            return self._memory_read(target, params["address"], int(params["length"]))
+        if op == "memory_write":
+            return self._memory_write(target, params["address"], str(params["data_hex"]))
+        if op == "memory_insert":
+            return self._memory_insert(target, params["address"], str(params["data_hex"]))
+        if op == "memory_remove":
+            return self._memory_remove(target, params["address"], int(params["length"]))
+        if op == "memory_reader_read":
+            return self._memory_reader_read(
+                target, params["address"], int(params["width"]),
+                endian=str(params.get("endian", "little")),
+            )
+        if op == "memory_writer_write":
+            return self._memory_writer_write(
+                target, params["address"], int(params["width"]),
+                int(params["value"]), endian=str(params.get("endian", "little")),
+            )
+
+        # --- value ops ---
+        if op == "value_flags_at":
+            return self._value_flags_at(target, params["function_start"], params["address"])
+        if op == "value_possible":
+            return self._value_possible(
+                target, params["function_start"], params["address"],
+                level=str(params.get("level", "hlil")),
+                ssa=bool(params.get("ssa", False)),
+            )
+        if op == "value_reg":
+            return self._value_reg(
+                target, params["function_start"], params["address"],
+                str(params["register"]), after=bool(params.get("after", False)),
+            )
+        if op == "value_stack":
+            return self._value_stack(
+                target, params["function_start"], params["address"],
+                int(params["stack_offset"]), int(params["size"]),
+                after=bool(params.get("after", False)),
+            )
+
+        # --- search ops ---
+        if op == "search_bytes":
+            return self._search_bytes(
+                target, str(params["data_hex"]),
+                start=params.get("start"), end=params.get("end"),
+                limit=params.get("limit"),
+            )
+        if op == "search_constant":
+            return self._search_constant(
+                target, int(params["constant"]),
+                start=params["start"], end=params["end"],
+                limit=params.get("limit"),
+            )
+        if op == "search_text":
+            return self._search_text(
+                target, str(params["query"]),
+                start=params.get("start"), end=params.get("end"),
+                regex=bool(params.get("regex", False)),
+                limit=params.get("limit"),
+            )
+
+        # --- arch ops ---
+        if op == "arch_info":
+            return self._arch_info(target)
+        if op == "arch_assemble":
+            return self._arch_assemble(
+                target, str(params["asm"]),
+                address=params.get("address"),
+                arch_name=params.get("arch_name"),
+            )
+        if op == "arch_disasm_bytes":
+            return self._arch_disasm_bytes(
+                target, str(params["data_hex"]),
+                address=params.get("address"),
+                arch_name=params.get("arch_name"),
+            )
+
+        # --- segments/sections/data_vars ---
+        if op == "list_segments":
+            return self._list_segments(target)
+        if op == "list_sections":
+            return self._list_sections(target)
+        if op == "list_data_vars":
+            return self._list_data_vars(
+                target,
+                offset=int(params.get("offset", 0)),
+                limit=int(params.get("limit", 100)),
+            )
+
+        # --- disasm extended ---
+        if op == "disasm_linear":
+            return self._disasm_linear(
+                target, params["address"],
+                count=int(params.get("count", 20)),
+            )
+        if op == "disasm_range":
+            return self._disasm_range(target, params["start"], params["end"])
+
+        # --- function extended ---
+        if op == "function_basic_blocks":
+            return self._function_basic_blocks(target, params["identifier"])
+        if op == "function_callers":
+            return self._function_callers(target, params["identifier"])
+        if op == "function_callees":
+            return self._function_callees(target, params["identifier"])
+        if op == "function_force_analysis":
+            return self._function_force_analysis(target, params["identifier"])
+        if op == "function_ssa_var_def_use":
+            return self._function_ssa_var_def_use(
+                target, params["identifier"],
+                var_name=str(params["var"]),
+                version=int(params["version"]),
+                il_level=str(params.get("level", "mlil")),
+            )
+        if op == "function_ssa_memory_def_use":
+            return self._function_ssa_memory_def_use(
+                target, params["identifier"],
+                version=int(params["version"]),
+                il_level=str(params.get("level", "mlil")),
+            )
+        if op == "function_var_refs":
+            return self._function_var_refs(
+                target, params["identifier"],
+                var_name=str(params["var"]),
+                il_level=str(params.get("level", "hlil")),
+            )
+        if op == "function_var_refs_from":
+            return self._function_var_refs_from(
+                target, params["identifier"],
+                address=params["address"],
+                il_level=str(params.get("level", "hlil")),
+            )
+        if op == "function_metadata_query":
+            return self._function_metadata_query(target, params["identifier"], str(params["key"]))
+        if op == "function_metadata_store":
+            return self._function_metadata_store(target, params["identifier"], str(params["key"]), params["value"])
+        if op == "function_metadata_remove":
+            return self._function_metadata_remove(target, params["identifier"], str(params["key"]))
+
+        # --- database ---
+        if op == "database_info":
+            return self._database_info(target)
+        if op == "database_read_global":
+            return self._database_read_global(target, str(params["key"]))
+        if op == "database_write_global":
+            return self._database_write_global(target, str(params["key"]), str(params["value"]))
+        if op == "database_snapshots":
+            return self._database_snapshots(target, offset=int(params.get("offset", 0)), limit=int(params.get("limit", 50)))
+        if op == "database_save_auto_snapshot":
+            return self._database_save_auto_snapshot(target)
+        if op == "database_create_bndb":
+            return self._database_create_bndb(target, str(params["path"]))
+
+        # --- type extended ---
+        if op == "type_rename":
+            return self._type_rename(target, str(params["old_name"]), str(params["new_name"]))
+        if op == "type_undefine_user":
+            return self._type_undefine_user(target, str(params["name"]))
+        if op == "type_parse_string":
+            return self._type_parse_string(target, str(params["type_source"]))
+        if op == "type_import_library_type":
+            return self._type_import_library_type(target, str(params["name"]), lib_id=params.get("type_library_id"))
+        if op == "type_import_library_object":
+            return self._type_import_library_object(target, str(params["name"]), lib_id=params.get("type_library_id"))
+        if op == "type_export_to_library":
+            return self._type_export_to_library(target, str(params["type_library_id"]), str(params["type_source"]), name=params.get("name"))
+        if op == "type_library_list":
+            return self._type_library_list(target)
+        if op == "type_library_get":
+            return self._type_library_get(target, str(params["type_library_id"]))
+        if op == "type_library_create":
+            return self._type_library_create(target, str(params["name"]), path=params.get("path"), add_to_view=bool(params.get("add_to_view", False)))
+        if op == "type_library_load":
+            return self._type_library_load(target, str(params["path"]), add_to_view=bool(params.get("add_to_view", True)))
+        if op == "type_archive_list":
+            return self._type_archive_list(target)
+        if op == "type_archive_get":
+            return self._type_archive_get(target, str(params["type_archive_id"]))
+        if op == "type_archive_create":
+            return self._type_archive_create(target, str(params["path"]), attach=bool(params.get("attach", False)))
+        if op == "type_archive_open":
+            return self._type_archive_open(target, str(params["path"]), attach=bool(params.get("attach", False)))
+        if op == "type_archive_pull":
+            return self._type_archive_pull(target, str(params["type_archive_id"]), list(params["names"]))
+        if op == "type_archive_push":
+            return self._type_archive_push(target, str(params["type_archive_id"]), list(params["names"]))
+
+        # --- annotation ---
+        if op == "annotation_add_tag":
+            return self._annotation_add_tag(target, params["address"], str(params["tag_type"]), str(params["data"]))
+        if op == "annotation_get_tags":
+            return self._annotation_get_tags(target, params["address"])
+        if op == "annotation_define_data_var":
+            return self._annotation_define_data_var(target, params["address"], type_name=params.get("type_name"), name=params.get("name"), width=params.get("width"))
+        if op == "annotation_undefine_data_var":
+            return self._annotation_undefine_data_var(target, params["address"])
+        if op == "annotation_define_symbol":
+            return self._annotation_define_symbol(target, params["address"], str(params["name"]), symbol_type=params.get("symbol_type"))
+        if op == "annotation_undefine_symbol":
+            return self._annotation_undefine_symbol(target, params["address"])
+        if op == "annotation_rename_data_var":
+            return self._annotation_rename_data_var(target, params["address"], str(params["new_name"]))
+
+        # --- undo ---
+        if op == "undo_begin":
+            return self._undo_begin(target)
+        if op == "undo_commit":
+            return self._undo_commit(target)
+        if op == "undo_revert":
+            return self._undo_revert(target)
+        if op == "undo_undo":
+            return self._undo_undo(target)
+        if op == "undo_redo":
+            return self._undo_redo(target)
+
+        # --- uidf ---
+        if op == "uidf_set_user_var_value":
+            return self._uidf_set(target, params)
+        if op == "uidf_clear_user_var_value":
+            return self._uidf_clear(target, params)
+        if op == "uidf_list_user_var_values":
+            return self._uidf_list(target, params["function_start"])
+        if op == "uidf_parse_possible_value":
+            return self._uidf_parse(target, str(params["value"]), str(params["state"]))
+
+        # --- loader ---
+        if op == "loader_load_settings_get":
+            return self._loader_settings_get(target, str(params["type_name"]))
+        if op == "loader_load_settings_set":
+            return self._loader_settings_set(target, str(params["type_name"]), str(params["key"]), params["value"])
+        if op == "loader_load_settings_types":
+            return self._loader_settings_types(target)
+        if op == "loader_rebase":
+            return self._loader_rebase(target, params["address"], force=bool(params.get("force", False)))
+
+        # --- external ---
+        if op == "external_library_add":
+            return self._external_library_add(target, str(params["name"]))
+        if op == "external_library_list":
+            return self._external_library_list(target)
+        if op == "external_library_remove":
+            return self._external_library_remove(target, str(params["name"]))
+        if op == "external_location_add":
+            return self._external_location_add(target, params)
+        if op == "external_location_get":
+            return self._external_location_get(target, params["source_address"])
+        if op == "external_location_remove":
+            return self._external_location_remove(target, params["source_address"])
+
+        # --- analysis ---
+        if op == "analysis_status":
+            return self._analysis_status(target)
+        if op == "analysis_progress":
+            return self._analysis_progress(target)
+        if op == "analysis_abort":
+            return self._analysis_abort(target)
+        if op == "analysis_set_hold":
+            return self._analysis_set_hold(target, bool(params["hold"]))
+        if op == "analysis_update":
+            return self._analysis_update(target)
+        if op == "analysis_update_and_wait":
+            return self._analysis_update_and_wait(target)
+
+        # --- metadata (view-level) ---
+        if op == "metadata_query":
+            return self._metadata_query(target, str(params["key"]))
+        if op == "metadata_store":
+            return self._metadata_store(target, str(params["key"]), params["value"])
+        if op == "metadata_remove":
+            return self._metadata_remove(target, str(params["key"]))
+
+        # --- data ---
+        if op == "data_typed_at":
+            return self._data_typed_at(target, params["address"])
+
+        # --- xref extended ---
+        if op == "xref_code_refs_from":
+            return self._xref_code_refs_from(target, params["address"], length=params.get("length"))
+        if op == "xref_code_refs_to":
+            return self._xref_code_refs_to(target, params["address"], limit=int(params.get("limit", 100)))
+        if op == "xref_data_refs_from":
+            return self._xref_data_refs_from(target, params["address"], length=params.get("length"))
+        if op == "xref_data_refs_to":
+            return self._xref_data_refs_to(target, params["address"], limit=int(params.get("limit", 100)))
+
+        # --- il extended ---
+        if op == "il_address_to_index":
+            return self._il_address_to_index(target, params["function_start"], params["address"], level=params.get("level", "hlil"))
+        if op == "il_index_to_address":
+            return self._il_index_to_address(target, params["function_start"], int(params["index"]), level=params.get("level", "hlil"))
+        if op == "il_instruction_by_addr":
+            return self._il_instruction_by_addr(target, params["function_start"], params["address"], level=params.get("level", "hlil"))
+
+        # --- section/segment user ---
+        if op == "section_add_user":
+            return self._section_add_user(target, params)
+        if op == "section_remove_user":
+            return self._section_remove_user(target, str(params["name"]))
+        if op == "segment_add_user":
+            return self._segment_add_user(target, params)
+        if op == "segment_remove_user":
+            return self._segment_remove_user(target, params["start"], length=params.get("length"))
+
+        # --- debug ---
+        if op == "debug_parsers":
+            return self._debug_parsers(target)
+        if op == "debug_parse_and_apply":
+            return self._debug_parse_and_apply(target, parser_name=params.get("parser_name"), debug_path=params.get("debug_path"))
+
+        # --- plugin ---
+        if op == "plugin_valid_commands":
+            return self._plugin_valid_commands(target, address=params.get("address"))
+        if op == "plugin_execute":
+            return self._plugin_execute(target, str(params["name"]), address=params.get("address"))
+
+        # --- binary extended ---
+        if op == "binary_basic_blocks_at":
+            return self._binary_basic_blocks_at(target, params["address"])
 
         raise ValueError(f"Unknown operation: {op}")
 
@@ -3555,6 +4042,1696 @@ class BinaryNinjaBridge:
             "parsed_variable_count": len(parsed["variables"]),
             "requested": self._operation_requested(op),
         }
+
+    # =========================================================================
+    # Patch operations
+    # =========================================================================
+
+    def _patch_status(self, selector, address_raw):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        return _run_on_main_thread(lambda: {
+            "address": hex(addr),
+            "can_assemble": bv.arch.can_assemble if bv.arch else False,
+            "is_never_branch_patch_available": bv.is_never_branch_patch_available(addr),
+            "is_always_branch_patch_available": bv.is_always_branch_patch_available(addr),
+            "is_invert_branch_patch_available": bv.is_invert_branch_patch_available(addr),
+            "is_skip_and_return_zero_patch_available": bv.is_skip_and_return_zero_patch_available(addr),
+            "is_skip_and_return_value_patch_available": bv.is_skip_and_return_value_patch_available(addr),
+        })
+
+    def _patch_assemble(self, selector, address_raw, asm_text: str):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            result = bv.assemble(asm_text, addr)
+            if result is None:
+                raise RuntimeError(f"Assembly failed at {hex(addr)}: {asm_text!r}")
+            bv.write(addr, result)
+            return {"address": hex(addr), "asm": asm_text, "bytes_hex": result.hex(), "length": len(result)}
+        return _run_on_main_thread(_do)
+
+    def _patch_nop(self, selector, address_raw):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            if not bv.convert_to_nop(addr):
+                raise RuntimeError(f"convert_to_nop failed at {hex(addr)}")
+            return {"address": hex(addr), "patched": True, "kind": "nop"}
+        return _run_on_main_thread(_do)
+
+    def _patch_always_branch(self, selector, address_raw):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            if not bv.always_branch(addr):
+                raise RuntimeError(f"always_branch failed at {hex(addr)}")
+            return {"address": hex(addr), "patched": True, "kind": "always_branch"}
+        return _run_on_main_thread(_do)
+
+    def _patch_invert_branch(self, selector, address_raw):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            if not bv.invert_branch(addr):
+                raise RuntimeError(f"invert_branch failed at {hex(addr)}")
+            return {"address": hex(addr), "patched": True, "kind": "invert_branch"}
+        return _run_on_main_thread(_do)
+
+    def _patch_never_branch(self, selector, address_raw):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            if not bv.never_branch(addr):
+                raise RuntimeError(f"never_branch failed at {hex(addr)}")
+            return {"address": hex(addr), "patched": True, "kind": "never_branch"}
+        return _run_on_main_thread(_do)
+
+    def _patch_skip_and_return(self, selector, address_raw, value: int):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            if not bv.skip_and_return_value(addr, value):
+                raise RuntimeError(f"skip_and_return_value failed at {hex(addr)}")
+            return {"address": hex(addr), "patched": True, "kind": "skip_and_return_value", "value": value}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Memory operations
+    # =========================================================================
+
+    def _memory_read(self, selector, address_raw, length: int):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        if length < 1 or length > 65536:
+            raise RuntimeError(f"length must be 1..65536, got {length}")
+        data = _run_on_main_thread(lambda: bv.read(addr, length))
+        return {"address": hex(addr), "length": len(data), "data_hex": data.hex()}
+
+    def _memory_write(self, selector, address_raw, data_hex: str):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        data = bytes.fromhex(data_hex)
+        written = _run_on_main_thread(lambda: bv.write(addr, data))
+        return {"address": hex(addr), "bytes_written": written, "data_hex": data_hex}
+
+    def _memory_insert(self, selector, address_raw, data_hex: str):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        data = bytes.fromhex(data_hex)
+        result = _run_on_main_thread(lambda: bv.insert(addr, data))
+        return {"address": hex(addr), "bytes_inserted": result, "data_hex": data_hex}
+
+    def _memory_remove(self, selector, address_raw, length: int):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        result = _run_on_main_thread(lambda: bv.remove(addr, length))
+        return {"address": hex(addr), "bytes_removed": result, "length": length}
+
+    def _memory_reader_read(self, selector, address_raw, width: int, *, endian: str = "little"):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        if width not in (1, 2, 4, 8):
+            raise RuntimeError(f"width must be 1, 2, 4, or 8; got {width}")
+        def _do():
+            reader = bn.BinaryReader(bv)
+            reader.seek(addr)
+            reader.endianness = bn.Endianness.LittleEndian if endian == "little" else bn.Endianness.BigEndian
+            if width == 1:
+                val = reader.read8()
+            elif width == 2:
+                val = reader.read16()
+            elif width == 4:
+                val = reader.read32()
+            else:
+                val = reader.read64()
+            if val is None:
+                raise RuntimeError(f"BinaryReader failed to read {width} bytes at {hex(addr)}")
+            return {"address": hex(addr), "width": width, "endian": endian, "value": val, "value_hex": hex(val)}
+        return _run_on_main_thread(_do)
+
+    def _memory_writer_write(self, selector, address_raw, width: int, value: int, *, endian: str = "little"):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        if width not in (1, 2, 4, 8):
+            raise RuntimeError(f"width must be 1, 2, 4, or 8; got {width}")
+        def _do():
+            writer = bn.BinaryWriter(bv)
+            writer.seek(addr)
+            writer.endianness = bn.Endianness.LittleEndian if endian == "little" else bn.Endianness.BigEndian
+            if width == 1:
+                writer.write8(value)
+            elif width == 2:
+                writer.write16(value)
+            elif width == 4:
+                writer.write32(value)
+            else:
+                writer.write64(value)
+            return {"address": hex(addr), "width": width, "endian": endian, "value": value, "written": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Value analysis operations
+    # =========================================================================
+
+    def _value_flags_at(self, selector, function_start_raw, address_raw):
+        bv = self._resolve_view(selector)
+        fn_addr = _parse_address(function_start_raw)
+        addr = _parse_address(address_raw)
+        def _do():
+            fn = bv.get_function_at(fn_addr)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            llil = fn.llil
+            flags_read = []
+            flags_written = []
+            for block in llil:
+                for instr in block:
+                    if instr.address == addr:
+                        for token in instr.tokens:
+                            token_text = str(token)
+                            if token_text in [str(f) for f in fn.arch.flags]:
+                                flags_read.append(token_text)
+            return {"function": hex(fn_addr), "address": hex(addr), "flags_read": flags_read, "flags_written": flags_written}
+        return _run_on_main_thread(_do)
+
+    def _value_possible(self, selector, function_start_raw, address_raw, *, level: str = "hlil", ssa: bool = False):
+        bv = self._resolve_view(selector)
+        fn_addr = _parse_address(function_start_raw)
+        addr = _parse_address(address_raw)
+        def _do():
+            fn = bv.get_function_at(fn_addr)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            if level == "llil":
+                il_func = fn.llil if not ssa else fn.llil.ssa_form
+            elif level == "mlil":
+                il_func = fn.mlil if not ssa else fn.mlil.ssa_form
+            else:
+                il_func = fn.hlil if not ssa else fn.hlil.ssa_form
+            # Find the IL instruction at the given address
+            for block in il_func:
+                for instr in block:
+                    if instr.address == addr:
+                        pv = instr.possible_values
+                        return {
+                            "function": hex(fn_addr),
+                            "address": hex(addr),
+                            "level": level,
+                            "ssa": ssa,
+                            "type": str(pv.type) if hasattr(pv, "type") else str(type(pv).__name__),
+                            "value": str(pv),
+                        }
+            return {"function": hex(fn_addr), "address": hex(addr), "level": level, "ssa": ssa, "type": "not_found", "value": None}
+        return _run_on_main_thread(_do)
+
+    def _value_reg(self, selector, function_start_raw, address_raw, register: str, *, after: bool = False):
+        bv = self._resolve_view(selector)
+        fn_addr = _parse_address(function_start_raw)
+        addr = _parse_address(address_raw)
+        def _do():
+            fn = bv.get_function_at(fn_addr)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            if after:
+                val = fn.get_reg_value_after(addr, register)
+            else:
+                val = fn.get_reg_value_at(addr, register)
+            return {
+                "function": hex(fn_addr),
+                "address": hex(addr),
+                "register": register,
+                "after": after,
+                "type": str(val.type) if hasattr(val, "type") else str(type(val).__name__),
+                "value": val.value if hasattr(val, "value") else str(val),
+            }
+        return _run_on_main_thread(_do)
+
+    def _value_stack(self, selector, function_start_raw, address_raw, stack_offset: int, size: int, *, after: bool = False):
+        bv = self._resolve_view(selector)
+        fn_addr = _parse_address(function_start_raw)
+        addr = _parse_address(address_raw)
+        def _do():
+            fn = bv.get_function_at(fn_addr)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            if after:
+                val = fn.get_stack_contents_after(addr, stack_offset, size)
+            else:
+                val = fn.get_stack_contents_at(addr, stack_offset, size)
+            return {
+                "function": hex(fn_addr),
+                "address": hex(addr),
+                "stack_offset": stack_offset,
+                "size": size,
+                "after": after,
+                "type": str(val.type) if hasattr(val, "type") else str(type(val).__name__),
+                "value": val.value if hasattr(val, "value") else str(val),
+            }
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Search operations
+    # =========================================================================
+
+    def _search_bytes(self, selector, data_hex: str, *, start=None, end=None, limit=None):
+        bv = self._resolve_view(selector)
+        search_data = bytes.fromhex(data_hex)
+        s = _parse_address(start) if start is not None else bv.start
+        e = _parse_address(end) if end is not None else bv.end
+        max_results = int(limit) if limit else 1000
+        def _do():
+            results = []
+            offset = s
+            while offset < e and len(results) < max_results:
+                found = bv.find_next_data(offset, search_data)
+                if found is None or found >= e:
+                    break
+                results.append(hex(found))
+                offset = found + 1
+            return {"pattern": data_hex, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
+        return _run_on_main_thread(_do)
+
+    def _search_constant(self, selector, constant: int, *, start, end, limit=None):
+        bv = self._resolve_view(selector)
+        s = _parse_address(start)
+        e = _parse_address(end)
+        max_results = int(limit) if limit else 1000
+        def _do():
+            results = []
+            offset = s
+            while offset < e and len(results) < max_results:
+                found = bv.find_next_constant(offset, constant)
+                if found is None or found >= e:
+                    break
+                results.append(hex(found))
+                offset = found + 1
+            return {"constant": constant, "constant_hex": hex(constant), "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
+        return _run_on_main_thread(_do)
+
+    def _search_text(self, selector, query: str, *, start=None, end=None, regex: bool = False, limit=None):
+        bv = self._resolve_view(selector)
+        s = _parse_address(start) if start is not None else bv.start
+        e = _parse_address(end) if end is not None else bv.end
+        max_results = int(limit) if limit else 1000
+        def _do():
+            results = []
+            offset = s
+            while offset < e and len(results) < max_results:
+                if regex:
+                    found = bv.find_next_text(offset, query, flags=bn.FindFlag.FindCaseSensitive)
+                else:
+                    found = bv.find_next_text(offset, query)
+                if found is None or found >= e:
+                    break
+                results.append(hex(found))
+                offset = found + 1
+            return {"query": query, "regex": regex, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Architecture operations
+    # =========================================================================
+
+    def _arch_info(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            arch = bv.arch
+            platform = bv.platform
+            return {
+                "arch_name": str(arch) if arch else None,
+                "address_size": arch.address_size if arch else None,
+                "default_int_size": arch.default_int_size if arch else None,
+                "max_instr_length": arch.max_instr_length if arch else None,
+                "endianness": str(arch.endianness) if arch else None,
+                "registers": list(arch.regs.keys()) if arch else [],
+                "platform": str(platform) if platform else None,
+            }
+        return _run_on_main_thread(_do)
+
+    def _arch_assemble(self, selector, asm_text: str, *, address=None, arch_name=None):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address) if address is not None else 0
+        def _do():
+            arch = bv.arch
+            if arch_name:
+                arch = bn.Architecture[arch_name]
+                if arch is None:
+                    raise RuntimeError(f"Unknown architecture: {arch_name}")
+            if arch is None:
+                raise RuntimeError("No architecture available")
+            result = arch.assemble(asm_text, addr)
+            if result is None or (isinstance(result, tuple) and result[0] is None):
+                err = result[1] if isinstance(result, tuple) and len(result) > 1 else "unknown error"
+                raise RuntimeError(f"Assembly failed: {err}")
+            encoded = result[0] if isinstance(result, tuple) else result
+            return {"asm": asm_text, "address": hex(addr), "bytes_hex": encoded.hex(), "length": len(encoded)}
+        return _run_on_main_thread(_do)
+
+    def _arch_disasm_bytes(self, selector, data_hex: str, *, address=None, arch_name=None):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address) if address is not None else 0
+        data = bytes.fromhex(data_hex)
+        def _do():
+            arch = bv.arch
+            if arch_name:
+                arch = bn.Architecture[arch_name]
+                if arch is None:
+                    raise RuntimeError(f"Unknown architecture: {arch_name}")
+            if arch is None:
+                raise RuntimeError("No architecture available")
+            instructions = []
+            offset = 0
+            while offset < len(data):
+                info = arch.get_instruction_info(data[offset:], addr + offset)
+                text_result = arch.get_instruction_text(data[offset:], addr + offset)
+                if info is None or text_result is None:
+                    break
+                tokens, length = text_result
+                text = "".join(str(t) for t in tokens)
+                instructions.append({
+                    "address": hex(addr + offset),
+                    "text": text,
+                    "length": length,
+                    "bytes_hex": data[offset:offset + length].hex(),
+                })
+                offset += length
+            return {"data_hex": data_hex, "address": hex(addr), "instructions": instructions, "count": len(instructions)}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Segments / Sections / Data Variables
+    # =========================================================================
+
+    def _list_segments(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            return [
+                {
+                    "start": hex(seg.start),
+                    "end": hex(seg.end),
+                    "length": seg.length,
+                    "data_offset": seg.data_offset,
+                    "data_length": seg.data_length,
+                    "readable": seg.readable,
+                    "writable": seg.writable,
+                    "executable": seg.executable,
+                }
+                for seg in bv.segments
+            ]
+        return _run_on_main_thread(_do)
+
+    def _list_sections(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            return [
+                {
+                    "name": name,
+                    "start": hex(section.start),
+                    "end": hex(section.end),
+                    "length": section.length,
+                    "type": str(section.type) if hasattr(section, "type") else None,
+                    "semantics": str(section.semantics) if hasattr(section, "semantics") else None,
+                }
+                for name, section in bv.sections.items()
+            ]
+        return _run_on_main_thread(_do)
+
+    def _list_data_vars(self, selector, *, offset: int = 0, limit: int = 100):
+        bv = self._resolve_view(selector)
+        def _do():
+            all_vars = list(bv.data_vars.items())
+            subset = all_vars[offset:offset + limit]
+            return [
+                {
+                    "address": hex(addr),
+                    "type": str(dv.type) if dv.type else None,
+                    "auto_discovered": dv.auto_discovered if hasattr(dv, "auto_discovered") else None,
+                }
+                for addr, dv in subset
+            ]
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Disassembly extended (linear, range)
+    # =========================================================================
+
+    def _disasm_linear(self, selector, address_raw, *, count: int = 20):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        def _do():
+            lines = []
+            settings = bn.DisassemblySettings()
+            lv = bn.LinearViewObject.disassembly(bv, settings)
+            cursor = bn.LinearViewCursor(lv)
+            cursor.seek_to_address(addr)
+            for _ in range(count):
+                cur_lines = cursor.lines
+                if not cur_lines:
+                    break
+                for line in cur_lines:
+                    tokens_text = "".join(str(t) for t in line.contents.tokens)
+                    lines.append({
+                        "address": hex(line.contents.address) if hasattr(line.contents, "address") else None,
+                        "text": tokens_text,
+                    })
+                if not cursor.next():
+                    break
+            return lines[:count]
+        return _run_on_main_thread(_do)
+
+    def _disasm_range(self, selector, start_raw, end_raw):
+        bv = self._resolve_view(selector)
+        s = _parse_address(start_raw)
+        e = _parse_address(end_raw)
+        def _do():
+            lines = []
+            arch = bv.arch
+            if arch is None:
+                raise RuntimeError("No architecture")
+            offset = s
+            while offset < e:
+                data = bv.read(offset, min(arch.max_instr_length, e - offset))
+                if not data:
+                    break
+                text_result = arch.get_instruction_text(data, offset)
+                if text_result is None:
+                    offset += 1
+                    continue
+                tokens, length = text_result
+                text = "".join(str(t) for t in tokens)
+                lines.append({"address": hex(offset), "text": text, "length": length})
+                offset += length
+            return lines
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Function extended operations
+    # =========================================================================
+
+    def _function_basic_blocks(self, selector, identifier):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            return [
+                {
+                    "start": hex(bb.start),
+                    "end": hex(bb.end),
+                    "length": bb.length,
+                    "incoming_edges": [hex(e.source.start) for e in bb.incoming_edges],
+                    "outgoing_edges": [hex(e.target.start) for e in bb.outgoing_edges],
+                    "instruction_count": bb.instruction_count if hasattr(bb, "instruction_count") else None,
+                }
+                for bb in fn.basic_blocks
+            ]
+        return _run_on_main_thread(_do)
+
+    def _function_callers(self, selector, identifier):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            callers = []
+            for ref in fn.callers:
+                callers.append({
+                    "name": ref.name,
+                    "address": hex(ref.start),
+                })
+            return callers
+        return _run_on_main_thread(_do)
+
+    def _function_callees(self, selector, identifier):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            callees = []
+            for ref in fn.callees:
+                callees.append({
+                    "name": ref.name if hasattr(ref, "name") else str(ref),
+                    "address": hex(ref.start) if hasattr(ref, "start") else None,
+                })
+            return callees
+        return _run_on_main_thread(_do)
+
+    def _function_force_analysis(self, selector, identifier):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            fn.reanalyze()
+            bv.update_analysis_and_wait()
+            return {"function": fn.name, "address": hex(fn.start), "reanalyzed": True}
+        return _run_on_main_thread(_do)
+
+    def _function_ssa_var_def_use(self, selector, identifier, *, var_name: str, version: int, il_level: str = "mlil"):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            if il_level == "mlil":
+                il_func = fn.mlil.ssa_form
+            elif il_level == "hlil":
+                il_func = fn.hlil.ssa_form
+            else:
+                il_func = fn.llil.ssa_form
+            # Find the SSA variable
+            ssa_var = None
+            for var in il_func.vars:
+                if str(var.var.name) == var_name:
+                    ssa_var = bn.SSAVariable(var.var, version) if not isinstance(var, bn.SSAVariable) else var
+                    break
+            if ssa_var is None:
+                # Try from non-SSA vars
+                for var in fn.vars:
+                    if str(var.name) == var_name:
+                        ssa_var = bn.SSAVariable(var, version)
+                        break
+            if ssa_var is None:
+                raise RuntimeError(f"Variable {var_name!r} not found in {fn.name}")
+            definition = il_func.get_ssa_var_definition(ssa_var)
+            uses = il_func.get_ssa_var_uses(ssa_var)
+            return {
+                "function": fn.name,
+                "var": var_name,
+                "version": version,
+                "level": il_level,
+                "definition": {"index": definition.instr_index, "address": hex(definition.address)} if definition else None,
+                "uses": [{"index": u.instr_index, "address": hex(u.address)} for u in uses],
+            }
+        return _run_on_main_thread(_do)
+
+    def _function_ssa_memory_def_use(self, selector, identifier, *, version: int, il_level: str = "mlil"):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            if il_level == "mlil":
+                il_func = fn.mlil.ssa_form
+            elif il_level == "hlil":
+                il_func = fn.hlil.ssa_form
+            else:
+                il_func = fn.llil.ssa_form
+            definition = il_func.get_ssa_memory_definition(version)
+            uses = il_func.get_ssa_memory_uses(version)
+            return {
+                "function": fn.name,
+                "memory_version": version,
+                "level": il_level,
+                "definition": {"index": definition.instr_index, "address": hex(definition.address)} if definition else None,
+                "uses": [{"index": u.instr_index, "address": hex(u.address)} for u in uses],
+            }
+        return _run_on_main_thread(_do)
+
+    def _function_var_refs(self, selector, identifier, *, var_name: str, il_level: str = "hlil"):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            target_var = None
+            for var in fn.vars:
+                if str(var.name) == var_name:
+                    target_var = var
+                    break
+            if target_var is None:
+                raise RuntimeError(f"Variable {var_name!r} not found in {fn.name}")
+            if il_level == "hlil":
+                refs = fn.get_hlil_var_refs(target_var)
+            else:
+                refs = fn.get_mlil_var_refs(target_var)
+            return [
+                {
+                    "address": hex(ref.address) if hasattr(ref, "address") else None,
+                    "type": str(type(ref).__name__),
+                }
+                for ref in refs
+            ]
+        return _run_on_main_thread(_do)
+
+    def _function_var_refs_from(self, selector, identifier, *, address, il_level: str = "hlil"):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        addr = _parse_address(address)
+        def _do():
+            if il_level == "hlil":
+                refs = fn.get_hlil_var_refs_from(addr)
+            else:
+                refs = fn.get_mlil_var_refs_from(addr)
+            return [
+                {
+                    "var": str(ref.var.name) if hasattr(ref, "var") else str(ref),
+                    "address": hex(ref.address) if hasattr(ref, "address") else hex(addr),
+                    "type": str(type(ref).__name__),
+                }
+                for ref in refs
+            ]
+        return _run_on_main_thread(_do)
+
+    def _function_metadata_query(self, selector, identifier, key: str):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            val = fn.query_user_metadata(key)
+            if val is None:
+                return {"key": key, "found": False, "value": None}
+            return {"key": key, "found": True, "value": val}
+        return _run_on_main_thread(_do)
+
+    def _function_metadata_store(self, selector, identifier, key: str, value):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            fn.store_user_metadata(key, value)
+            return {"key": key, "stored": True}
+        return _run_on_main_thread(_do)
+
+    def _function_metadata_remove(self, selector, identifier, key: str):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, identifier)
+        def _do():
+            fn.remove_user_metadata(key)
+            return {"key": key, "removed": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Database operations
+    # =========================================================================
+
+    def _database_info(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            db = bv.file.database
+            if db is None:
+                return {"has_database": False}
+            return {
+                "has_database": True,
+                "global_keys": list(db.read_global_data("").keys()) if hasattr(db, "read_global_data") else [],
+                "snapshot_count": len(db.snapshots) if hasattr(db, "snapshots") else 0,
+                "current_snapshot": db.current_snapshot.id if hasattr(db, "current_snapshot") and db.current_snapshot else None,
+            }
+        return _run_on_main_thread(_do)
+
+    def _database_read_global(self, selector, key: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            db = bv.file.database
+            if db is None:
+                raise RuntimeError("No database (save as .bndb first)")
+            val = db.read_global(key)
+            return {"key": key, "value": val}
+        return _run_on_main_thread(_do)
+
+    def _database_write_global(self, selector, key: str, value: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            db = bv.file.database
+            if db is None:
+                raise RuntimeError("No database (save as .bndb first)")
+            db.write_global(key, value)
+            return {"key": key, "written": True}
+        return _run_on_main_thread(_do)
+
+    def _database_snapshots(self, selector, *, offset: int = 0, limit: int = 50):
+        bv = self._resolve_view(selector)
+        def _do():
+            db = bv.file.database
+            if db is None:
+                raise RuntimeError("No database (save as .bndb first)")
+            snaps = list(db.snapshots)[offset:offset + limit]
+            return [
+                {
+                    "id": s.id,
+                    "name": s.name if hasattr(s, "name") else None,
+                    "is_auto_save": s.is_auto_save if hasattr(s, "is_auto_save") else None,
+                }
+                for s in snaps
+            ]
+        return _run_on_main_thread(_do)
+
+    def _database_save_auto_snapshot(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.file.create_database(bv.file.filename)
+            return {"saved": True, "path": bv.file.filename}
+        return _run_on_main_thread(_do)
+
+    def _database_create_bndb(self, selector, path: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.create_database(path)
+            return {"created": True, "path": path}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Type extended operations
+    # =========================================================================
+
+    def _type_rename(self, selector, old_name: str, new_name: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            t = bv.get_type_by_name(old_name)
+            if t is None:
+                raise RuntimeError(f"Type {old_name!r} not found")
+            bv.rename_type(old_name, new_name)
+            return {"old_name": old_name, "new_name": new_name, "renamed": True}
+        return _run_on_main_thread(_do)
+
+    def _type_undefine_user(self, selector, name: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            t = bv.get_type_by_name(name)
+            if t is None:
+                raise RuntimeError(f"Type {name!r} not found")
+            bv.undefine_user_type(name)
+            return {"name": name, "undefined": True}
+        return _run_on_main_thread(_do)
+
+    def _type_parse_string(self, selector, type_source: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            result = bv.parse_type_string(type_source)
+            if result is None:
+                raise RuntimeError(f"Failed to parse type string: {type_source!r}")
+            parsed_type, name = result
+            return {"source": type_source, "parsed": str(parsed_type), "name": str(name) if name else None}
+        return _run_on_main_thread(_do)
+
+    def _type_import_library_type(self, selector, name: str, *, lib_id=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            if lib_id:
+                for lib in bv.type_libraries:
+                    if lib.name == lib_id or str(lib.guid) == lib_id:
+                        t = lib.get_named_type(name)
+                        if t:
+                            bv.define_user_type(name, t)
+                            return {"name": name, "imported": True, "library": lib.name}
+                raise RuntimeError(f"Type library {lib_id!r} not found or type {name!r} not in it")
+            # Search all type libraries
+            for lib in bv.type_libraries:
+                t = lib.get_named_type(name)
+                if t:
+                    bv.define_user_type(name, t)
+                    return {"name": name, "imported": True, "library": lib.name}
+            raise RuntimeError(f"Type {name!r} not found in any type library")
+        return _run_on_main_thread(_do)
+
+    def _type_import_library_object(self, selector, name: str, *, lib_id=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            if lib_id:
+                for lib in bv.type_libraries:
+                    if lib.name == lib_id or str(lib.guid) == lib_id:
+                        obj = lib.get_named_object(name)
+                        if obj:
+                            bv.define_user_type(name, obj)
+                            return {"name": name, "imported": True, "library": lib.name}
+                raise RuntimeError(f"Type library {lib_id!r} not found or object {name!r} not in it")
+            for lib in bv.type_libraries:
+                obj = lib.get_named_object(name)
+                if obj:
+                    bv.define_user_type(name, obj)
+                    return {"name": name, "imported": True, "library": lib.name}
+            raise RuntimeError(f"Object {name!r} not found in any type library")
+        return _run_on_main_thread(_do)
+
+    def _type_export_to_library(self, selector, type_library_id: str, type_source: str, *, name=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            target_lib = None
+            for lib in bv.type_libraries:
+                if lib.name == type_library_id or str(lib.guid) == type_library_id:
+                    target_lib = lib
+                    break
+            if target_lib is None:
+                raise RuntimeError(f"Type library {type_library_id!r} not found")
+            result = bv.parse_type_string(type_source)
+            if result is None:
+                raise RuntimeError(f"Failed to parse type: {type_source!r}")
+            parsed_type, parsed_name = result
+            export_name = name or str(parsed_name)
+            target_lib.add_named_type(export_name, parsed_type)
+            return {"name": export_name, "exported": True, "library": target_lib.name}
+        return _run_on_main_thread(_do)
+
+    def _type_library_list(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            return [
+                {
+                    "name": lib.name,
+                    "guid": str(lib.guid) if hasattr(lib, "guid") else None,
+                    "platform": str(lib.platform) if hasattr(lib, "platform") and lib.platform else None,
+                }
+                for lib in bv.type_libraries
+            ]
+        return _run_on_main_thread(_do)
+
+    def _type_library_get(self, selector, type_library_id: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            for lib in bv.type_libraries:
+                if lib.name == type_library_id or str(lib.guid) == type_library_id:
+                    named_types = list(lib.named_types.keys()) if hasattr(lib, "named_types") else []
+                    named_objects = list(lib.named_objects.keys()) if hasattr(lib, "named_objects") else []
+                    return {
+                        "name": lib.name,
+                        "guid": str(lib.guid) if hasattr(lib, "guid") else None,
+                        "named_types": [str(t) for t in named_types[:100]],
+                        "named_objects": [str(o) for o in named_objects[:100]],
+                        "type_count": len(named_types),
+                        "object_count": len(named_objects),
+                    }
+            raise RuntimeError(f"Type library {type_library_id!r} not found")
+        return _run_on_main_thread(_do)
+
+    def _type_library_create(self, selector, name: str, *, path=None, add_to_view: bool = False):
+        bv = self._resolve_view(selector)
+        def _do():
+            lib = bn.TypeLibrary.new(bv.arch, name)
+            if path:
+                lib.write_to_file(path)
+            if add_to_view:
+                bv.add_type_library(lib)
+            return {"name": lib.name, "created": True, "added_to_view": add_to_view}
+        return _run_on_main_thread(_do)
+
+    def _type_library_load(self, selector, path: str, *, add_to_view: bool = True):
+        bv = self._resolve_view(selector)
+        def _do():
+            lib = bn.TypeLibrary(path)
+            if add_to_view:
+                bv.add_type_library(lib)
+            return {"name": lib.name, "loaded": True, "added_to_view": add_to_view}
+        return _run_on_main_thread(_do)
+
+    def _type_archive_list(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            archives = bv.type_archives if hasattr(bv, "type_archives") else []
+            return [
+                {
+                    "id": str(a.id) if hasattr(a, "id") else None,
+                    "path": str(a.path) if hasattr(a, "path") else None,
+                }
+                for a in archives
+            ]
+        return _run_on_main_thread(_do)
+
+    def _type_archive_get(self, selector, type_archive_id: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            for a in (bv.type_archives if hasattr(bv, "type_archives") else []):
+                if str(getattr(a, "id", "")) == type_archive_id:
+                    type_names = a.get_type_names_and_ids() if hasattr(a, "get_type_names_and_ids") else {}
+                    return {
+                        "id": str(a.id),
+                        "path": str(a.path) if hasattr(a, "path") else None,
+                        "types": [{"name": str(n), "id": str(i)} for n, i in list(type_names.items())[:100]],
+                        "count": len(type_names),
+                    }
+            raise RuntimeError(f"Type archive {type_archive_id!r} not found")
+        return _run_on_main_thread(_do)
+
+    def _type_archive_create(self, selector, path: str, *, attach: bool = False):
+        bv = self._resolve_view(selector)
+        def _do():
+            archive = bn.TypeArchive.create(path)
+            if attach and hasattr(bv, "attach_type_archive"):
+                bv.attach_type_archive(archive)
+            return {"created": True, "path": path, "attached": attach}
+        return _run_on_main_thread(_do)
+
+    def _type_archive_open(self, selector, path: str, *, attach: bool = False):
+        bv = self._resolve_view(selector)
+        def _do():
+            archive = bn.TypeArchive.open(path)
+            if attach and hasattr(bv, "attach_type_archive"):
+                bv.attach_type_archive(archive)
+            return {"opened": True, "path": path, "attached": attach}
+        return _run_on_main_thread(_do)
+
+    def _type_archive_pull(self, selector, type_archive_id: str, names: list):
+        bv = self._resolve_view(selector)
+        def _do():
+            for a in (bv.type_archives if hasattr(bv, "type_archives") else []):
+                if str(getattr(a, "id", "")) == type_archive_id:
+                    pulled = []
+                    for name in names:
+                        t = a.get_type_by_name(name) if hasattr(a, "get_type_by_name") else None
+                        if t:
+                            bv.define_user_type(name, t)
+                            pulled.append(name)
+                    return {"pulled": pulled, "count": len(pulled)}
+            raise RuntimeError(f"Type archive {type_archive_id!r} not found")
+        return _run_on_main_thread(_do)
+
+    def _type_archive_push(self, selector, type_archive_id: str, names: list):
+        bv = self._resolve_view(selector)
+        def _do():
+            for a in (bv.type_archives if hasattr(bv, "type_archives") else []):
+                if str(getattr(a, "id", "")) == type_archive_id:
+                    pushed = []
+                    for name in names:
+                        t = bv.get_type_by_name(name)
+                        if t and hasattr(a, "add_type"):
+                            a.add_type(name, t)
+                            pushed.append(name)
+                    return {"pushed": pushed, "count": len(pushed)}
+            raise RuntimeError(f"Type archive {type_archive_id!r} not found")
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Annotation operations
+    # =========================================================================
+
+    def _annotation_add_tag(self, selector, address, tag_type: str, data: str):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            tt = bv.create_tag_type(tag_type, "⭐") if bv.get_tag_type(tag_type) is None else bv.get_tag_type(tag_type)
+            tag = bv.create_tag(tt, data)
+            fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
+            if fn:
+                fn.add_tag(tag_type, data, addr)
+            else:
+                bv.add_tag(addr, tag_type, data)
+            return {"address": hex(addr), "tag_type": tag_type, "data": data, "added": True}
+        return _run_on_main_thread(_do)
+
+    def _annotation_get_tags(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            tags = []
+            fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
+            if fn:
+                for tag in fn.get_tags_at(addr):
+                    tags.append({"type": tag.type.name, "data": tag.data})
+            addr_tags = bv.get_tags_at(addr) if hasattr(bv, "get_tags_at") else []
+            for tag in addr_tags:
+                tags.append({"type": tag.type.name, "data": tag.data})
+            return tags
+        return _run_on_main_thread(_do)
+
+    def _annotation_define_data_var(self, selector, address, *, type_name=None, name=None, width=None):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            if type_name:
+                t = bv.parse_type_string(type_name)
+                if t is None:
+                    raise RuntimeError(f"Failed to parse type: {type_name!r}")
+                bv.define_user_data_var(addr, t[0])
+            elif width:
+                bv.define_user_data_var(addr, bn.Type.int(int(width)))
+            else:
+                bv.define_user_data_var(addr, bn.Type.int(4))
+            if name:
+                sym = bn.Symbol(bn.SymbolType.DataSymbol, addr, name)
+                bv.define_user_symbol(sym)
+            return {"address": hex(addr), "defined": True, "type": type_name, "name": name}
+        return _run_on_main_thread(_do)
+
+    def _annotation_undefine_data_var(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            bv.undefine_user_data_var(addr)
+            return {"address": hex(addr), "undefined": True}
+        return _run_on_main_thread(_do)
+
+    def _annotation_define_symbol(self, selector, address, name: str, *, symbol_type=None):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            st = bn.SymbolType.DataSymbol
+            if symbol_type:
+                mapping = {
+                    "function": bn.SymbolType.FunctionSymbol,
+                    "data": bn.SymbolType.DataSymbol,
+                    "import": bn.SymbolType.ImportedFunctionSymbol,
+                    "external": bn.SymbolType.ExternalSymbol,
+                }
+                st = mapping.get(symbol_type, bn.SymbolType.DataSymbol)
+            sym = bn.Symbol(st, addr, name)
+            bv.define_user_symbol(sym)
+            return {"address": hex(addr), "name": name, "symbol_type": str(st), "defined": True}
+        return _run_on_main_thread(_do)
+
+    def _annotation_undefine_symbol(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            sym = bv.get_symbol_at(addr)
+            if sym is None:
+                raise RuntimeError(f"No symbol at {hex(addr)}")
+            bv.undefine_user_symbol(sym)
+            return {"address": hex(addr), "undefined": True}
+        return _run_on_main_thread(_do)
+
+    def _annotation_rename_data_var(self, selector, address, new_name: str):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            sym = bv.get_symbol_at(addr)
+            if sym:
+                bv.undefine_user_symbol(sym)
+            new_sym = bn.Symbol(bn.SymbolType.DataSymbol, addr, new_name)
+            bv.define_user_symbol(new_sym)
+            return {"address": hex(addr), "new_name": new_name, "renamed": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Undo operations
+    # =========================================================================
+
+    def _undo_begin(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.begin_undo_actions()
+            return {"begun": True}
+        return _run_on_main_thread(_do)
+
+    def _undo_commit(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.commit_undo_actions()
+            return {"committed": True}
+        return _run_on_main_thread(_do)
+
+    def _undo_revert(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.revert_undo_actions()
+            return {"reverted": True}
+        return _run_on_main_thread(_do)
+
+    def _undo_undo(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.undo()
+            return {"undone": True}
+        return _run_on_main_thread(_do)
+
+    def _undo_redo(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.redo()
+            return {"redone": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # UIDF (User IL Data Flow) operations
+    # =========================================================================
+
+    def _uidf_set(self, selector, params):
+        bv = self._resolve_view(selector)
+        fn_start = _parse_address(params["function_start"])
+        address = _parse_address(params["address"])
+        var_name = str(params["var_name"])
+        def_site_addr = _parse_address(params.get("def_site_address", address))
+        value_raw = params["value"]
+        state_raw = params.get("state", "ConstantValue")
+        def _do():
+            fn = bv.get_function_at(fn_start)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_start)}")
+            target_var = None
+            for var in fn.vars:
+                if str(var.name) == var_name:
+                    target_var = var
+                    break
+            if target_var is None:
+                raise RuntimeError(f"Variable {var_name!r} not found")
+            from binaryninja import PossibleValueSet, RegisterValueType
+            state_map = {
+                "ConstantValue": RegisterValueType.ConstantValue,
+                "ConstantPointerValue": RegisterValueType.ConstantPointerValue,
+            }
+            pv = PossibleValueSet.constant(int(value_raw))
+            def_site = bn.ArchAndAddr(fn.arch, def_site_addr) if hasattr(bn, "ArchAndAddr") else None
+            if def_site and hasattr(fn, "set_user_var_value"):
+                fn.set_user_var_value(target_var, def_site, pv)
+            elif hasattr(fn, "set_user_var_value"):
+                fn.set_user_var_value(target_var, fn.arch, address, pv)
+            else:
+                raise RuntimeError("set_user_var_value not available")
+            return {"function": fn.name, "var": var_name, "value": value_raw, "set": True}
+        return _run_on_main_thread(_do)
+
+    def _uidf_clear(self, selector, params):
+        bv = self._resolve_view(selector)
+        fn_start = _parse_address(params["function_start"])
+        address = _parse_address(params["address"])
+        var_name = str(params["var_name"])
+        def _do():
+            fn = bv.get_function_at(fn_start)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_start)}")
+            target_var = None
+            for var in fn.vars:
+                if str(var.name) == var_name:
+                    target_var = var
+                    break
+            if target_var is None:
+                raise RuntimeError(f"Variable {var_name!r} not found")
+            if hasattr(fn, "clear_user_var_value"):
+                def_site = bn.ArchAndAddr(fn.arch, address) if hasattr(bn, "ArchAndAddr") else None
+                if def_site:
+                    fn.clear_user_var_value(target_var, def_site)
+                else:
+                    fn.clear_user_var_value(target_var, fn.arch, address)
+            else:
+                raise RuntimeError("clear_user_var_value not available")
+            return {"function": fn.name, "var": var_name, "cleared": True}
+        return _run_on_main_thread(_do)
+
+    def _uidf_list(self, selector, function_start):
+        bv = self._resolve_view(selector)
+        fn_start = _parse_address(function_start)
+        def _do():
+            fn = bv.get_function_at(fn_start)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_start)}")
+            if not hasattr(fn, "user_var_values") or fn.user_var_values is None:
+                return []
+            results = []
+            for var, val_info in fn.user_var_values.items() if hasattr(fn.user_var_values, "items") else []:
+                results.append({
+                    "var": str(var.name) if hasattr(var, "name") else str(var),
+                    "info": str(val_info),
+                })
+            return results
+        return _run_on_main_thread(_do)
+
+    def _uidf_parse(self, selector, value: str, state: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            from binaryninja import PossibleValueSet, RegisterValueType
+            state_map = {
+                "ConstantValue": RegisterValueType.ConstantValue,
+                "ConstantPointerValue": RegisterValueType.ConstantPointerValue,
+                "UndeterminedValue": RegisterValueType.UndeterminedValue,
+            }
+            rv_type = state_map.get(state)
+            if rv_type is None:
+                return {"value": value, "state": state, "valid": False, "error": f"Unknown state: {state}"}
+            return {"value": value, "state": state, "valid": True, "parsed_value": int(value, 0) if isinstance(value, str) else value}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Loader operations
+    # =========================================================================
+
+    def _loader_settings_get(self, selector, type_name: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            settings = bn.Settings(f"loader.{type_name}")
+            keys = settings.keys() if hasattr(settings, "keys") else []
+            result = {}
+            for key in keys:
+                result[key] = settings.get_string(key) if hasattr(settings, "get_string") else None
+            return {"type_name": type_name, "settings": result}
+        return _run_on_main_thread(_do)
+
+    def _loader_settings_set(self, selector, type_name: str, key: str, value):
+        bv = self._resolve_view(selector)
+        def _do():
+            settings = bn.Settings(f"loader.{type_name}")
+            if isinstance(value, bool):
+                settings.set_bool(key, value)
+            elif isinstance(value, int):
+                settings.set_integer(key, value)
+            else:
+                settings.set_string(key, str(value))
+            return {"type_name": type_name, "key": key, "set": True}
+        return _run_on_main_thread(_do)
+
+    def _loader_settings_types(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            return {"view_type": bv.view_type, "available_view_types": [str(v) for v in bv.available_view_types] if hasattr(bv, "available_view_types") else []}
+        return _run_on_main_thread(_do)
+
+    def _loader_rebase(self, selector, address, *, force: bool = False):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            if hasattr(bv, "rebase"):
+                bv.rebase(addr)
+            else:
+                raise RuntimeError("BinaryView does not support rebase")
+            bv.update_analysis_and_wait()
+            return {"new_base": hex(addr), "rebased": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # External library/location operations
+    # =========================================================================
+
+    def _external_library_add(self, selector, name: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            lib = bv.add_external_library(name, None) if hasattr(bv, "add_external_library") else None
+            if lib is None:
+                raise RuntimeError("add_external_library not available or failed")
+            return {"name": name, "added": True}
+        return _run_on_main_thread(_do)
+
+    def _external_library_list(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            libs = bv.external_libraries if hasattr(bv, "external_libraries") else []
+            return [
+                {
+                    "name": lib.name if hasattr(lib, "name") else str(lib),
+                    "backing_file": str(lib.backing_file) if hasattr(lib, "backing_file") and lib.backing_file else None,
+                }
+                for lib in libs
+            ]
+        return _run_on_main_thread(_do)
+
+    def _external_library_remove(self, selector, name: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            if hasattr(bv, "remove_external_library"):
+                bv.remove_external_library(name)
+            else:
+                raise RuntimeError("remove_external_library not available")
+            return {"name": name, "removed": True}
+        return _run_on_main_thread(_do)
+
+    def _external_location_add(self, selector, params):
+        bv = self._resolve_view(selector)
+        source_addr = _parse_address(params["source_address"])
+        library_name = params.get("library_name")
+        target_symbol = params.get("target_symbol")
+        target_address = params.get("target_address")
+        def _do():
+            if hasattr(bv, "add_external_location"):
+                lib = None
+                if library_name:
+                    for l in (bv.external_libraries if hasattr(bv, "external_libraries") else []):
+                        if (hasattr(l, "name") and l.name == library_name):
+                            lib = l
+                            break
+                bv.add_external_location(source_addr, lib, target_symbol, _parse_address(target_address) if target_address else None)
+            else:
+                raise RuntimeError("add_external_location not available")
+            return {"source_address": hex(source_addr), "added": True}
+        return _run_on_main_thread(_do)
+
+    def _external_location_get(self, selector, source_address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(source_address)
+        def _do():
+            if hasattr(bv, "get_external_location_at"):
+                loc = bv.get_external_location_at(addr)
+                if loc is None:
+                    return {"address": hex(addr), "found": False}
+                return {
+                    "address": hex(addr),
+                    "found": True,
+                    "library": loc.library.name if hasattr(loc, "library") and loc.library else None,
+                    "symbol": loc.symbol if hasattr(loc, "symbol") else None,
+                    "target_address": hex(loc.target_address) if hasattr(loc, "target_address") and loc.target_address else None,
+                }
+            raise RuntimeError("get_external_location_at not available")
+        return _run_on_main_thread(_do)
+
+    def _external_location_remove(self, selector, source_address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(source_address)
+        def _do():
+            if hasattr(bv, "remove_external_location"):
+                bv.remove_external_location(addr)
+            else:
+                raise RuntimeError("remove_external_location not available")
+            return {"address": hex(addr), "removed": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Analysis operations
+    # =========================================================================
+
+    def _analysis_status(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            progress = bv.analysis_progress
+            state_name = progress.state.name if hasattr(progress, "state") and hasattr(progress.state, "name") else str(progress)
+            count = progress.count if hasattr(progress, "count") else 0
+            total = progress.total if hasattr(progress, "total") else 0
+            done = (state_name == "Idle" or (total > 0 and count >= total))
+            return {
+                "state": state_name,
+                "count": count,
+                "total": total,
+                "done": done,
+            }
+        return _run_on_main_thread(_do)
+
+    def _analysis_progress(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            progress = bv.analysis_progress
+            state_name = progress.state.name if hasattr(progress, "state") and hasattr(progress.state, "name") else str(progress)
+            count = progress.count if hasattr(progress, "count") else 0
+            total = progress.total if hasattr(progress, "total") else 0
+            done = (state_name == "Idle" or (total > 0 and count >= total))
+            return {
+                "state": state_name,
+                "count": count,
+                "total": total,
+                "done": done,
+            }
+        return _run_on_main_thread(_do)
+
+    def _analysis_abort(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.abort_analysis()
+            return {"aborted": True}
+        return _run_on_main_thread(_do)
+
+    def _analysis_set_hold(self, selector, hold: bool):
+        bv = self._resolve_view(selector)
+        def _do():
+            if hold:
+                bv.abort_analysis()
+            return {"hold": hold, "set": True}
+        return _run_on_main_thread(_do)
+
+    def _analysis_update(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.update_analysis()
+            return {"update_requested": True}
+        return _run_on_main_thread(_do)
+
+    def _analysis_update_and_wait(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.update_analysis_and_wait()
+            return {"updated": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Metadata (view-level) operations
+    # =========================================================================
+
+    def _metadata_query(self, selector, key: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            try:
+                val = bv.query_metadata(key)
+            except KeyError:
+                return {"key": key, "found": False, "value": None}
+            if val is None:
+                return {"key": key, "found": False, "value": None}
+            return {"key": key, "found": True, "value": str(val)}
+        return _run_on_main_thread(_do)
+
+    def _metadata_store(self, selector, key: str, value):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.store_metadata(key, value)
+            return {"key": key, "stored": True}
+        return _run_on_main_thread(_do)
+
+    def _metadata_remove(self, selector, key: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            try:
+                bv.remove_metadata(key)
+            except KeyError:
+                return {"key": key, "removed": False, "error": "key not found"}
+            return {"key": key, "removed": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Data typed at address
+    # =========================================================================
+
+    def _data_typed_at(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            dv = bv.get_data_var_at(addr)
+            if dv is None:
+                return {"address": hex(addr), "found": False}
+            return {
+                "address": hex(addr),
+                "found": True,
+                "type": str(dv.type) if dv.type else None,
+                "auto_discovered": dv.auto_discovered if hasattr(dv, "auto_discovered") else None,
+                "name": str(dv.name) if hasattr(dv, "name") else None,
+            }
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Xref extended operations
+    # =========================================================================
+
+    def _xref_code_refs_from(self, selector, address, *, length=None):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            if length:
+                refs = bv.get_code_refs_from(addr, int(length))
+            else:
+                refs = bv.get_code_refs_from(addr)
+            return [
+                {
+                    "address": hex(ref) if isinstance(ref, int) else hex(ref.address) if hasattr(ref, "address") else str(ref),
+                }
+                for ref in refs
+            ]
+        return _run_on_main_thread(_do)
+
+    def _xref_code_refs_to(self, selector, address, *, limit: int = 100):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            refs = list(bv.get_code_refs(addr))[:limit]
+            return [
+                {
+                    "address": hex(ref.address) if hasattr(ref, "address") else str(ref),
+                    "function": ref.function.name if hasattr(ref, "function") and ref.function else None,
+                }
+                for ref in refs
+            ]
+        return _run_on_main_thread(_do)
+
+    def _xref_data_refs_from(self, selector, address, *, length=None):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            if length:
+                refs = bv.get_data_refs_from(addr, int(length))
+            else:
+                refs = bv.get_data_refs_from(addr)
+            return [{"address": hex(ref)} for ref in refs]
+        return _run_on_main_thread(_do)
+
+    def _xref_data_refs_to(self, selector, address, *, limit: int = 100):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            refs = list(bv.get_data_refs(addr))[:limit]
+            return [{"address": hex(ref)} for ref in refs]
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # IL extended operations
+    # =========================================================================
+
+    def _il_address_to_index(self, selector, function_start, address, *, level: str = "hlil"):
+        bv = self._resolve_view(selector)
+        fn_start = _parse_address(function_start)
+        addr = _parse_address(address)
+        def _do():
+            fn = bv.get_function_at(fn_start)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_start)}")
+            if level == "hlil":
+                il = fn.hlil
+            elif level == "mlil":
+                il = fn.mlil
+            else:
+                il = fn.llil
+            # find instruction at address
+            for i, instr in enumerate(il.instructions):
+                if instr.address == addr:
+                    return {"function": fn.name, "address": hex(addr), "index": i, "level": level}
+            return {"function": fn.name, "address": hex(addr), "index": None, "level": level, "note": "no instruction at exact address"}
+        return _run_on_main_thread(_do)
+
+    def _il_index_to_address(self, selector, function_start, index: int, *, level: str = "hlil"):
+        bv = self._resolve_view(selector)
+        fn_start = _parse_address(function_start)
+        def _do():
+            fn = bv.get_function_at(fn_start)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_start)}")
+            if level == "hlil":
+                il = fn.hlil
+            elif level == "mlil":
+                il = fn.mlil
+            else:
+                il = fn.llil
+            if index < 0 or index >= len(il):
+                raise RuntimeError(f"Index {index} out of range (0..{len(il)-1})")
+            instr = il[index]
+            return {"function": fn.name, "index": index, "address": hex(instr.address), "level": level}
+        return _run_on_main_thread(_do)
+
+    def _il_instruction_by_addr(self, selector, function_start, address, *, level: str = "hlil"):
+        bv = self._resolve_view(selector)
+        fn_start = _parse_address(function_start)
+        addr = _parse_address(address)
+        def _do():
+            fn = bv.get_function_at(fn_start)
+            if fn is None:
+                raise RuntimeError(f"No function at {hex(fn_start)}")
+            if level == "hlil":
+                il = fn.hlil
+            elif level == "mlil":
+                il = fn.mlil
+            else:
+                il = fn.llil
+            for i, instr in enumerate(il.instructions):
+                if instr.address == addr:
+                    return {
+                        "function": fn.name,
+                        "address": hex(addr),
+                        "index": i,
+                        "level": level,
+                        "text": str(instr),
+                        "operation": str(instr.operation) if hasattr(instr, "operation") else None,
+                    }
+            raise RuntimeError(f"No {level} instruction at {hex(addr)} in {fn.name}")
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Section/Segment user operations
+    # =========================================================================
+
+    def _section_add_user(self, selector, params):
+        bv = self._resolve_view(selector)
+        name = str(params["name"])
+        start = _parse_address(params["start"])
+        length = int(params["length"])
+        def _do():
+            bv.add_user_section(name, start, length)
+            return {"name": name, "start": hex(start), "length": length, "added": True}
+        return _run_on_main_thread(_do)
+
+    def _section_remove_user(self, selector, name: str):
+        bv = self._resolve_view(selector)
+        def _do():
+            bv.remove_user_section(name)
+            return {"name": name, "removed": True}
+        return _run_on_main_thread(_do)
+
+    def _segment_add_user(self, selector, params):
+        bv = self._resolve_view(selector)
+        start = _parse_address(params["start"])
+        length = int(params["length"])
+        data_offset = int(params.get("data_offset", 0))
+        data_length = int(params.get("data_length", length))
+        flags = int(params.get("flags", 0))
+        def _do():
+            bv.add_user_segment(start, length, data_offset, data_length, flags)
+            return {"start": hex(start), "length": length, "added": True}
+        return _run_on_main_thread(_do)
+
+    def _segment_remove_user(self, selector, start, *, length=None):
+        bv = self._resolve_view(selector)
+        s = _parse_address(start)
+        def _do():
+            if length:
+                bv.remove_user_segment(s, int(length))
+            else:
+                bv.remove_user_segment(s, 0)
+            return {"start": hex(s), "removed": True}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Debug info operations
+    # =========================================================================
+
+    def _debug_parsers(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            parsers = bn.DebugInfoParser.get_parsers_for_view(bv) if hasattr(bn, "DebugInfoParser") else []
+            return [{"name": p.name if hasattr(p, "name") else str(p)} for p in parsers]
+        return _run_on_main_thread(_do)
+
+    def _debug_parse_and_apply(self, selector, *, parser_name=None, debug_path=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            if parser_name:
+                parser = None
+                for p in (bn.DebugInfoParser.get_parsers_for_view(bv) if hasattr(bn, "DebugInfoParser") else []):
+                    if (hasattr(p, "name") and p.name == parser_name):
+                        parser = p
+                        break
+                if parser is None:
+                    raise RuntimeError(f"Debug info parser {parser_name!r} not found")
+                debug_info = parser.parse_debug_info(bv, debug_path) if debug_path else parser.parse_debug_info(bv)
+            else:
+                debug_info = bv.debug_info
+            if debug_info and hasattr(bv, "apply_debug_info"):
+                bv.apply_debug_info(debug_info)
+                bv.update_analysis_and_wait()
+                return {"applied": True, "parser": parser_name}
+            return {"applied": False, "reason": "no debug info or apply_debug_info unavailable"}
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Plugin command operations
+    # =========================================================================
+
+    def _plugin_valid_commands(self, selector, *, address=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            commands = []
+            for cmd in bn.PluginCommand:
+                if hasattr(cmd, "is_valid"):
+                    if cmd.is_valid(bv):
+                        commands.append({"name": cmd.name, "description": cmd.description if hasattr(cmd, "description") else None})
+                else:
+                    commands.append({"name": cmd.name, "description": cmd.description if hasattr(cmd, "description") else None})
+            return commands
+        return _run_on_main_thread(_do)
+
+    def _plugin_execute(self, selector, name: str, *, address=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            for cmd in bn.PluginCommand:
+                if cmd.name == name:
+                    if hasattr(cmd, "execute"):
+                        cmd.execute(bv)
+                    return {"name": name, "executed": True}
+            raise RuntimeError(f"Plugin command {name!r} not found")
+        return _run_on_main_thread(_do)
+
+    # =========================================================================
+    # Binary basic blocks at address
+    # =========================================================================
+
+    def _binary_basic_blocks_at(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            bbs = bv.get_basic_blocks_at(addr)
+            return [
+                {
+                    "start": hex(bb.start),
+                    "end": hex(bb.end),
+                    "length": bb.length,
+                    "function": bb.function.name if bb.function else None,
+                    "function_start": hex(bb.function.start) if bb.function else None,
+                }
+                for bb in bbs
+            ]
+        return _run_on_main_thread(_do)
+
 
 _bridge: BinaryNinjaBridge | None = None
 
