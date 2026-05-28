@@ -212,6 +212,28 @@ def _render_result(
     sys.stdout.write(result.rendered)
 
 
+def _render_and_output(
+    args: argparse.Namespace,
+    result: Any,
+    *,
+    text_renderer: Callable[[Any], str] | None = None,
+    stem: str,
+) -> int:
+    """Render result and write output (mini version of _call's tail for direct-request handlers)."""
+    spill_context = result
+    if text_renderer is not None and args.format == "text":
+        result = text_renderer(result)
+    _render_result(
+        result,
+        fmt=args.format,
+        out_path=args.out,
+        stem=stem,
+        spill_label=stem.replace("-", " "),
+        spill_context=spill_context,
+    )
+    return 0
+
+
 def _render_target_choice(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1865,28 +1887,44 @@ def _function_info(args: argparse.Namespace) -> int:
     )
 
 
+def _handle_il_unavailable(result: dict[str, Any]) -> int:
+    """Print IL unavailable info to stderr and return exit code 4."""
+    func_info = result.get("function", {})
+    name = func_info.get("name", "?")
+    address = func_info.get("address", "?")
+    reason = result.get("reason", "IL not available")
+    hint = result.get("hint", "")
+    status = result.get("status", "unknown")
+
+    msg = f"error: cannot obtain IL for {name} ({address}): {reason}"
+    if status == "analyzing":
+        msg = f"info: {name} ({address}): {reason}"
+    print(msg, file=sys.stderr)
+    if hint:
+        print(f"hint: {hint}", file=sys.stderr)
+    return 4
+
+
 def _decompile(args: argparse.Namespace) -> int:
-    return _call(
-        args,
-        "decompile",
-        {"identifier": args.identifier},
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_text_field("text"),
-        stem="decompile",
-    )
+    target = _resolve_target(args, require_target=True, allow_implicit_target=True)
+    response = send_request("decompile", params={"identifier": args.identifier}, target=target)
+    result = response["result"]
+    if result.get("il_unavailable"):
+        return _handle_il_unavailable(result)
+    return _render_and_output(args, result, text_renderer=_text_field("text"), stem="decompile")
 
 
 def _il(args: argparse.Namespace) -> int:
-    return _call(
-        args,
+    target = _resolve_target(args, require_target=True, allow_implicit_target=True)
+    response = send_request(
         "il",
-        {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_text_field("text"),
-        stem="il",
+        params={"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
+        target=target,
     )
+    result = response["result"]
+    if result.get("il_unavailable"):
+        return _handle_il_unavailable(result)
+    return _render_and_output(args, result, text_renderer=_text_field("text"), stem="il")
 
 
 def _disasm(args: argparse.Namespace) -> int:
@@ -2323,6 +2361,26 @@ def _function_callees(args: argparse.Namespace) -> int:
     )
 
 
+def _render_force_analysis(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    name = value.get("function", "?")
+    addr = value.get("address", "?")
+    il_ok = value.get("il_available", False)
+    lines = [f"{name} ({addr}): reanalyzed"]
+    if value.get("prior_skip_reason"):
+        lines.append(f"  prior skip reason: {value['prior_skip_reason']}")
+    lines.append(f"  IL available: {il_ok}")
+    if not il_ok:
+        il_status = value.get("il_status")
+        if il_status:
+            lines.append(f"  status: {il_status.get('reason', 'unknown')}")
+            hint = il_status.get("hint")
+            if hint:
+                lines.append(f"  hint: {hint}")
+    return "\n".join(lines)
+
+
 def _function_force_analysis(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -2330,6 +2388,7 @@ def _function_force_analysis(args: argparse.Namespace) -> int:
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_force_analysis,
         stem="function-force-analysis",
     )
 

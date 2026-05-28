@@ -2335,3 +2335,115 @@ def test_daemon_start_background_errors_when_registry_never_appears(monkeypatch,
     rc = bn.cli.main(["daemon", "start"])
     assert rc == 2
     assert "did not register" in capsys.readouterr().err
+
+
+# --- IL unavailable detection tests ---
+
+
+def test_decompile_il_unavailable_analysis_skipped(monkeypatch, capsys):
+    """When bridge reports il_unavailable with analysis_skipped, CLI exits 4 with hint."""
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "function": {"name": "big_func", "address": "0x49d4d0"},
+                "text": None,
+                "il_unavailable": True,
+                "status": "analysis_skipped",
+                "skip_reason": "ExceedFunctionAnalysisTimeSkipReason",
+                "reason": "Function analysis exceeded time limit",
+                "hint": "Use `bn function force-analysis <function>` to force full analysis (may take a long time for large functions).",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["decompile", "--target", "active", "big_func"])
+
+    assert rc == 4
+    err = capsys.readouterr().err
+    assert "cannot obtain IL" in err
+    assert "big_func" in err
+    assert "force-analysis" in err
+
+
+def test_decompile_il_unavailable_analyzing(monkeypatch, capsys):
+    """When bridge reports il_unavailable with analyzing status, CLI exits 4 with info."""
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "function": {"name": "sub_401000", "address": "0x401000"},
+                "text": None,
+                "il_unavailable": True,
+                "status": "analyzing",
+                "reason": "Binary is currently being analyzed (state: AnalyzeState)",
+                "hint": "Wait for analysis to complete, or use `bn analysis status` to check progress.",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["decompile", "--target", "active", "sub_401000"])
+
+    assert rc == 4
+    err = capsys.readouterr().err
+    assert "info:" in err
+    assert "currently being analyzed" in err
+
+
+def test_il_unavailable_returns_exit_4(monkeypatch, capsys):
+    """bn il also returns exit 4 when IL is unavailable."""
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "function": {"name": "big_func", "address": "0x49d4d0"},
+                "view": "mlil",
+                "ssa": False,
+                "text": None,
+                "il_unavailable": True,
+                "status": "analysis_skipped",
+                "skip_reason": "ExceedFunctionSizeSkipReason",
+                "reason": "Function exceeds maximum size limit",
+                "hint": "Use `bn function force-analysis <function>` to force full analysis (may take a long time for large functions).",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["il", "--target", "active", "big_func"])
+
+    assert rc == 4
+    err = capsys.readouterr().err
+    assert "cannot obtain IL" in err
+    assert "force-analysis" in err
+
+
+def test_force_analysis_returns_il_status(monkeypatch, capsys):
+    """bn function force-analysis shows il_available and prior skip reason."""
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        return {
+            "ok": True,
+            "result": {
+                "function": "big_func",
+                "address": "0x49d4d0",
+                "reanalyzed": True,
+                "il_available": True,
+                "prior_skip_reason": "ExceedFunctionAnalysisTimeSkipReason",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "force-analysis", "--target", "active", "--format", "text", "0x49d4d0"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "reanalyzed" in out
+    assert "IL available: True" in out
+    assert "ExceedFunctionAnalysisTimeSkipReason" in out

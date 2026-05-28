@@ -2171,10 +2171,55 @@ class BinaryNinjaBridge:
             seen.add(marker)
             yield var, False
 
-    def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False) -> str:
+    def _il_status(self, bv, func) -> dict[str, Any] | None:
+        """Check why IL might be unavailable. Returns None if IL should be available."""
+        # Check if BV is still analyzing
+        progress = getattr(bv, "analysis_progress", None)
+        if progress is not None:
+            state_name = progress.state.name if hasattr(progress, "state") and hasattr(progress.state, "name") else str(progress)
+            if state_name not in ("Idle", "IdleState"):
+                return {
+                    "status": "analyzing",
+                    "reason": f"Binary is currently being analyzed (state: {state_name})",
+                    "hint": "Wait for analysis to complete, or use `bn analysis status` to check progress.",
+                }
+        # Check if function analysis was skipped
+        if hasattr(func, "analysis_skipped") and func.analysis_skipped:
+            reason_enum = getattr(func, "analysis_skip_reason", None)
+            reason_name = reason_enum.name if reason_enum is not None else "unknown"
+            reason_map = {
+                "ExceedFunctionSizeSkipReason": "Function exceeds maximum size limit",
+                "ExceedFunctionAnalysisTimeSkipReason": "Function analysis exceeded time limit",
+                "ExceedFunctionUpdateCountSkipReason": "Function exceeded update count limit",
+                "AlwaysSkipReason": "Function is set to always skip analysis",
+                "NewAutoFunctionAnalysisSuppressedReason": "Auto analysis suppressed",
+                "BasicAnalysisSkipReason": "Basic analysis mode — advanced IL not generated",
+                "IntermediateAnalysisSkipReason": "Intermediate analysis mode — full IL not generated",
+                "AnalysisPipelineSuspendedReason": "Analysis pipeline suspended",
+            }
+            human_reason = reason_map.get(reason_name, f"Analysis skipped ({reason_name})")
+            return {
+                "status": "analysis_skipped",
+                "skip_reason": reason_name,
+                "reason": human_reason,
+                "hint": "Use `bn function force-analysis <function>` to force full analysis (may take a long time for large functions).",
+            }
+        # Check too_large flag (may not have been skipped yet but is flagged)
+        if hasattr(func, "too_large") and func.too_large:
+            return {
+                "status": "too_large",
+                "reason": "Function is flagged as too large for default analysis",
+                "hint": "Use `bn function force-analysis <function>` to force full analysis.",
+            }
+        return None
+
+    def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False) -> str | dict[str, Any]:
+        """Return IL text as string, or a dict with il_unavailable info if IL cannot be obtained."""
         il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
         try:
             il = getattr(func, il_name)
+            if il is None:
+                raise AttributeError(f"{il_name} is None")
             if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
                 il = il.ssa_form
             lines = []
@@ -2183,9 +2228,15 @@ class BinaryNinjaBridge:
                 lines.append(f"{int(address):08x}        {ins}")
             if lines:
                 return "\n".join(lines)
+            # IL object exists but produced no instructions — might still be generating
         except Exception:
             pass
-        return str(func)
+        # IL not available — figure out why
+        status = self._il_status(bv, func)
+        if status is not None:
+            return {"il_unavailable": True, **status}
+        # Fallback: IL attr exists but empty/broken without a clear reason
+        return {"il_unavailable": True, "status": "unknown", "reason": f"Could not obtain {il_name} for this function", "hint": "Try `bn function force-analysis <function>` or `bn refresh`."}
 
     def _instruction_length(self, bv, address: int) -> int:
         arch = getattr(bv, "arch", None)
@@ -2764,6 +2815,13 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
         text = self._function_text(bv, func, view="hlil")
+        if isinstance(text, dict) and text.get("il_unavailable"):
+            return {
+                "function": {"name": func.name, "address": hex(func.start)},
+                "text": None,
+                "il_unavailable": True,
+                **{k: v for k, v in text.items() if k != "il_unavailable"},
+            }
         warnings = self._render_warnings(text)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
@@ -2818,6 +2876,15 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
         text = self._function_text(bv, func, view=view, ssa=ssa)
+        if isinstance(text, dict) and text.get("il_unavailable"):
+            return {
+                "function": {"name": func.name, "address": hex(func.start)},
+                "view": view,
+                "ssa": ssa,
+                "text": None,
+                "il_unavailable": True,
+                **{k: v for k, v in text.items() if k != "il_unavailable"},
+            }
         return {
             "function": {"name": func.name, "address": hex(func.start)},
             "view": view,
@@ -4576,9 +4643,48 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         fn = self._find_function(bv, identifier)
         def _do():
+            # Record prior state
+            was_skipped = getattr(fn, "analysis_skipped", False)
+            prior_skip_reason = None
+            if was_skipped:
+                reason_enum = getattr(fn, "analysis_skip_reason", None)
+                prior_skip_reason = reason_enum.name if reason_enum is not None else "unknown"
+
+            # Match BN UI "Force Analysis": set NeverSkipFunctionAnalysis override
+            try:
+                from binaryninja.enums import FunctionAnalysisSkipOverride
+                fn.analysis_skip_override = FunctionAnalysisSkipOverride.NeverSkipFunctionAnalysis
+            except Exception:
+                # Fallback for older API: set analysis_skipped = False
+                fn.analysis_skipped = False
+
             fn.reanalyze()
             bv.update_analysis_and_wait()
-            return {"function": fn.name, "address": hex(fn.start), "reanalyzed": True}
+
+            # Verify IL is now available
+            il_available = False
+            try:
+                hlil = fn.hlil
+                if hlil is not None:
+                    instrs = list(hlil.instructions)
+                    il_available = len(instrs) > 0
+            except Exception:
+                pass
+
+            result = {
+                "function": fn.name,
+                "address": hex(fn.start),
+                "reanalyzed": True,
+                "il_available": il_available,
+            }
+            if was_skipped:
+                result["prior_skip_reason"] = prior_skip_reason
+            if not il_available:
+                # Check if still analyzing or some other issue
+                status = self._il_status(bv, fn)
+                if status:
+                    result["il_status"] = status
+            return result
         return _run_on_main_thread(_do)
 
     def _function_ssa_var_def_use(self, selector, identifier, *, var_name: str, version: int, il_level: str = "mlil"):
