@@ -139,6 +139,7 @@ READ_LOCKED_OPS = {
     "disasm_linear",
     "disasm_range",
     # --- function extended ---
+    "function_containing",
     "function_basic_blocks",
     "function_callers",
     "function_callees",
@@ -657,7 +658,17 @@ class TargetManager:
                     view = self._explicit_refs.get(record.view_id) or record.ref()
                     if view is not None:
                         return view
-        raise RuntimeError(f"Unknown target selector: {selector}")
+            # Build hint with available targets
+            available = []
+            for record in self._records.values():
+                info = record.to_dict()
+                available.append(info.get("filename") or info.get("view_id", "?"))
+            hint = ""
+            if available:
+                hint = f". Available targets: {', '.join(available[:5])}"
+                if len(available) > 5:
+                    hint += f" (+{len(available) - 5} more)"
+        raise RuntimeError(f"Unknown target selector: {selector}{hint}")
 
 
 class BridgeHandler(socketserver.StreamRequestHandler):
@@ -1174,6 +1185,8 @@ class BinaryNinjaBridge:
             return self._disasm_range(target, params["start"], params["end"])
 
         # --- function extended ---
+        if op == "function_containing":
+            return self._function_containing(target, params["address"])
         if op == "function_basic_blocks":
             return self._function_basic_blocks(target, params["identifier"])
         if op == "function_callers":
@@ -1911,6 +1924,20 @@ class BinaryNinjaBridge:
             fn = bv.get_function_at(addr)
             if fn is not None:
                 return fn
+            # Address parsed but no function starts there — try containing
+            containing = self._functions_containing(bv, addr)
+            if len(containing) == 1:
+                return containing[0]
+            if len(containing) > 1:
+                hints = ", ".join(f"{fn.name} @ {hex(fn.start)}" for fn in containing[:5])
+                raise RuntimeError(
+                    f"No function starts at {hex(addr)}, but {len(containing)} functions contain it: {hints}. "
+                    f"Use one of their start addresses instead."
+                )
+            # No function contains this address either
+            raise RuntimeError(self._function_not_found_hint(bv, identifier, addr))
+        except RuntimeError:
+            raise
         except Exception:
             pass
 
@@ -1933,6 +1960,25 @@ class BinaryNinjaBridge:
             if fn is not None:
                 return fn
         raise RuntimeError(f"Function not found: {identifier}")
+
+    def _function_not_found_hint(self, bv, identifier, addr: int | None = None) -> str:
+        """Build an error message with nearby function suggestions."""
+        msg = f"Function not found: {identifier}"
+        if addr is None:
+            return msg
+        # Find nearest function before and after this address
+        nearest: list[str] = []
+        prev_fn = None
+        for fn in sorted(bv.functions, key=lambda f: f.start):
+            if fn.start > addr:
+                nearest.append(f"{fn.name} @ {hex(fn.start)} (next)")
+                break
+            prev_fn = fn
+        if prev_fn is not None:
+            nearest.insert(0, f"{prev_fn.name} @ {hex(prev_fn.start)} (prev)")
+        if nearest:
+            msg += f". Nearest functions: {', '.join(nearest)}"
+        return msg
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         matches = []
@@ -4595,6 +4641,22 @@ class BinaryNinjaBridge:
     # =========================================================================
     # Function extended operations
     # =========================================================================
+
+    def _function_containing(self, selector, address_raw):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address_raw)
+        containing = self._functions_containing(bv, addr)
+        if not containing:
+            raise RuntimeError(self._function_not_found_hint(bv, hex(addr), addr))
+        return [
+            {
+                "name": fn.name,
+                "start": hex(fn.start),
+                "end": hex(fn.start + fn.total_bytes) if hasattr(fn, "total_bytes") else None,
+                "address_offset": hex(addr - fn.start),
+            }
+            for fn in containing
+        ]
 
     def _function_basic_blocks(self, selector, identifier):
         bv = self._resolve_view(selector)

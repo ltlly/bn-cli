@@ -2361,6 +2361,30 @@ def _function_callees(args: argparse.Namespace) -> int:
     )
 
 
+def _render_function_containing_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    lines: list[str] = []
+    for item in value:
+        name = item.get("name", "?")
+        start = item.get("start", "?")
+        offset = item.get("address_offset", "?")
+        lines.append(f"{name} @ {start}  (offset +{offset})")
+    return "\n".join(lines) if lines else "(no containing function)"
+
+
+def _function_containing(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_containing",
+        {"address": args.address},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_function_containing_text,
+        stem="function-containing",
+    )
+
+
 def _render_force_analysis(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3788,6 +3812,13 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(function_force, required=False)
     function_force.add_argument("identifier")
     function_force.set_defaults(handler=_function_force_analysis)
+    function_containing = function_sub.add_parser(
+        "containing", help="Find function(s) containing an address"
+    )
+    _common_io_options(function_containing)
+    _target_option(function_containing, required=False)
+    function_containing.add_argument("address", help="Address to look up (hex or decimal)")
+    function_containing.set_defaults(handler=_function_containing)
 
     decompile = subparsers.add_parser("decompile", help="Render HLIL-style decompile text for a function")
     _common_io_options(decompile)
