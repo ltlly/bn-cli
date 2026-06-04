@@ -393,6 +393,341 @@ def _text_field(field: str) -> Callable[[Any], str]:
     return render
 
 
+def _render_disasm_list_text(value: Any) -> str:
+    """Compact disassembly renderer: one instruction per line, address + text."""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        address = item.get("address", "<unknown>")
+        text = item.get("text", "")
+        lines.append(f"{address}  {text}".rstrip())
+    return "\n".join(lines)
+
+
+def _render_arch_disasm_text(value: Any) -> str:
+    """Compact renderer for arch disasm-bytes: instructions only."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    instructions = value.get("instructions") or []
+    if not instructions:
+        return "none"
+    lines = []
+    for item in instructions:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        address = item.get("address", "<unknown>")
+        text = item.get("text", "")
+        lines.append(f"{address}  {text}".rstrip())
+    return "\n".join(lines)
+
+
+# --- Compact list renderers (AI-first: one item per line, no JSON key repetition) ---
+
+def _render_segments_text(value: Any) -> str:
+    """Compact segments: start-end perms length"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        start = item.get("start", "?")
+        end = item.get("end", "?")
+        r = "r" if item.get("readable") else "-"
+        w = "w" if item.get("writable") else "-"
+        x = "x" if item.get("executable") else "-"
+        length = item.get("length", "?")
+        lines.append(f"{start}-{end} {r}{w}{x} len={length}")
+    return "\n".join(lines)
+
+
+def _render_sections_text(value: Any) -> str:
+    """Compact sections: start-end name [type]"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        start = item.get("start", "?")
+        end = item.get("end", "?")
+        name = item.get("name", "?")
+        sec_type = item.get("type") or ""
+        line = f"{start}-{end} {name}"
+        if sec_type:
+            line += f" [{sec_type}]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_data_vars_text(value: Any) -> str:
+    """Compact data vars: address type"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        address = item.get("address", "?")
+        dtype = item.get("type") or "?"
+        lines.append(f"{address}  {dtype}")
+    return "\n".join(lines)
+
+
+def _render_search_result_text(value: Any) -> str:
+    """Compact search results: one address per line"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    matches = value.get("matches") or []
+    if not matches:
+        return "none"
+    return "\n".join(str(m) for m in matches)
+
+
+def _render_function_bbs_text(value: Any) -> str:
+    """Compact basic blocks: start-end n_instr [incoming->outgoing]"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        start = item.get("start", "?")
+        end = item.get("end", "?")
+        n = item.get("instruction_count") or "?"
+        incoming = item.get("incoming_edges") or []
+        outgoing = item.get("outgoing_edges") or []
+        line = f"{start}-{end} instr={n}"
+        if incoming or outgoing:
+            line += f" {len(incoming)}in->{len(outgoing)}out"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_name_address_list_compact(value: Any) -> str:
+    """Compact callers/callees: address name"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        address = item.get("address", "?")
+        name = item.get("name") or "?"
+        lines.append(f"{address}  {name}")
+    return "\n".join(lines)
+
+
+def _render_memory_read_text(value: Any) -> str:
+    """Compact memory read: address hex"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    address = value.get("address", "?")
+    data_hex = value.get("data_hex", "")
+    length = value.get("length", "?")
+    return f"{address}  {data_hex}  ({length} bytes)"
+
+
+def _render_patch_status_text(value: Any) -> str:
+    """Compact patch status: available operations"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    addr = value.get("address", "?")
+    ops = []
+    if value.get("can_assemble"):
+        ops.append("assemble")
+    if value.get("is_always_branch_patch_available"):
+        ops.append("always_branch")
+    if value.get("is_invert_branch_patch_available"):
+        ops.append("invert_branch")
+    if value.get("is_never_branch_patch_available"):
+        ops.append("never_branch")
+    if value.get("is_skip_and_return_zero_patch_available"):
+        ops.append("skip_ret0")
+    if value.get("is_skip_and_return_value_patch_available"):
+        ops.append("skip_ret_val")
+    avail = ",".join(ops) if ops else "none"
+    return f"{addr}  {avail}"
+
+
+def _render_analysis_status_text_compact(value: Any) -> str:
+    """Compact analysis status: state count/total done"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    state = value.get("state", "?")
+    count = value.get("count", 0)
+    total = value.get("total", 0)
+    done = value.get("done", False)
+    if total > 0:
+        return f"{state} {count}/{total} done={done}"
+    return f"{state} done={done}"
+
+
+def _render_xref_simple_list_text(value: Any) -> str:
+    """Compact xref code/data refs: one address per line, with optional function"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(str(item))
+            continue
+        address = item.get("address", "?")
+        func = item.get("function")
+        if func:
+            lines.append(f"{address}  {func}")
+        else:
+            lines.append(address)
+    return "\n".join(lines)
+
+
+def _render_xref_data_simple_text(value: Any) -> str:
+    """Compact data refs: one address per line"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if isinstance(item, dict):
+            lines.append(item.get("address", "?"))
+        else:
+            lines.append(str(item))
+    return "\n".join(lines)
+
+
+def _render_data_typed_at_text(value: Any) -> str:
+    """Compact data-typed-at: address type [name]"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if not value.get("found"):
+        return "none"
+    address = value.get("address", "?")
+    dtype = value.get("type") or "?"
+    name = value.get("name")
+    line = f"{address}  {dtype}"
+    if name:
+        line += f"  {name}"
+    return line
+
+
+def _render_binary_bbs_at_text(value: Any) -> str:
+    """Compact binary basic blocks at address"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        start = item.get("start", "?")
+        end = item.get("end", "?")
+        func = item.get("function") or "?"
+        lines.append(f"{start}-{end} {func}")
+    return "\n".join(lines)
+
+
+def _render_arch_info_text(value: Any) -> str:
+    """Compact arch info"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    name = value.get("arch_name") or "?"
+    addr_size = value.get("address_size") or "?"
+    endian = value.get("endianness") or "?"
+    platform = value.get("platform") or ""
+    line = f"{name} addr={addr_size} {endian}"
+    if platform:
+        line += f" platform={platform}"
+    return line
+
+
+def _render_database_info_text(value: Any) -> str:
+    """Compact database info"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if not value.get("has_database"):
+        return "no database"
+    keys = value.get("global_keys") or []
+    snaps = value.get("snapshot_count", 0)
+    current = value.get("current_snapshot")
+    line = f"snapshots={snaps}"
+    if current:
+        line += f" current={current}"
+    if keys:
+        line += f" keys={len(keys)}"
+    return line
+
+
+def _render_database_snapshots_text(value: Any) -> str:
+    """Compact database snapshots: one per line"""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        sid = item.get("id", "?")
+        name = item.get("name") or ""
+        auto = item.get("is_auto_save")
+        line = f"{sid}"
+        if name:
+            line += f"  {name}"
+        if auto:
+            line += "  [auto]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_value_result_text(value: Any) -> str:
+    """Compact value analysis: type value"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    vtype = value.get("type") or "?"
+    val = value.get("value")
+    if val is None:
+        return f"{vtype}  <none>"
+    return f"{vtype}  {val}"
+
+
+def _render_il_instruction_text(value: Any) -> str:
+    """Compact IL instruction by address: index text"""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    idx = value.get("index", "?")
+    text = value.get("text") or "?"
+    level = value.get("level") or "?"
+    return f"[{idx}] {text}  ({level})"
+
+
 def _render_function_info_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -676,37 +1011,29 @@ def _render_xrefs_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    lines = [
-        f"xrefs to {value.get('address', '<unknown>')}",
-        "",
-        "code refs:",
-    ]
+    lines = []
     code_refs = list(value.get("code_refs") or [])
     if code_refs:
         for ref in code_refs:
             if not isinstance(ref, dict):
-                lines.append("- " + _render_fallback_text(ref))
+                lines.append("c " + _render_fallback_text(ref))
                 continue
-            details = [str(ref.get("address", "<unknown>"))]
-            if ref.get("function"):
-                details.append(str(ref["function"]))
-            lines.append("- " + " | ".join(details))
-    else:
-        lines.append("- none")
+            func = ref.get("function")
+            addr = str(ref.get("address", "<unknown>"))
+            lines.append(f"c {addr}" + (f" {func}" if func else ""))
 
-    lines.extend(["", "data refs:"])
     data_refs = list(value.get("data_refs") or [])
     if data_refs:
         for ref in data_refs:
             if not isinstance(ref, dict):
-                lines.append("- " + _render_fallback_text(ref))
+                lines.append("d " + _render_fallback_text(ref))
                 continue
-            details = [str(ref.get("address", "<unknown>"))]
-            if ref.get("function"):
-                details.append(str(ref["function"]))
-            lines.append("- " + " | ".join(details))
-    else:
-        lines.append("- none")
+            func = ref.get("function")
+            addr = str(ref.get("address", "<unknown>"))
+            lines.append(f"d {addr}" + (f" {func}" if func else ""))
+
+    if not lines:
+        return "none"
     return "\n".join(lines)
 
 
@@ -726,42 +1053,29 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         containing = row.get("containing_function") if isinstance(row.get("containing_function"), dict) else {}
         call_addr = row.get("call_addr", "<unknown>")
         caller_static = row.get("caller_static", "<unknown>")
-        call_index = row.get("call_index")
         primary = (
-            f"caller_static {caller_static} | call {call_addr}"
+            f"cs {caller_static} call {call_addr}"
             if prefer_caller_static
-            else f"call {call_addr} | caller_static {caller_static}"
+            else f"call {call_addr} cs {caller_static}"
         )
         lines = [
             primary,
-            (
-                f"within: {containing.get('name', '<unknown>')} @ "
-                f"{containing.get('address', '<unknown>')}"
-            ),
-            f"callee: {callee.get('name', '<unknown>')} @ {callee.get('address', '<unknown>')}",
+            f"in {containing.get('name', '?')} @ {containing.get('address', '?')}",
+            f"-> {callee.get('name', '?')} @ {callee.get('address', '?')}",
         ]
-        if call_index is not None:
-            lines.append(f"call-index: {call_index}")
-        if row.get("within_query"):
-            lines.append(f"within-query: {row['within_query']}")
-        if row.get("hlil_statement"):
-            lines.append(f"hlil: {row['hlil_statement']}")
-        if row.get("pre_branch_condition"):
-            lines.append(f"pre-branch: {row['pre_branch_condition']}")
-
         call_instruction = row.get("call_instruction") if isinstance(row.get("call_instruction"), dict) else {}
-        previous = list(row.get("previous_instructions") or [])
-        next_instructions = list(row.get("next_instructions") or [])
-        lines.append("context:")
-        for item in previous:
+        prev = list(row.get("previous_instructions") or [])
+        nxt = list(row.get("next_instructions") or [])
+        for item in prev[-2:]:
             if isinstance(item, dict):
-                lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
-        lines.append(
-            f"> {call_instruction.get('address', '<unknown>')}  {call_instruction.get('text', '')}".rstrip()
-        )
-        for item in next_instructions:
+                lines.append(f"  {item.get('address', '?')}  {item.get('text', '')}".rstrip())
+        lines.append(f"> {call_instruction.get('address', '?')}  {call_instruction.get('text', '')}".rstrip())
+        for item in nxt[:2]:
             if isinstance(item, dict):
-                lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
+                lines.append(f"  {item.get('address', '?')}  {item.get('text', '')}".rstrip())
+        hlil = row.get("hlil_statement")
+        if hlil:
+            lines.append(f"hlil: {hlil}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -1946,6 +2260,7 @@ def _disasm_linear(args: argparse.Namespace) -> int:
         {"address": args.address, "count": args.count},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_disasm_list_text,
         stem="disasm-linear",
     )
 
@@ -1957,6 +2272,7 @@ def _disasm_range(args: argparse.Namespace) -> int:
         {"start": args.start, "end": args.end},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_disasm_list_text,
         stem="disasm-range",
     )
 
@@ -1973,6 +2289,7 @@ def _patch_status(args: argparse.Namespace) -> int:
         {"address": args.address},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_patch_status_text,
         stem="patch-status",
     )
 
@@ -2055,6 +2372,7 @@ def _memory_read(args: argparse.Namespace) -> int:
         {"address": args.address, "length": args.length},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_memory_read_text,
         stem="memory-read",
     )
 
@@ -2131,6 +2449,7 @@ def _value_reg(args: argparse.Namespace) -> int:
         },
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
         stem="value-reg",
     )
 
@@ -2148,6 +2467,7 @@ def _value_stack(args: argparse.Namespace) -> int:
         },
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
         stem="value-stack",
     )
 
@@ -2164,6 +2484,7 @@ def _value_possible(args: argparse.Namespace) -> int:
         },
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
         stem="value-possible",
     )
 
@@ -2178,6 +2499,7 @@ def _value_flags(args: argparse.Namespace) -> int:
         },
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
         stem="value-flags",
     )
 
@@ -2201,6 +2523,7 @@ def _search_bytes(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_search_result_text,
         stem="search-bytes",
     )
 
@@ -2215,6 +2538,7 @@ def _search_constant(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_search_result_text,
         stem="search-constant",
     )
 
@@ -2233,6 +2557,7 @@ def _search_text_handler(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_search_result_text,
         stem="search-text",
     )
 
@@ -2249,6 +2574,7 @@ def _arch_info(args: argparse.Namespace) -> int:
         {},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_arch_info_text,
         stem="arch-info",
     )
 
@@ -2281,6 +2607,7 @@ def _arch_disasm_bytes(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_arch_disasm_text,
         stem="arch-disasm",
     )
 
@@ -2297,6 +2624,7 @@ def _list_segments(args: argparse.Namespace) -> int:
         {},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_segments_text,
         stem="segments",
     )
 
@@ -2308,6 +2636,7 @@ def _list_sections(args: argparse.Namespace) -> int:
         {},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_sections_text,
         stem="sections",
     )
 
@@ -2316,9 +2645,10 @@ def _list_data_vars(args: argparse.Namespace) -> int:
     return _call(
         args,
         "list_data_vars",
-        {"offset": args.offset, "limit": args.limit},
+        {},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_data_vars_text,
         stem="data-vars",
     )
 
@@ -2335,6 +2665,7 @@ def _function_basic_blocks(args: argparse.Namespace) -> int:
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_function_bbs_text,
         stem="function-bbs",
     )
 
@@ -2346,6 +2677,7 @@ def _function_callers(args: argparse.Namespace) -> int:
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_name_address_list_compact,
         stem="function-callers",
     )
 
@@ -2357,6 +2689,7 @@ def _function_callees(args: argparse.Namespace) -> int:
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
+        text_renderer=_render_name_address_list_compact,
         stem="function-callees",
     )
 
@@ -2486,13 +2819,10 @@ def _types(args: argparse.Namespace) -> int:
     return _call(
         args,
         "types",
-        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        {"query": args.query},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_type_list_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
-        page_label="types",
         stem="types",
     )
 
@@ -2546,13 +2876,10 @@ def _strings(args: argparse.Namespace) -> int:
     return _call(
         args,
         "strings",
-        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        {"query": args.query},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_strings_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
-        page_label="strings",
         stem="strings",
     )
 
@@ -2929,7 +3256,7 @@ def _api_docs_refresh(args: argparse.Namespace) -> int:
 
 
 def _database_info(args: argparse.Namespace) -> int:
-    return _call(args, "database_info", {}, require_target=True, allow_implicit_target=True, stem="database-info")
+    return _call(args, "database_info", {}, require_target=True, allow_implicit_target=True, text_renderer=_render_database_info_text, stem="database-info")
 
 
 def _database_read_global(args: argparse.Namespace) -> int:
@@ -2941,12 +3268,15 @@ def _database_write_global(args: argparse.Namespace) -> int:
 
 
 def _database_snapshots(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {}
-    if hasattr(args, "offset") and args.offset:
-        params["offset"] = args.offset
-    if hasattr(args, "limit") and args.limit:
-        params["limit"] = args.limit
-    return _call(args, "database_snapshots", params, require_target=True, allow_implicit_target=True, stem="database-snapshots")
+    return _call(
+        args,
+        "database_snapshots",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_database_snapshots_text,
+        stem="database-snapshots",
+    )
 
 
 def _database_save_auto_snapshot(args: argparse.Namespace) -> int:
@@ -3208,11 +3538,11 @@ def _external_location_remove(args: argparse.Namespace) -> int:
 
 
 def _analysis_status(args: argparse.Namespace) -> int:
-    return _call(args, "analysis_status", {}, require_target=True, allow_implicit_target=True, stem="analysis-status")
+    return _call(args, "analysis_status", {}, require_target=True, allow_implicit_target=True, text_renderer=_render_analysis_status_text_compact, stem="analysis-status")
 
 
 def _analysis_progress(args: argparse.Namespace) -> int:
-    return _call(args, "analysis_progress", {}, require_target=True, allow_implicit_target=True, stem="analysis-progress")
+    return _call(args, "analysis_progress", {}, require_target=True, allow_implicit_target=True, text_renderer=_render_analysis_status_text_compact, stem="analysis-progress")
 
 
 def _analysis_abort(args: argparse.Namespace) -> int:
@@ -3254,7 +3584,7 @@ def _metadata_remove(args: argparse.Namespace) -> int:
 
 
 def _data_typed_at(args: argparse.Namespace) -> int:
-    return _call(args, "data_typed_at", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="data-typed-at")
+    return _call(args, "data_typed_at", {"address": args.address}, require_target=True, allow_implicit_target=True, text_renderer=_render_data_typed_at_text, stem="data-typed-at")
 
 
 # =========================================================================
@@ -3266,28 +3596,28 @@ def _xref_code_refs_from(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"address": args.address}
     if hasattr(args, "length") and args.length:
         params["length"] = args.length
-    return _call(args, "xref_code_refs_from", params, require_target=True, allow_implicit_target=True, stem="xref-code-refs-from")
+    return _call(args, "xref_code_refs_from", params, require_target=True, allow_implicit_target=True, text_renderer=_render_xref_data_simple_text, stem="xref-code-refs-from")
 
 
 def _xref_code_refs_to(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"address": args.address}
     if hasattr(args, "limit") and args.limit:
         params["limit"] = args.limit
-    return _call(args, "xref_code_refs_to", params, require_target=True, allow_implicit_target=True, stem="xref-code-refs-to")
+    return _call(args, "xref_code_refs_to", params, require_target=True, allow_implicit_target=True, text_renderer=_render_xref_simple_list_text, stem="xref-code-refs-to")
 
 
 def _xref_data_refs_from(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"address": args.address}
     if hasattr(args, "length") and args.length:
         params["length"] = args.length
-    return _call(args, "xref_data_refs_from", params, require_target=True, allow_implicit_target=True, stem="xref-data-refs-from")
+    return _call(args, "xref_data_refs_from", params, require_target=True, allow_implicit_target=True, text_renderer=_render_xref_data_simple_text, stem="xref-data-refs-from")
 
 
 def _xref_data_refs_to(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"address": args.address}
     if hasattr(args, "limit") and args.limit:
         params["limit"] = args.limit
-    return _call(args, "xref_data_refs_to", params, require_target=True, allow_implicit_target=True, stem="xref-data-refs-to")
+    return _call(args, "xref_data_refs_to", params, require_target=True, allow_implicit_target=True, text_renderer=_render_xref_data_simple_text, stem="xref-data-refs-to")
 
 
 # =========================================================================
@@ -3313,7 +3643,7 @@ def _il_instruction_by_addr(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"function_start": args.function_start, "address": args.address}
     if hasattr(args, "level") and args.level:
         params["level"] = args.level
-    return _call(args, "il_instruction_by_addr", params, require_target=True, allow_implicit_target=True, stem="il-instr-at")
+    return _call(args, "il_instruction_by_addr", params, require_target=True, allow_implicit_target=True, text_renderer=_render_il_instruction_text, stem="il-instr-at")
 
 
 # =========================================================================
@@ -3390,7 +3720,7 @@ def _plugin_execute(args: argparse.Namespace) -> int:
 
 
 def _binary_basic_blocks_at(args: argparse.Namespace) -> int:
-    return _call(args, "binary_basic_blocks_at", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="binary-bbs-at")
+    return _call(args, "binary_basic_blocks_at", {"address": args.address}, require_target=True, allow_implicit_target=True, text_renderer=_render_binary_bbs_at_text, stem="binary-bbs-at")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3884,7 +4214,6 @@ def build_parser() -> argparse.ArgumentParser:
     types = subparsers.add_parser("types", help="List or search types")
     _common_io_options(types)
     _target_option(types, required=False)
-    _add_paged_args(types)
     types.add_argument("--query")
     types.set_defaults(handler=_types)
     types_sub = types.add_subparsers(dest="types_command")
@@ -3905,7 +4234,6 @@ def build_parser() -> argparse.ArgumentParser:
     strings = subparsers.add_parser("strings", help="List or search strings")
     _common_io_options(strings)
     _target_option(strings, required=False)
-    _add_paged_args(strings)
     strings.add_argument("--query")
     strings.set_defaults(handler=_strings)
 
@@ -4226,7 +4554,6 @@ def build_parser() -> argparse.ArgumentParser:
     data_vars_p = subparsers.add_parser("data-vars", help="List data variables")
     _common_io_options(data_vars_p)
     _target_option(data_vars_p, required=False)
-    _add_paged_args(data_vars_p)
     data_vars_p.add_argument("--query", help="Filter by name/address substring")
     data_vars_p.set_defaults(handler=_list_data_vars)
 
@@ -4332,7 +4659,6 @@ def build_parser() -> argparse.ArgumentParser:
     db_snaps = database_sub.add_parser("snapshots", help="List database snapshots")
     _common_io_options(db_snaps)
     _target_option(db_snaps, required=False)
-    _add_paged_args(db_snaps)
     db_snaps.set_defaults(handler=_database_snapshots)
 
     db_save = database_sub.add_parser("save", help="Save auto snapshot")

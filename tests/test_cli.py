@@ -755,9 +755,8 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert "xrefs to 0x401000" in output
-    assert "- 0x402000 | sub_402000" in output
-    assert "- 0x403000 | sub_403000" in output
+    assert "c 0x402000 sub_402000" in output
+    assert "d 0x403000 sub_403000" in output
 
 
 def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
@@ -818,13 +817,10 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     assert captured["params"]["context"] == 3
     assert captured["params"]["caller_static"] is True
     output = capsys.readouterr().out
-    assert output.startswith("caller_static 0x4124a5 | call 0x4124a0")
-    assert "within: bonus_pick_random_type @ 0x412470" in output
-    assert "call-index: 0" in output
-    assert "within-query: bonus_pick_random_type" in output
-    assert "hlil: edx_1:eax_1 = sx.q(crt_rand())" in output
-    assert "pre-branch: result == 2" in output
+    assert output.startswith("cs 0x4124a5 call 0x4124a0")
+    assert "in bonus_pick_random_type @ 0x412470" in output
     assert "> 0x4124a0  call crt_rand" in output
+    assert "hlil: edx_1:eax_1 = sx.q(crt_rand())" in output
 
 
 def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp_path):
@@ -891,7 +887,7 @@ def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert "call-index: 3" in output
+    assert "call 0x427806" in output
     assert "hlil:" not in output
     assert "pre-branch:" not in output
 

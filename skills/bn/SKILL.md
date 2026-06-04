@@ -42,12 +42,35 @@ If `bn daemon list` shows both `gui` and `headless` running and no sticky mode i
 - Otherwise pass `--target <selector>` from `bn target list`. `selector` is usually the basename (e.g. `libfoo.so`).
 - `--target active` always means "the active one" by the rules above.
 
-3. Pick the right output mode:
-- Read commands default to `text`.
-- Mutation, preview, setup, and export commands default to `json`.
-- Other options: `--format json`, `--format ndjson`, `--out <path>`.
+3. Output modes (AI-first defaults):
+- Read commands default to compact `text` — one item per line, no repeated JSON keys.
+- Disassembly commands (`disasm`, `disasm-linear`, `disasm-range`, `arch disasm-bytes`) output `address  instruction` per line.
+- List commands output one record per line:
+  - `segments` → `start-end rwx len=N`
+  - `sections` → `start-end name [type]`
+  - `data-vars` → `address  type`
+  - `types` → `name | kind | decl`
+  - `strings` → `address  len=N  type  "value"`
+  - `imports` / `function-callers` / `function-callees` → `address  name`
+  - `function-bbs` → `start-end instr=N Nin->Nout`
+  - `database-snapshots` → `id  name  [auto]`
+- Search commands (`search-bytes`, `search-constant`, `search-text`) output one match address per line.
+- `xrefs` → `c address [function]` for code refs, `d address [function]` for data refs.
+- `callsites` → compact block per call with address, caller_static, context disasm, and hlil.
+- `memory-read` → `address  hex  (N bytes)`
+- `patch-status` → `address  available_ops`
+- `analysis-status` / `analysis-progress` → `state count/total done=true/false`
+- `arch` → `arch_name addr=N endianness platform=...`
+- `data-typed-at` → `address  type  [name]`
+- `binary-bbs-at` → `start-end function`
+- `il-instruction` → `[index] text  (level)`
+- Value commands (`value-reg`, `value-stack`, `value-possible`, `value-flags`) → `type  value`
+- Mutation, preview, setup, and export commands default to `json` for structured status.
+- Use `--format json` when you need structured/programmable data; `--format ndjson` for streaming.
+- Use `--out <path>` to write output to a known file instead of stdout.
+- Use shell tools (`head`, `tail`, `rg`) to slice large outputs — `bn` does not add its own pagination or built-in offset/limit.
 
-Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata as plain text, so do not chain `bn ... | rg ...` and expect to search the real output. Use `--out <path>` when you want the full body written to a known file.
+Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata. Use `--out <path>` when you want the full body at a known location, or pipe through `head` to grab just the first N lines.
 
 ## Headless Daemon Workflow
 

@@ -930,12 +930,7 @@ class BinaryNinjaBridge:
         if op == "field_xrefs":
             return self._field_xrefs(target, str(params["field"]))
         if op == "types":
-            return self._types(
-                target,
-                query=params.get("query"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params.get("limit", 100)),
-            )
+            return self._types(target, query=params.get("query"))
         if op == "type_info":
             return self._type_info(
                 target,
@@ -943,12 +938,7 @@ class BinaryNinjaBridge:
                 require_struct=bool(params.get("require_struct")),
             )
         if op == "strings":
-            return self._strings(
-                target,
-                query=params.get("query"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params.get("limit", 100)),
-            )
+            return self._strings(target, query=params.get("query"))
         if op == "imports":
             return self._imports(target)
         if op == "workflow_list":
@@ -1169,11 +1159,7 @@ class BinaryNinjaBridge:
         if op == "list_sections":
             return self._list_sections(target)
         if op == "list_data_vars":
-            return self._list_data_vars(
-                target,
-                offset=int(params.get("offset", 0)),
-                limit=int(params.get("limit", 100)),
-            )
+            return self._list_data_vars(target)
 
         # --- disasm extended ---
         if op == "disasm_linear":
@@ -1235,7 +1221,7 @@ class BinaryNinjaBridge:
         if op == "database_write_global":
             return self._database_write_global(target, str(params["key"]), str(params["value"]))
         if op == "database_snapshots":
-            return self._database_snapshots(target, offset=int(params.get("offset", 0)), limit=int(params.get("limit", 50)))
+            return self._database_snapshots(target)
         if op == "database_save_auto_snapshot":
             return self._database_save_auto_snapshot(target)
         if op == "database_create_bndb":
@@ -3048,7 +3034,7 @@ class BinaryNinjaBridge:
             "data_refs": data_refs,
         }
 
-    def _types(self, selector: str | None, *, query, offset: int, limit: int):
+    def _types(self, selector: str | None, *, query):
         bv = self._resolve_view(selector)
         items = []
         needle = str(query).lower() if query else None
@@ -3058,7 +3044,7 @@ class BinaryNinjaBridge:
                 continue
             items.append(entry)
         items.sort(key=lambda item: item["name"].lower())
-        return items[offset : offset + limit]
+        return items
 
     def _find_type(self, bv, type_name: str):
         type_obj = bv.get_type_by_name(type_name)
@@ -3093,7 +3079,7 @@ class BinaryNinjaBridge:
             raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
         return self._type_entry(resolved_name, type_obj)
 
-    def _strings(self, selector: str | None, *, query, offset: int, limit: int):
+    def _strings(self, selector: str | None, *, query):
         bv = self._resolve_view(selector)
         items = []
         needle = str(query).lower() if query else None
@@ -3109,7 +3095,7 @@ class BinaryNinjaBridge:
                 continue
             items.append(entry)
         items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
-        return items[offset : offset + limit]
+        return items
 
     def _imports(self, selector: str | None):
         bv = self._resolve_view(selector)
@@ -4570,18 +4556,16 @@ class BinaryNinjaBridge:
             ]
         return _run_on_main_thread(_do)
 
-    def _list_data_vars(self, selector, *, offset: int = 0, limit: int = 100):
+    def _list_data_vars(self, selector):
         bv = self._resolve_view(selector)
         def _do():
-            all_vars = list(bv.data_vars.items())
-            subset = all_vars[offset:offset + limit]
             return [
                 {
                     "address": hex(addr),
                     "type": str(dv.type) if dv.type else None,
                     "auto_discovered": dv.auto_discovered if hasattr(dv, "auto_discovered") else None,
                 }
-                for addr, dv in subset
+                for addr, dv in bv.data_vars
             ]
         return _run_on_main_thread(_do)
 
@@ -4913,20 +4897,19 @@ class BinaryNinjaBridge:
             return {"key": key, "written": True}
         return _run_on_main_thread(_do)
 
-    def _database_snapshots(self, selector, *, offset: int = 0, limit: int = 50):
+    def _database_snapshots(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             db = bv.file.database
             if db is None:
                 raise RuntimeError("No database (save as .bndb first)")
-            snaps = list(db.snapshots)[offset:offset + limit]
             return [
                 {
                     "id": s.id,
                     "name": s.name if hasattr(s, "name") else None,
                     "is_auto_save": s.is_auto_save if hasattr(s, "is_auto_save") else None,
                 }
-                for s in snaps
+                for s in db.snapshots
             ]
         return _run_on_main_thread(_do)
 
