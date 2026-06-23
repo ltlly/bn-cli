@@ -1926,14 +1926,27 @@ def test_target_manager_explicit_register_unregister_most_recent(monkeypatch):
     assert manager.most_recent() is bv_b
 
     listed = manager.refresh()
+    # Decoupled: two targets, no explicit active selection -> no active target.
+    actives = [item for item in listed if item["active"]]
+    assert actives == []
+
+    # Explicitly select b; now b is active.
+    manager.set_active(record_b.view_id)
+    listed = manager.refresh()
     actives = [item for item in listed if item["active"]]
     assert len(actives) == 1
     assert actives[0]["target_id"] == record_b.target_id()
 
+    # Closing the active target clears the pointer; the single remaining target
+    # auto-selects.
     removed = manager.unregister(record_b.view_id)
     assert removed is not None
     assert manager.most_recent() is bv_a
-    assert all(item["target_id"] != record_b.target_id() for item in manager.refresh())
+    listed = manager.refresh()
+    actives = [item for item in listed if item["active"]]
+    assert len(actives) == 1
+    assert actives[0]["target_id"] == record_a.target_id()
+    assert all(item["target_id"] != record_b.target_id() for item in listed)
     assert manager.unregister(record_b.view_id) is None
     # `record_a` is still alive
     assert any(item["target_id"] == record_a.target_id() for item in manager.refresh())
@@ -2297,5 +2310,151 @@ def test_active_resolves_to_most_recent_in_headless(monkeypatch):
     instance._load_target(path="/tmp/a.so", analysis="skip", options=None)
     instance._load_target(path="/tmp/b.so", analysis="skip", options=None)
 
+    # Decoupled: multiple targets, no explicit active -> "active" no longer falls
+    # back to most-recently-loaded.
+    with pytest.raises(RuntimeError, match="No active BinaryView is selected"):
+        instance._resolve_view("active")
+
+    # Explicit selection drives "active" now.
+    instance._set_active_target({"target": "b.so"})
     assert instance._resolve_view("active") is bv_b
     assert instance._resolve_view(None) is bv_b
+
+    # Switching the active selection re-routes "active".
+    instance._set_active_target({"target": "a.so"})
+    assert instance._resolve_view("active") is bv_a
+
+    # Clearing the selection re-enables the multi-target error.
+    instance._set_active_target({"clear": True})
+    with pytest.raises(RuntimeError, match="No active BinaryView is selected"):
+        instance._resolve_view("active")
+
+
+def test_set_active_target_op_sets_and_clears(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    bv_b = _FakeHeadlessBV(filename="/tmp/b.so", session_id="sess-b")
+    loads = iter([bv_a, bv_b])
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: next(loads), raising=False)
+    instance._load_target(path="/tmp/a.so", analysis="skip", options=None)
+    instance._load_target(path="/tmp/b.so", analysis="skip", options=None)
+
+    # Setting active via selector marks that target active.
+    result = instance._set_active_target({"target": "a.so"})
+    assert result["active"] is True
+    assert result["basename"] == "a.so"
+    assert [t["basename"] for t in instance.targets.refresh() if t["active"]] == ["a.so"]
+
+    # "active" is not an acceptable selector for set_active_target.
+    with pytest.raises(RuntimeError, match="explicit target selector"):
+        instance._set_active_target({"target": "active"})
+
+    # Clear returns a cleared envelope and removes the active marker.
+    cleared = instance._set_active_target({"clear": True})
+    assert cleared["cleared"] is True
+    assert not any(t["active"] for t in cleared["targets"])
+
+
+def test_set_active_target_rejects_unknown_selector(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: bv_a, raising=False)
+    instance._load_target(path="/tmp/a.so", analysis="skip", options=None)
+
+    # Unknown selector raises RuntimeError (not AttributeError from the old to_dict).
+    with pytest.raises(RuntimeError, match="Unknown target selector"):
+        instance._set_active_target({"target": "nope.so"})
+
+
+def test_load_target_does_not_steal_active(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    bv_b = _FakeHeadlessBV(filename="/tmp/b.so", session_id="sess-b")
+    loads = iter([bv_a, bv_b])
+    monkeypatch.setattr(bridge.bn, "load", lambda path, **kwargs: next(loads), raising=False)
+    instance._load_target(path="/tmp/a.so", analysis="skip", options=None)
+    instance._set_active_target({"target": "a.so"})
+    assert instance._resolve_view("active") is bv_a
+
+    # Loading a second target must not change the active selection.
+    result = instance._load_target(path="/tmp/b.so", analysis="skip", options=None)
+    assert instance._resolve_view("active") is bv_a
+    # The newly loaded target is not active and carries a hint.
+    assert result["basename"] == "b.so"
+    assert result.get("active") is False
+    assert "active_hint" in result
+
+
+def test_default_view_single_target_autoselect(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager(mode="gui")
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    manager.register(bv_a)
+
+    # No explicit pointer, single target -> auto-selected. The UI is not consulted:
+    # if _default_view touched ui.* this non-functional sentinel would raise.
+    monkeypatch.setattr(bridge, "ui", object())
+    assert manager._default_view() is bv_a
+    assert [t["basename"] for t in manager._serialize_records() if t["active"]] == ["a.so"]
+
+
+def test_gui_refresh_decoupled_from_ui_focus(monkeypatch):
+    """In GUI mode, active is the explicit pointer / single-target fallback,
+    never the BN UI focused tab."""
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager(mode="gui")
+
+    bv_a = _FakeHeadlessBV(filename="/tmp/a.so", session_id="sess-a")
+    bv_b = _FakeHeadlessBV(filename="/tmp/b.so", session_id="sess-b")
+
+    class _Frame:
+        def __init__(self, data):
+            self._data = data
+
+        def getCurrentBinaryView(self):
+            return self._data
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame(bv_a)
+
+        def getTabs(self):
+            return ["tab-a", "tab-b"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame(bv_a if tab == "tab-a" else bv_b)
+
+        def getViewForTab(self, tab):
+            return types.SimpleNamespace(
+                getData=lambda: bv_a if tab == "tab-a" else bv_b
+            )
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [_Context()],
+            activeContext=lambda: _Context(),
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+
+    # If refresh() consulted the UI focus (_active_binary_view), this would raise.
+    monkeypatch.setattr(
+        bridge,
+        "_active_binary_view",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("_active_binary_view must not be consulted after decoupling")
+        ),
+    )
+
+    listed = manager.refresh()
+    assert len(listed) == 2
+    # Two GUI targets, no explicit active -> none (UI focus ignored).
+    assert not any(t["active"] for t in listed)
+
+    # Explicit pointer drives active even in GUI mode.
+    manager.set_active(manager.view_id_for(bv_b))
+    listed = manager.refresh()
+    assert [t["basename"] for t in listed if t["active"]] == ["b.so"]

@@ -2443,3 +2443,83 @@ def test_force_analysis_returns_il_status(monkeypatch, capsys):
     assert "reanalyzed" in out
     assert "IL available: True" in out
     assert "ExceedFunctionAnalysisTimeSkipReason" in out
+
+
+def test_target_use_sends_set_active(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"selector": "foo.exe", "target_id": "1:1:1", "active": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "use", "foo.exe"])
+    assert rc == 0
+    assert captured["op"] == "set_active_target"
+    assert captured["params"] == {"target": "foo.exe"}
+
+
+def test_target_use_clear(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"cleared": True, "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "use", "--clear"])
+    assert rc == 0
+    assert captured["op"] == "set_active_target"
+    assert captured["params"] == {"clear": True}
+
+
+def test_target_use_rejects_selector_and_clear(monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "send_request", lambda *a, **k: {"ok": True, "result": {}})
+
+    rc = bn.cli.main(["target", "use", "foo.exe", "--clear"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not both" in err
+
+
+def test_target_use_requires_arg(monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "send_request", lambda *a, **k: {"ok": True, "result": {}})
+
+    rc = bn.cli.main(["target", "use"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "selector or --clear" in err
+
+
+def test_target_use_text_render(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        if params.get("clear"):
+            return {"ok": True, "result": {"cleared": True, "targets": []}}
+        return {
+            "ok": True,
+            "result": {
+                "selector": "foo.exe",
+                "target_id": "1:1:1",
+                "view_id": "1",
+                "view_name": "PE",
+                "filename": "/tmp/foo.exe",
+                "active": True,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "use", "foo.exe", "--format", "text"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "active target:" in out
+    assert "foo.exe [active]" in out
+
+    rc = bn.cli.main(["target", "use", "--clear", "--format", "text"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "active target cleared" in out

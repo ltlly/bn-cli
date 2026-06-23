@@ -38,9 +38,9 @@ If `bn daemon list` shows both `gui` and `headless` running and no sticky mode i
 
 2. Pick a target:
 - If exactly one BinaryView is registered, target-scoped commands can omit `--target` entirely.
-- If multiple targets are loaded and exactly one is `active` (GUI focus / most-recent headless load), omitting `--target` also works.
+- With multiple targets, set the active one with `bn target use <selector>` (e.g. `bn target use libfoo.so`), then omit `--target` to use it. `bn target use --clear` drops the selection. (Active is CLI-managed and decoupled from the BN UI tab focus — clicking a tab in BN does not change `bn`'s active target.)
 - Otherwise pass `--target <selector>` from `bn target list`. `selector` is usually the basename (e.g. `libfoo.so`).
-- `--target active` always means "the active one" by the rules above.
+- `--target active` always means "the active one".
 
 3. Output modes (AI-first defaults):
 - Read commands default to compact `text` — one item per line, no repeated JSON keys.
@@ -93,6 +93,7 @@ bn target loads                            # check status / errors for recent --
 bn target status                           # analysis progress on the active target
 bn target save --path /tmp/app.bndb        # first save: choose .bndb path
 bn target save                             # subsequent: save_auto_snapshot to the same .bndb
+bn target use <selector>                   # with multiple targets, set which one is active (then omit --target)
 bn target close                            # unload, free the BV
 ```
 
@@ -103,6 +104,7 @@ Notes that bite agents:
 - **During `state: AnalyzeState`**, read commands like `bn function list` may return partial or empty results. Wait until `done: true` for stable views.
 - **Detached failures are not raised in the CLI.** Always check `bn target loads` after `--async` if the target doesn't appear in `bn target list` within the expected time.
 - **`--no-update-analysis`** skips analysis entirely; run `bn refresh` later to trigger it synchronously.
+- **`bn target load` does not steal active.** With multiple targets loaded, a freshly loaded target is not auto-selected as active; the response carries an `active_hint`. Run `bn target use <selector>` (or pass `--target`) to operate on it. The first target auto-selects while it is the only one.
 
 ## High-Value Read Commands
 
@@ -510,7 +512,7 @@ If any op fails verification, the entire batch is reverted.
 ## Full Command Quick-Reference
 
 ### Core
-`bn setup`, `bn doctor`, `bn plugin install`, `bn skill install`, `bn daemon {start,stop,status,list,use}`, `bn target {list,load,close,save,status,loads,info}`, `bn refresh`
+`bn setup`, `bn doctor`, `bn plugin install`, `bn skill install`, `bn daemon {start,stop,status,list,use}`, `bn target {list,load,use,close,save,status,loads,info}`, `bn refresh`
 
 ### Read / Inspect
 `bn function {list,search,info}`, `bn decompile`, `bn il`, `bn disasm`, `bn disasm-linear`, `bn disasm-range`, `bn xrefs`, `bn xref-ext`, `bn callsites`, `bn types`, `bn strings`, `bn imports`, `bn segments`, `bn sections`, `bn data-vars`, `bn data-typed-at`, `bn binary-bbs-at`, `bn il-nav`, `bn proto get`, `bn local list`, `bn comment get`, `bn arch`, `bn search`, `bn value`, `bn memory read`, `bn workflow`, `bn api-docs`, `bn bundle function`

@@ -983,6 +983,18 @@ def _render_target_info_text(value: Any) -> str:
     return _render_target_summary(value)
 
 
+def _render_target_use_text(value: Any) -> str:
+    if isinstance(value, dict) and value.get("cleared"):
+        return (
+            "active target cleared\n"
+            "single target auto-selects; with multiple targets, pass --target or run "
+            "`bn target use <selector>` again."
+        )
+    if isinstance(value, dict):
+        return f"active target:\n{_render_target_summary(value)}"
+    return _render_fallback_text(value)
+
+
 def _render_name_address_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -1775,6 +1787,30 @@ def _target_info(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_target_info_text,
         stem="target-info",
+    )
+
+
+def _target_use(args: argparse.Namespace) -> int:
+    if args.clear:
+        if args.selector:
+            raise BridgeError("Pass either <selector> or --clear, not both")
+        return _call(
+            args,
+            "set_active_target",
+            {"clear": True},
+            require_target=False,
+            text_renderer=_render_target_use_text,
+            stem="target-use",
+        )
+    if not args.selector:
+        raise BridgeError("Pass a target selector or --clear")
+    return _call(
+        args,
+        "set_active_target",
+        {"target": args.selector},
+        require_target=False,
+        text_renderer=_render_target_use_text,
+        stem="target-use",
     )
 
 
@@ -3846,6 +3882,23 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(target_info)
     _target_option(target_info, required=False)
     target_info.set_defaults(handler=_target_info)
+
+    target_use = target_sub.add_parser(
+        "use",
+        help="Set the active target (decoupled from the BN UI focus)",
+    )
+    target_use.add_argument(
+        "selector",
+        nargs="?",
+        help="Target selector from `bn target list` (selector/target_id/basename/filename/view id)",
+    )
+    target_use.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear the active selection (fall back to single-target auto-select)",
+    )
+    _common_io_options(target_use, default_format="json")
+    target_use.set_defaults(handler=_target_use)
 
     target_load = target_sub.add_parser(
         "load",

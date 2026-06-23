@@ -303,6 +303,7 @@ WRITE_LOCKED_OPS = {
 GLOBAL_OPS = {
     "load_target",
     "close_target",
+    "set_active_target",
 }
 
 
@@ -481,6 +482,13 @@ class TargetManager:
         self._next_id = 1
         self._explicit_refs: dict[str, Any] = {}
         self._load_order: list[str] = []
+        # CLI-managed active target, decoupled from the BN UI focus. ``None`` means
+        # "no explicit selection" — falls back to single-target auto-select.
+        self._active_view_id: str | None = None
+
+    def set_active(self, view_id: str | None) -> None:
+        with self._lock:
+            self._active_view_id = view_id
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -556,6 +564,8 @@ class TargetManager:
                 self._load_order.remove(view_id)
             except ValueError:
                 pass
+            if view_id == self._active_view_id:
+                self._active_view_id = None
             if record is not None:
                 bv = record.ref()
                 if bv is not None:
@@ -575,38 +585,50 @@ class TargetManager:
         return None
 
     def _default_view(self):
-        if self._mode == "headless":
-            return self.most_recent()
-
-        active = _active_binary_view()
-        if active is not None:
-            return active
-
         with self._lock:
-            live_views = [record.ref() for record in self._records.values()]
-        live_views = [view for view in live_views if view is not None]
-        if len(live_views) == 1:
-            return live_views[0]
-        return None
+            # 1. Explicit CLI-managed active target wins (GUI + headless alike).
+            if self._active_view_id is not None and self._active_view_id in self._records:
+                record = self._records[self._active_view_id]
+                view = self._explicit_refs.get(self._active_view_id) or record.ref()
+                if view is not None:
+                    return view
+            # Decoupled from the BN UI focus: no _active_binary_view(), no most_recent().
+            # 2. Single-target auto-select.
+            live = [
+                (vid, self._explicit_refs.get(vid) or rec.ref())
+                for vid, rec in self._records.items()
+            ]
+            live = [(vid, view) for vid, view in live if view is not None]
+            if len(live) == 1:
+                return live[0][1]
+            # 3. Multiple targets, no active selection -> None (resolve() reports it).
+            return None
 
-    def _serialize_records(self, *, focused) -> list[dict[str, Any]]:
+    def _serialize_records(self) -> list[dict[str, Any]]:
         with self._lock:
             basename_counts: dict[str, int] = {}
-            for record in self._records.values():
+            live_view_ids: list[str] = []
+            for view_id, record in self._records.items():
                 if record.basename:
                     basename_counts[record.basename] = basename_counts.get(record.basename, 0) + 1
+                view = self._explicit_refs.get(view_id) or record.ref()
+                if view is not None:
+                    live_view_ids.append(view_id)
+            single = len(live_view_ids) == 1
+            single_view_id = live_view_ids[0] if single else None
 
-            recent_view_id = self._load_order[-1] if self._load_order else None
             result: list[dict[str, Any]] = []
             for view_id in sorted(self._records, key=lambda item: int(item)):
                 record = self._records[view_id]
                 view = self._explicit_refs.get(view_id) or record.ref()
                 if view is None:
                     continue
-                if focused is None and self._mode == "headless":
-                    is_active = view_id == recent_view_id
+                # Decoupled from UI focus: active is the explicit pointer, or the
+                # single live target when no pointer is set.
+                if self._active_view_id is not None:
+                    is_active = view_id == self._active_view_id
                 else:
-                    is_active = bool(view is focused)
+                    is_active = view_id == single_view_id
                 result.append(
                     {
                         "target_id": record.target_id(),
@@ -624,10 +646,9 @@ class TargetManager:
 
     def refresh(self) -> list[dict[str, Any]]:
         if self._mode == "headless":
-            return self._serialize_records(focused=None)
+            return self._serialize_records()
 
         views = _collect_open_views()
-        focused = _active_binary_view()
 
         with self._lock:
             alive: dict[str, TargetRecord] = {}
@@ -635,10 +656,11 @@ class TargetManager:
                 record = self._build_record(bv, source="gui")
                 alive[record.view_id] = record
             self._records = alive
-            if focused is None and len(self._records) == 1:
-                focused = next(iter(self._records.values())).ref()
+            # Drop the active pointer if its view was closed in the UI.
+            if self._active_view_id is not None and self._active_view_id not in self._records:
+                self._active_view_id = None
 
-        return self._serialize_records(focused=focused)
+        return self._serialize_records()
 
     def resolve(self, selector: str | None):
         targets = self.refresh()
@@ -661,8 +683,7 @@ class TargetManager:
             # Build hint with available targets
             available = []
             for record in self._records.values():
-                info = record.to_dict()
-                available.append(info.get("filename") or info.get("view_id", "?"))
+                available.append(record.filename or record.view_id)
             hint = ""
             if available:
                 hint = f". Available targets: {', '.join(available[:5])}"
@@ -889,6 +910,8 @@ class BinaryNinjaBridge:
             return self.targets.refresh()
         if op == "target_info":
             return self._target_info(params.get("selector") or target)
+        if op == "set_active_target":
+            return self._set_active_target(params)
         if op == "refresh":
             return self._refresh(target)
 
@@ -1427,6 +1450,23 @@ class BinaryNinjaBridge:
             "entry_point": hex(getattr(bv, "entry_point", 0)),
         }
 
+    def _set_active_target(self, params: dict[str, Any]):
+        """Set/clear the CLI-managed active target (decoupled from the BN UI focus)."""
+        if params.get("clear"):
+            self.targets.set_active(None)
+            return {"cleared": True, "targets": self.targets.refresh()}
+        selector = params.get("target") or params.get("selector")
+        if not selector or selector == "active":
+            raise RuntimeError(
+                "set_active_target requires an explicit target selector (not 'active')"
+            )
+        bv = self.targets.resolve(selector)
+        view_id = self.targets.view_id_for(bv)
+        if view_id is None:
+            raise RuntimeError(f"Target not registered: {selector!r}")
+        self.targets.set_active(view_id)
+        return self._target_info(self.targets._records[view_id].target_id())
+
     def _refresh(self, selector: str | None):
         bv = self._resolve_view(selector)
         bv.update_analysis_and_wait()
@@ -1498,7 +1538,14 @@ class BinaryNinjaBridge:
             record = self.targets.register(bv)
         if run_analysis:
             bv.update_analysis_and_wait()
-        return self._target_info(record.target_id())
+        result = self._target_info(record.target_id())
+        if not result.get("active"):
+            # Multiple targets open and this one isn't the active selection.
+            result["active_hint"] = (
+                "Multiple targets are open and this one is not active. "
+                "Run `bn target use <selector>` to make it the active target."
+            )
+        return result
 
     def _close_target(self, selector: str):
         if self.mode != "headless":

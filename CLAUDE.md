@@ -71,10 +71,10 @@ The `bn daemon` family in `cli.py` wires these into `start` / `stop` / `status` 
 
 `TargetManager` (in `bridge.py`) is **mode-aware**:
 
-- **GUI mode** — every `refresh()` rescans the UI via `_collect_open_views()` (touches `ui.UIContext.*`). Records are stored by `view_id` and held by `weakref`. `_default_view()` returns the GUI-focused tab via `_active_binary_view()`, falling back to the single-record case.
-- **Headless mode** — `refresh()` does **not** touch any UI APIs. Targets are added/removed explicitly via `register(bv)` and `unregister(view_id)` driven by the `load_target` / `close_target` ops. Strong references live in `_explicit_refs` to prevent GC. `_load_order` tracks the insertion order so `most_recent()` (= "active" in headless) returns the latest load.
+- **GUI mode** — every `refresh()` rescans the UI via `_collect_open_views()` (touches `ui.UIContext.*`) to *enumerate* open views; active is **not** read from the UI focus. Records are stored by `view_id` and held by `weakref`.
+- **Headless mode** — `refresh()` does **not** touch any UI APIs. Targets are added/removed explicitly via `register(bv)` and `unregister(view_id)` driven by the `load_target` / `close_target` ops. Strong references live in `_explicit_refs` to prevent GC.
 
-The CLI's `_implicit_target` (`cli.py:225-`) covers both modes: omitting `--target` works when exactly one BinaryView is registered, or when exactly one BV has `active: true` in the `list_targets` payload. Both modes already mark "active" appropriately (GUI focus / most-recent load), so this fallback rule is mode-agnostic.
+**Active target is decoupled from the BN UI focus and CLI-managed.** `TargetManager._active_view_id` is an explicit pointer set by the `set_active_target` op (in `GLOBAL_OPS`, alongside `load_target`/`close_target`) — CLI: `bn target use <selector>` / `bn target use --clear`. `_default_view()` and the `active` flag in `list_targets` resolve to: the explicit pointer → else the single live target (auto-select) → else `None` (and `resolve("active")` raises). `most_recent()`/`_load_order` no longer drive active; `load_target` does **not** steal active (its response carries an `active_hint` when the new target isn't active). Closing the active target, or the view disappearing from the GUI, clears the pointer. The CLI's `_implicit_target` (`cli.py:225-`) stays mode-agnostic: omitting `--target` works when exactly one BV is registered or exactly one is `active`.
 
 Don't add commands that silently default to a fixed selector. Always plumb selection through `_resolve_target(..., allow_implicit_target=True)`. The strict fallback contract is covered by tests in `test_cli.py`.
 
