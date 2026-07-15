@@ -5,10 +5,13 @@ import contextlib
 import difflib
 import errno
 import hashlib
+import hmac
 import io
 import json
 import os
 import re
+import secrets
+import socket
 import socketserver
 import threading
 import traceback
@@ -22,7 +25,7 @@ import binaryninja as bn
 from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
-from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path
+from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, bridge_tcp_port
 from .version import VERSION, build_id_for_file
 
 try:
@@ -726,19 +729,38 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         else:
             op = payload.get("op")
             request_id = payload.get("id")
-            response = self.server.bridge.dispatch(payload)
+            expected_auth = self.server.bridge.auth_token
+            supplied_auth = payload.get("auth")
+            if expected_auth is not None and (
+                not isinstance(supplied_auth, str)
+                or not hmac.compare_digest(supplied_auth, expected_auth)
+            ):
+                response = _json_response(ok=False, error="Unauthorized bridge request")
+            else:
+                response = self.server.bridge.dispatch(payload)
         encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
         self._write_response(encoded, op=op, request_id=request_id)
 
 
-class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class _ThreadedServerMixin(socketserver.ThreadingMixIn):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, socket_path: str, handler, bridge):
+
+if hasattr(socketserver, "UnixStreamServer"):
+    class ThreadedUnixServer(_ThreadedServerMixin, socketserver.UnixStreamServer):
+        def __init__(self, socket_path: str, handler, bridge):
+            self.bridge = bridge
+            super().__init__(socket_path, handler)
+else:  # pragma: no cover - exercised on Windows
+    ThreadedUnixServer = None
+
+
+class ThreadedTcpServer(_ThreadedServerMixin, socketserver.TCPServer):
+    def __init__(self, address: tuple[str, int], handler, bridge):
         self.bridge = bridge
-        super().__init__(socket_path, handler)
+        super().__init__(address, handler)
 
 
 LOAD_ATTEMPTS_LIMIT = 50
@@ -774,7 +796,11 @@ class BinaryNinjaBridge:
         self.targets = TargetManager(mode=mode)
         self.socket_path = bridge_socket_path(mode)
         self.registry_path = bridge_registry_path(mode)
-        self._server: ThreadedUnixServer | None = None
+        self.transport = "unix" if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX") else "tcp"
+        self.host: str | None = None
+        self.port: int | None = None
+        self.auth_token: str | None = None
+        self._server: socketserver.BaseServer | None = None
         self._thread: threading.Thread | None = None
         self._target_locks: dict[str, _ReadWriteLock] = {}
         self._target_locks_lock = threading.Lock()
@@ -834,15 +860,28 @@ class BinaryNinjaBridge:
             return [attempt.to_dict() for attempt in self._load_attempts]
 
     def start(self):  # pragma: no cover - requires GUI runtime
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.socket_path.exists():
-            self.socket_path.unlink()
-
-        self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+        if self.transport == "unix":
+            self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.socket_path.exists():
+                self.socket_path.unlink()
+            assert ThreadedUnixServer is not None
+            self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+        else:
+            self.auth_token = secrets.token_urlsafe(32)
+            self._server = ThreadedTcpServer(
+                ("127.0.0.1", bridge_tcp_port(self.mode)), BridgeHandler, self
+            )
+            self.host, self.port = self._server.server_address
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self._write_registry()
-        bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
+        bn.log_info(f"BN Agent Bridge listening on {self.endpoint}")
+
+    @property
+    def endpoint(self) -> str:
+        if self.transport == "tcp":
+            return f"tcp://{self.host}:{self.port}"
+        return str(self.socket_path)
 
     def stop(self):  # pragma: no cover - requires GUI runtime
         if self._server is not None:
@@ -850,7 +889,7 @@ class BinaryNinjaBridge:
                 self._server.shutdown()
             with contextlib.suppress(Exception):
                 self._server.server_close()
-        if self.socket_path.exists():
+        if self.transport == "unix" and self.socket_path.exists():
             with contextlib.suppress(OSError):
                 self.socket_path.unlink()
         if self.registry_path.exists():
@@ -860,13 +899,22 @@ class BinaryNinjaBridge:
     def _write_registry(self):
         payload = {
             "pid": os.getpid(),
-            "socket_path": str(self.socket_path),
+            "socket_path": str(self.socket_path) if self.transport == "unix" else None,
+            "transport": self.transport,
             "plugin_name": PLUGIN_NAME,
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "mode": self.mode,
         }
+        if self.transport == "tcp":
+            payload.update(
+                {
+                    "host": self.host,
+                    "port": self.port,
+                    "auth_token": self.auth_token,
+                }
+            )
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -1424,7 +1472,8 @@ class BinaryNinjaBridge:
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "pid": os.getpid(),
-            "socket_path": str(self.socket_path),
+            "socket_path": self.endpoint,
+            "transport": self.transport,
             "mode": self.mode,
             "targets": self.targets.refresh(),
         }

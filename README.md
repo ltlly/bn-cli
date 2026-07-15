@@ -46,11 +46,11 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 - `bn` has two parts:
   - a normal Python CLI that you can run from your shell or agent tool harness
-  - a Binary Ninja bridge that exposes the API over a Unix-domain socket
+  - a Binary Ninja bridge that exposes the API over a local transport: a Unix-domain socket on Unix, or authenticated loopback TCP on Windows
 - The bridge runs in one of two **modes**:
   - **`gui`** — loaded as a Binary Ninja plugin inside the GUI process. Works with a personal license. Started automatically when Binary Ninja opens with the plugin installed.
   - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
-- Each mode has its own socket and registry file under `~/Library/Caches/bn/` (or your platform's cache dir), so both can run simultaneously on the same machine.
+- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. On Windows, GUI uses `127.0.0.1:26765` and headless uses `127.0.0.1:26766`; registry entries include a random authentication token and the CLI only accepts loopback endpoints. Override the ports with `BN_BRIDGE_GUI_PORT` or `BN_BRIDGE_HEADLESS_PORT`.
 - The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
 - **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation just opens a socket, sends a JSON request, and reads the response — the binary is never re-imported.
 
@@ -506,7 +506,7 @@ If `bn target list` is empty:
 - make sure the plugin is installed with `bn plugin install`
 - reload Binary Ninja plugins or restart Binary Ninja after plugin changes
 
-If `bn doctor` sees a bridge registry but reports `Operation not permitted` under Codex,
+On Unix, if `bn doctor` sees a bridge registry but reports `Operation not permitted` under Codex,
 the Codex sandbox is blocking the Unix socket that connects to the live Binary Ninja GUI
 process. Let Codex run `bn` outside the sandbox by adding this rule to
 `~/.codex/rules/default.rules`:

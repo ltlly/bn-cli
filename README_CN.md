@@ -43,7 +43,7 @@ MCP 方案中 `binja.eval` 的 23.1% 错误率主要因未获取 BinaryView。bn
 ## 架构概览
 
 ```
-┌─────────────┐         Unix Socket         ┌──────────────────────┐
+┌─────────────┐       本地 Socket / TCP      ┌──────────────────────┐
 │   bn CLI    │ ──── JSON request ────────▶ │   Bridge Daemon      │
 │  (Python)   │ ◀─── JSON response ──────── │   (Binary Ninja)     │
 │             │                              │                      │
@@ -57,6 +57,7 @@ MCP 方案中 `binja.eval` 的 23.1% 错误率主要因未获取 BinaryView。bn
 - **CLI 进程从不导入 binaryninja**：它是纯粹的 socket 客户端，启动快（~0.15s）
 - **二进制只加载一次**：`bn target load` 后文件驻留在 daemon 的 `TargetManager` 中，后续所有命令都对内存中的 `BinaryView` 操作
 - **双模式并行**：GUI plugin 和 headless daemon 可同时运行，各有独立 socket
+- **跨平台本地传输**：Linux/macOS 使用 Unix-domain socket；Windows GUI 固定使用 `127.0.0.1:26765`，headless 使用 `127.0.0.1:26766`，并带随机认证令牌。可通过 `BN_BRIDGE_GUI_PORT` / `BN_BRIDGE_HEADLESS_PORT` 覆盖
 
 ## 安装
 

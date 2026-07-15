@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
+import socket
 import sys
 import threading
 import time
@@ -2458,3 +2460,48 @@ def test_gui_refresh_decoupled_from_ui_focus(monkeypatch):
     manager.set_active(manager.view_id_for(bv_b))
     listed = manager.refresh()
     assert [t["basename"] for t in listed if t["active"]] == ["b.so"]
+
+
+def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "bridge_tcp_port", lambda _mode: 0)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.transport = "tcp"
+    instance.start()
+
+    def _request(payload):
+        with socket.create_connection((instance.host, instance.port), timeout=2) as client:
+            client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            client.shutdown(socket.SHUT_WR)
+            chunks = []
+            while chunk := client.recv(65536):
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks))
+
+    try:
+        registry = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+        assert registry["transport"] == "tcp"
+        assert registry["host"] == "127.0.0.1"
+        assert registry["port"] == instance.port
+        assert registry["auth_token"] == instance.auth_token
+
+        denied = _request({"id": "denied", "op": "doctor", "params": {}})
+        assert denied == {
+            "error": "Unauthorized bridge request",
+            "ok": False,
+            "result": None,
+        }
+
+        allowed = _request(
+            {
+                "id": "allowed",
+                "op": "doctor",
+                "params": {},
+                "auth": instance.auth_token,
+            }
+        )
+        assert allowed["ok"] is True
+        assert allowed["result"]["transport"] == "tcp"
+    finally:
+        instance.stop()

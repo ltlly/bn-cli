@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import types
+from pathlib import Path
 
 import bn.cli
 import pytest
@@ -2032,7 +2033,7 @@ def test_target_load_sends_path_and_update_analysis(monkeypatch, capsys):
     assert rc == 0
     assert captured["op"] == "load_target"
     assert captured["params"]["analysis"] == "wait"
-    assert captured["params"]["path"].endswith("/tmp/sample.so")
+    assert captured["params"]["path"] == str(Path("/tmp/sample.so").resolve())
     assert captured["target"] is None
 
 

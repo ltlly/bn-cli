@@ -1181,14 +1181,14 @@ def _render_doctor_text(value: Any) -> str:
 
 
 def _sandbox_socket_hint(instance: Any, error: str) -> str | None:
-    if not os.environ.get("CODEX_SANDBOX"):
+    if not os.environ.get("CODEX_SANDBOX") or getattr(instance, "transport", "unix") != "unix":
         return None
     lowered = error.lower()
     if "operation not permitted" not in lowered and "permission denied" not in lowered:
         return None
     return (
         "Codex sandbox blocked the Binary Ninja bridge socket at "
-        f"{instance.socket_path}. `bn` must run outside the Codex sandbox to reach the "
+        f"{getattr(instance, 'endpoint', instance.socket_path)}. `bn` must run outside the Codex sandbox to reach the "
         "live Binary Ninja GUI bridge. Add `prefix_rule(pattern=[\"bn\"], decision=\"allow\")` "
         "to `~/.codex/rules/default.rules`, then restart Codex or reload rules."
     )
@@ -1354,7 +1354,8 @@ def _doctor(args: argparse.Namespace) -> int:
         loaded_build_id = ping.get("plugin_build_id") if isinstance(ping, dict) else None
         instance_info = {
             "pid": instance.pid,
-            "socket_path": str(instance.socket_path),
+            "socket_path": getattr(instance, "endpoint", str(instance.socket_path)),
+            "transport": getattr(instance, "transport", "unix"),
             "plugin_version": instance.plugin_version,
             "plugin_build_id": loaded_build_id,
             "installed_plugin_build_id": install_build_id,
@@ -1540,7 +1541,8 @@ def _instance_summary(instance: BridgeInstance) -> dict[str, Any]:
     return {
         "mode": instance.mode,
         "pid": instance.pid,
-        "socket_path": str(instance.socket_path),
+        "socket_path": getattr(instance, "endpoint", str(instance.socket_path)),
+        "transport": getattr(instance, "transport", "unix"),
         "registry_path": str(instance.registry_path),
         "plugin_version": instance.plugin_version,
         "started_at": instance.started_at,

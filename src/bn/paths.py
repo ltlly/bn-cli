@@ -48,6 +48,10 @@ def cache_home() -> Path:
 
 
 DAEMON_MODES: tuple[str, ...] = ("gui", "headless")
+DEFAULT_BRIDGE_TCP_PORTS = {
+    "gui": 26765,
+    "headless": 26766,
+}
 
 
 def _validate_mode(mode: str) -> str:
@@ -66,6 +70,21 @@ def bridge_registry_path(mode: str) -> Path:
 
 def bridge_socket_path(mode: str) -> Path:
     return cache_home() / f"{PLUGIN_NAME}.{_validate_mode(mode)}.sock"
+
+
+def bridge_tcp_port(mode: str) -> int:
+    mode = _validate_mode(mode)
+    env_name = f"BN_BRIDGE_{mode.upper()}_PORT"
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return DEFAULT_BRIDGE_TCP_PORTS[mode]
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be an integer TCP port") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{env_name} must be between 1 and 65535")
+    return port
 
 
 def current_daemon_mode_path() -> Path:
