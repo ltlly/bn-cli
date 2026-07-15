@@ -1196,6 +1196,8 @@ def _sandbox_socket_hint(instance: Any, error: str) -> str | None:
 
 def _format_operation_result(item: dict[str, Any]) -> str:
     op = item.get("op", "<unknown>")
+    if op == "create_function":
+        return f"create_function {item.get('address', '<unknown>')}"
     if op == "rename_symbol":
         return f"rename_symbol {item.get('kind', 'auto')} {item.get('address', '<unknown>')} -> {item.get('new_name', '<unknown>')}"
     if op == "set_comment":
@@ -2708,6 +2710,19 @@ def _function_basic_blocks(args: argparse.Namespace) -> int:
     )
 
 
+def _function_create(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "create_function",
+        {"address": args.address, "preview": bool(args.preview)},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_mutation_text,
+        stem="function-create",
+        result_exit_code=_mutation_exit_code,
+    )
+
+
 def _function_callers(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -4177,6 +4192,14 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(function_info, required=False)
     function_info.add_argument("identifier")
     function_info.set_defaults(handler=_function_info)
+    function_create = function_sub.add_parser(
+        "create", help="Create a user function at an address"
+    )
+    _common_io_options(function_create, default_format="json")
+    _target_option(function_create, required=False)
+    function_create.add_argument("--preview", action="store_true")
+    function_create.add_argument("address", help="Function start address (hex or decimal)")
+    function_create.set_defaults(handler=_function_create)
     function_bb = function_sub.add_parser("basic-blocks", help="List basic blocks for a function")
     _common_io_options(function_bb)
     _target_option(function_bb, required=False)

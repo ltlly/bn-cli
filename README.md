@@ -134,6 +134,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 
 | Command | Description |
 |---------|-------------|
+| `bn function create` | Create and verify a user function at an address |
 | `bn symbol rename` | Rename functions or data symbols |
 | `bn comment set` | Set or delete comments |
 | `bn proto set` | Set a user prototype |
@@ -425,6 +426,7 @@ bn local rename sub_401000 0x401000:local:StackVariableSourceType:-20:2:12345 sp
 bn local retype sub_401000 0x401000:local:StackVariableSourceType:-20:2:12345 float --preview
 bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
+bn function create 0x401000 --preview
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
@@ -439,6 +441,8 @@ bn struct show Player
 bn types show Player
 bn decompile sub_401000
 ```
+
+After creating a function, verify it with `bn function info <address>` or `bn decompile <address>`.
 
 For declaration and struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
 

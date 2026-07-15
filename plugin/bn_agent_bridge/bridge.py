@@ -199,6 +199,7 @@ READ_LOCKED_OPS = {
 
 WRITE_LOCKED_OPS = {
     "py_exec",
+    "create_function",
     "rename_symbol",
     "set_comment",
     "delete_comment",
@@ -1103,6 +1104,12 @@ class BinaryNinjaBridge:
 
         if op == "rename_symbol":
             return self._mutation(target, bool(params.get("preview")), [params])
+        if op == "create_function":
+            return self._mutation(
+                target,
+                bool(params.get("preview")),
+                [{"op": "create_function", **params}],
+            )
         if op == "get_comment":
             return self._get_comment(target, params.get("address"), params.get("function"))
         if op == "set_comment":
@@ -3356,7 +3363,10 @@ class BinaryNinjaBridge:
             kind = op.get("op") or "rename_symbol"
             functions = []
             try:
-                if kind == "rename_symbol" and op.get("kind") != "data":
+                if kind == "create_function":
+                    fn = bv.get_function_at(_parse_address(op["address"]))
+                    functions = [fn] if fn is not None else []
+                elif kind == "rename_symbol" and op.get("kind") != "data":
                     functions = [self._find_function(bv, op["identifier"])]
                 elif kind in {"set_prototype", "local_rename", "local_retype"}:
                     ident = op.get("identifier") or op.get("function")
@@ -3596,6 +3606,8 @@ class BinaryNinjaBridge:
     def _verify_operation(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         op = result.get("op")
         try:
+            if op == "create_function":
+                return self._verify_create_function(bv, result)
             if op == "rename_symbol":
                 return self._verify_rename_symbol(bv, result)
             if op == "set_comment":
@@ -3633,6 +3645,26 @@ class BinaryNinjaBridge:
             if item.get("requested") is None:
                 item["requested"] = {}
             return item
+
+    def _verify_create_function(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        fn = bv.get_function_at(address)
+        observed = {
+            "address": item["address"],
+            "exists": fn is not None,
+            "name": str(fn.name) if fn is not None else None,
+        }
+        item["observed"] = observed
+        if fn is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Function missing after creation at {item['address']}",
+                requested=item.get("requested"),
+                observed=observed,
+            )
+        item["status"] = "noop" if item.get("before_exists") else "verified"
+        return item
 
     def _verify_rename_symbol(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
@@ -3898,6 +3930,8 @@ class BinaryNinjaBridge:
     def _apply_operation(self, bv, op: dict[str, Any]):
         kind = op.get("op") or "rename_symbol"
         try:
+            if kind == "create_function":
+                return self._op_create_function(bv, op)
             if kind == "rename_symbol":
                 return self._op_rename_symbol(bv, op)
             if kind == "set_comment":
@@ -3957,7 +3991,10 @@ class BinaryNinjaBridge:
 
         try:
             bv.update_analysis_and_wait()
-            after = self._capture_function_snapshots(bv, affected)
+            after_affected = {int(fn.start): fn for fn in affected}
+            for fn in self._guess_affected_functions(bv, operations):
+                after_affected[int(fn.start)] = fn
+            after = self._capture_function_snapshots(bv, after_affected.values())
             type_after = self._capture_type_snapshots(bv, operations)
             diffs = self._diff_snapshots(before, after)
             type_diffs = self._diff_type_snapshots(type_before, type_after)
@@ -3988,6 +4025,27 @@ class BinaryNinjaBridge:
             with contextlib.suppress(Exception):
                 bv.revert_undo_actions(state)
             raise
+
+    def _op_create_function(self, bv, op: dict[str, Any]):
+        address = _parse_address(op["address"])
+        requested = self._operation_requested(op)
+        before = bv.get_function_at(address)
+        if before is None:
+            create = getattr(bv, "create_user_function", None)
+            if create is None:
+                raise OperationFailure(
+                    "unsupported",
+                    "BinaryView.create_user_function is unavailable",
+                    requested=requested,
+                )
+            create(address)
+        return {
+            "op": "create_function",
+            "address": hex(address),
+            "before_exists": before is not None,
+            "before_name": str(before.name) if before is not None else None,
+            "requested": requested,
+        }
 
     def _op_rename_symbol(self, bv, op: dict[str, Any]):
         kind = str(op.get("kind", "auto"))

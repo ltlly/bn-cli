@@ -441,6 +441,7 @@ The `py exec` environment includes:`bn`, `binaryninja`, `bv`, `result`.
 Prefer preview first:
 
 ```bash
+bn function create 0x401000 --preview
 bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn types declare --file /path/to/win32_min.h --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
@@ -475,6 +476,8 @@ bn struct show Player
 bn types show Player
 bn decompile sub_401000
 ```
+
+After `bn function create <address>`, verify the new start with `bn function info <address>` or `bn decompile <address>`.
 
 Key result statuses:
 - `verified`
@@ -520,7 +523,7 @@ If any op fails verification, the entire batch is reverted.
 `bn function {list,search,info}`, `bn decompile`, `bn il`, `bn disasm`, `bn disasm-linear`, `bn disasm-range`, `bn xrefs`, `bn xref-ext`, `bn callsites`, `bn types`, `bn strings`, `bn imports`, `bn segments`, `bn sections`, `bn data-vars`, `bn data-typed-at`, `bn binary-bbs-at`, `bn il-nav`, `bn proto get`, `bn local list`, `bn comment get`, `bn arch`, `bn search`, `bn value`, `bn memory read`, `bn workflow`, `bn api-docs`, `bn bundle function`
 
 ### Mutate
-`bn symbol rename`, `bn comment set`, `bn proto set`, `bn local rename`, `bn local retype`, `bn struct field set`, `bn types declare`, `bn batch apply`, `bn patch`, `bn memory write`
+`bn function create`, `bn symbol rename`, `bn comment set`, `bn proto set`, `bn local rename`, `bn local retype`, `bn struct field set`, `bn types declare`, `bn batch apply`, `bn patch`, `bn memory write`
 
 ### Database & Undo
 `bn database {info,snapshots}`, `bn undo {begin,commit,revert,undo,redo}`

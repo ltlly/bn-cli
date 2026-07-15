@@ -331,6 +331,41 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
     assert captured["params"]["preview"] is True
 
 
+def test_function_create_builds_verified_mutation_payload(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured.update(op=op, params=params, target=target)
+        return {
+            "ok": True,
+            "result": {
+                "preview": True,
+                "success": True,
+                "committed": False,
+                "results": [
+                    {
+                        "op": "create_function",
+                        "address": "0x401000",
+                        "status": "verified",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["function", "create", "--target", "active", "--preview", "0x401000"]
+    )
+
+    assert rc == 0
+    assert captured == {
+        "op": "create_function",
+        "params": {"address": "0x401000", "preview": True},
+        "target": "active",
+    }
+
+
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 

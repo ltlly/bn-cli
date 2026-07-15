@@ -164,6 +164,7 @@ bn daemon stop                        # 停止守护进程
 
 | 命令 | 描述 |
 |------|------|
+| `bn function create` | 在指定地址创建并验证用户函数 |
 | `bn symbol rename` | 重命名函数或数据符号 |
 | `bn comment set` | 设置或删除注释 |
 | `bn proto set` | 设置函数原型 |

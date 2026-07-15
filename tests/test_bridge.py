@@ -316,6 +316,27 @@ class _FakeMutationBV(_FakeBV):
         self.events.append(("commit", state))
 
 
+class _FakeFunctionCreationBV(_FakeMutationBV):
+    def __init__(self, *, create_succeeds: bool = True):
+        super().__init__()
+        self.create_succeeds = create_succeeds
+        self.create_calls: list[int] = []
+        self._undo_functions = []
+
+    def begin_undo_actions(self):
+        self._undo_functions = list(self.functions)
+        return super().begin_undo_actions()
+
+    def create_user_function(self, address: int):
+        self.create_calls.append(int(address))
+        if self.create_succeeds:
+            self.functions.append(_FakeFunction(int(address), f"sub_{int(address):x}"))
+
+    def revert_undo_actions(self, state):
+        self.functions = list(self._undo_functions)
+        super().revert_undo_actions(state)
+
+
 class _ParseResult:
     def __init__(self, *, types=None, variables=None, functions=None):
         self.types = dict(types or {})
@@ -400,6 +421,86 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     assert result["committed"] is False
     assert ("revert", "state") in bv.events
     assert ("commit", "state") not in bv.events
+
+
+def test_create_function_mutation_commits_verified_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV()
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+    monkeypatch.setattr(instance, "_function_text", lambda _bv, fn, **_kwargs: fn.name)
+
+    result = instance._mutation(
+        "active", False, [{"op": "create_function", "address": "0x401000"}]
+    )
+
+    assert result["success"] is True
+    assert result["committed"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert result["results"][0]["observed"] == {
+        "address": "0x401000",
+        "exists": True,
+        "name": "sub_401000",
+    }
+    assert result["affected_functions"][0]["address"] == "0x401000"
+    assert result["affected_functions"][0]["changed"] is True
+    assert bv.create_calls == [0x401000]
+    assert bv.get_function_at(0x401000) is not None
+    assert ("commit", "state") in bv.events
+
+
+def test_create_function_preview_verifies_then_reverts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV()
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+    monkeypatch.setattr(instance, "_function_text", lambda _bv, fn, **_kwargs: fn.name)
+
+    result = instance._mutation(
+        "active", True, [{"op": "create_function", "address": 0x402000}]
+    )
+
+    assert result["success"] is True
+    assert result["committed"] is False
+    assert result["results"][0]["status"] == "verified"
+    assert bv.get_function_at(0x402000) is None
+    assert ("revert", "state") in bv.events
+
+
+def test_create_function_existing_start_is_noop(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV()
+    bv.functions.append(_FakeFunction(0x403000, "already_there"))
+
+    result = instance._op_create_function(
+        bv, {"op": "create_function", "address": "0x403000"}
+    )
+    verified = instance._verify_operation(bv, result)
+
+    assert verified["status"] == "noop"
+    assert verified["observed"]["name"] == "already_there"
+    assert bv.create_calls == []
+
+
+def test_create_function_verification_failure_reverts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV(create_succeeds=False)
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+
+    result = instance._mutation(
+        "active", False, [{"op": "create_function", "address": "0x404000"}]
+    )
+
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["results"][0]["status"] == "verification_failed"
+    assert result["results"][0]["observed"]["exists"] is False
+    assert ("revert", "state") in bv.events
 
 
 def test_refresh_updates_analysis_and_returns_target_info(monkeypatch):
