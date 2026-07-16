@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import types
+from pathlib import Path
 
 import bn.cli
 import pytest
@@ -328,6 +329,41 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
     assert captured["op"] == "rename_symbol"
     assert captured["target"] == "123:1:7"
     assert captured["params"]["preview"] is True
+
+
+def test_function_create_builds_verified_mutation_payload(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured.update(op=op, params=params, target=target)
+        return {
+            "ok": True,
+            "result": {
+                "preview": True,
+                "success": True,
+                "committed": False,
+                "results": [
+                    {
+                        "op": "create_function",
+                        "address": "0x401000",
+                        "status": "verified",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["function", "create", "--target", "active", "--preview", "0x401000"]
+    )
+
+    assert rc == 0
+    assert captured == {
+        "op": "create_function",
+        "params": {"address": "0x401000", "preview": True},
+        "target": "active",
+    }
 
 
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypatch):
@@ -1172,6 +1208,8 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
         {
             "pid": 123,
             "socket_path": tmp_path / "bridge.sock",
+            "endpoint": str(tmp_path / "bridge.sock"),
+            "transport": "unix",
             "plugin_version": "0.4.0",
             "started_at": "2026-03-09T00:00:00+00:00",
         },
@@ -1220,6 +1258,8 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
         {
             "pid": 123,
             "socket_path": tmp_path / "bridge.sock",
+            "endpoint": str(tmp_path / "bridge.sock"),
+            "transport": "unix",
             "plugin_version": bn.cli.VERSION,
             "started_at": "2026-03-09T00:00:00+00:00",
         },
@@ -1266,6 +1306,8 @@ def test_doctor_reports_codex_sandbox_socket_denial(monkeypatch, tmp_path, capsy
         {
             "pid": 123,
             "socket_path": tmp_path / "bridge.sock",
+            "endpoint": str(tmp_path / "bridge.sock"),
+            "transport": "unix",
             "plugin_version": bn.cli.VERSION,
             "started_at": "2026-03-09T00:00:00+00:00",
         },
@@ -2032,7 +2074,7 @@ def test_target_load_sends_path_and_update_analysis(monkeypatch, capsys):
     assert rc == 0
     assert captured["op"] == "load_target"
     assert captured["params"]["analysis"] == "wait"
-    assert captured["params"]["path"].endswith("/tmp/sample.so")
+    assert captured["params"]["path"] == str(Path("/tmp/sample.so").resolve())
     assert captured["target"] is None
 
 
@@ -2333,6 +2375,88 @@ def test_daemon_start_background_errors_when_registry_never_appears(monkeypatch,
     assert "did not register" in capsys.readouterr().err
 
 
+def _fake_headless_instance(tmp_path):
+    registry = tmp_path / "daemons" / "headless.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text("{}", encoding="utf-8")
+    return bn.cli.BridgeInstance(
+        pid=4242,
+        socket_path=None,
+        registry_path=registry,
+        plugin_name="bn_agent_bridge",
+        plugin_version=bn.cli.VERSION,
+        started_at=None,
+        meta={},
+        mode="headless",
+        transport="tcp",
+        host="127.0.0.1",
+        port=26766,
+        auth_token="secret",
+    )
+
+
+def test_daemon_stop_requests_graceful_shutdown(monkeypatch, tmp_path, capsys):
+    instance = _fake_headless_instance(tmp_path)
+    captured = {}
+
+    def send(inst, op, **kwargs):
+        captured.update(instance=inst, op=op, kwargs=kwargs)
+        instance.registry_path.unlink()
+        return {
+            "ok": True,
+            "result": {"accepted": True, "mode": "headless", "pid": 4242},
+        }
+
+    monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", send)
+
+    rc = bn.cli.main(["daemon", "stop", "--mode", "headless"])
+
+    assert rc == 0
+    assert captured["instance"] is instance
+    assert captured["op"] == "shutdown"
+    assert captured["kwargs"]["timeout"] == 5.0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] is True
+    assert payload["shutdown"]["accepted"] is True
+
+
+def test_daemon_stop_explains_old_bridge_protocol(monkeypatch, tmp_path, capsys):
+    instance = _fake_headless_instance(tmp_path)
+    monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
+    monkeypatch.setattr(
+        bn.cli,
+        "_send_request_to_instance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            bn.cli.BridgeError("ValueError: Unknown operation: shutdown")
+        ),
+    )
+
+    rc = bn.cli.main(["daemon", "stop", "--mode", "headless"])
+
+    assert rc == 2
+    assert "does not support graceful shutdown" in capsys.readouterr().err
+
+
+def test_daemon_stop_errors_when_registry_does_not_disappear(monkeypatch, tmp_path, capsys):
+    instance = _fake_headless_instance(tmp_path)
+    monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
+    monkeypatch.setattr(
+        bn.cli,
+        "_send_request_to_instance",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "result": {"accepted": True, "mode": "headless", "pid": 4242},
+        },
+    )
+    monkeypatch.setattr(bn.cli, "_wait_for_registry_absent", lambda *_args, **_kwargs: False)
+
+    rc = bn.cli.main(["daemon", "stop", "--mode", "headless"])
+
+    assert rc == 2
+    assert "did not exit within 10 seconds" in capsys.readouterr().err
+
+
 # --- IL unavailable detection tests ---
 
 
@@ -2443,6 +2567,188 @@ def test_force_analysis_returns_il_status(monkeypatch, capsys):
     assert "reanalyzed" in out
     assert "IL available: True" in out
     assert "ExceedFunctionAnalysisTimeSkipReason" in out
+
+
+def test_target_command_uses_job_and_preserves_completed_result(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=None):
+        calls.append((op, params, target))
+        if op == "job_submit":
+            return {
+                "ok": True,
+                "result": {
+                    "job_id": "job123",
+                    "op": params["operation"],
+                    "state": "queued",
+                    "target_id": "1:1:1",
+                    "cancelable": True,
+                },
+            }
+        if op == "job_status":
+            return {"ok": True, "result": {"job_id": "job123", "state": "succeeded"}}
+        if op == "job_result":
+            return {
+                "ok": True,
+                "result": {
+                    "ready": True,
+                    "job": {"job_id": "job123", "state": "succeeded"},
+                    "result": [{"name": "main", "address": "0x401000"}],
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "_JOB_CAPABLE_SEND_REQUEST", fake_send_request)
+    rc = bn.cli.main(["function", "list", "--target", "active"])
+    assert rc == 0
+    assert calls[0][0] == "job_submit"
+    assert calls[0][1]["operation"] == "list_functions"
+    assert "main" in capsys.readouterr().out
+
+
+def test_job_wait_timeout_returns_124_and_job_id(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=None):
+        if op == "job_submit":
+            return {
+                "ok": True,
+                "result": {
+                    "job_id": "slow123",
+                    "op": params["operation"],
+                    "state": "queued",
+                    "target_id": "1:1:1",
+                    "cancelable": True,
+                },
+            }
+        if op == "job_status":
+            return {
+                "ok": True,
+                "result": {
+                    "job_id": "slow123",
+                    "op": "list_functions",
+                    "state": "running",
+                    "target_id": "1:1:1",
+                    "cancelable": True,
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "_JOB_CAPABLE_SEND_REQUEST", fake_send_request)
+    rc = bn.cli.main(
+        [
+            "function",
+            "list",
+            "--target",
+            "active",
+            "--format",
+            "json",
+            "--wait-timeout",
+            "0.01",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 124
+    assert json.loads(captured.out)["job_id"] == "slow123"
+    assert "bn job status slow123" in captured.err
+
+
+def test_async_job_returns_without_polling(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=None):
+        calls.append(op)
+        assert op == "job_submit"
+        return {
+            "ok": True,
+            "result": {
+                "job_id": "async123",
+                "op": params["operation"],
+                "state": "queued",
+                "target_id": "1:1:1",
+                "cancelable": True,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "_JOB_CAPABLE_SEND_REQUEST", fake_send_request)
+    rc = bn.cli.main(
+        ["function", "list", "--target", "active", "--async", "--format", "json"]
+    )
+    assert rc == 0
+    assert calls == ["job_submit"]
+    assert json.loads(capsys.readouterr().out)["job_id"] == "async123"
+
+
+def test_danger_always_wait_ignores_timeout(monkeypatch, capsys):
+    polls = 0
+
+    def fake_send_request(op, *, params=None, target=None, timeout=None):
+        nonlocal polls
+        if op == "job_submit":
+            return {"ok": True, "result": {"job_id": "wait123", "op": "list_functions", "state": "queued"}}
+        if op == "job_status":
+            polls += 1
+            state = "succeeded" if polls == 2 else "running"
+            return {"ok": True, "result": {"job_id": "wait123", "state": state}}
+        if op == "job_result":
+            return {
+                "ok": True,
+                "result": {"ready": True, "job": {"state": "succeeded"}, "result": []},
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "_JOB_CAPABLE_SEND_REQUEST", fake_send_request)
+    rc = bn.cli.main(
+        [
+            "function",
+            "list",
+            "--target",
+            "active",
+            "--danger-always-wait",
+            "--wait-timeout",
+            "0.001",
+        ]
+    )
+    assert rc == 0
+    assert polls == 2
+    assert capsys.readouterr().err == ""
+
+
+def test_job_result_command_returns_124_while_running(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli,
+        "send_request",
+        lambda op, **kwargs: {
+            "ok": True,
+            "result": {"ready": False, "job": {"job_id": "x", "state": "running"}, "result": None},
+        },
+    )
+    rc = bn.cli.main(["job", "result", "x", "--format", "json"])
+    assert rc == 124
+    assert json.loads(capsys.readouterr().out)["ready"] is False
+
+
+def test_ctrl_c_stops_waiting_without_cancelling_job(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=None):
+        calls.append(op)
+        if op == "job_submit":
+            return {"ok": True, "result": {"job_id": "keep123", "op": "list_functions", "state": "queued"}}
+        if op == "job_status":
+            raise KeyboardInterrupt
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "_JOB_CAPABLE_SEND_REQUEST", fake_send_request)
+    rc = bn.cli.main(
+        ["function", "list", "--target", "active", "--danger-always-wait"]
+    )
+    assert rc == 130
+    assert "job_cancel" not in calls
+    assert "job keep123 is still managed" in capsys.readouterr().err
 
 
 def test_target_use_sends_set_active(monkeypatch):

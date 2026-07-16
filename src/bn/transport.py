@@ -36,13 +36,23 @@ DENIED_SOCKET_ERRNOS = {
 @dataclass(slots=True)
 class BridgeInstance:
     pid: int
-    socket_path: Path
+    socket_path: Path | None
     registry_path: Path
     plugin_name: str
     plugin_version: str
     started_at: str | None
     meta: dict[str, Any]
     mode: str = "gui"
+    transport: str = "unix"
+    host: str | None = None
+    port: int | None = None
+    auth_token: str | None = None
+
+    @property
+    def endpoint(self) -> str:
+        if self.transport == "tcp":
+            return f"tcp://{self.host}:{self.port}"
+        return str(self.socket_path)
 
 
 def _purge_stale_registry(registry_path: Path) -> None:
@@ -50,11 +60,22 @@ def _purge_stale_registry(registry_path: Path) -> None:
         registry_path.unlink()
 
 
-def _socket_probe_error(socket_path: Path, timeout: float = 0.2) -> OSError | None:
+def _socket_args(instance: BridgeInstance) -> tuple[int, str | tuple[str, int]]:
+    if instance.transport == "tcp":
+        if instance.host != "127.0.0.1" or instance.port is None:
+            raise OSError(errno.EINVAL, "Invalid TCP bridge endpoint")
+        return socket.AF_INET, (instance.host, instance.port)
+    if instance.socket_path is None or not hasattr(socket, "AF_UNIX"):
+        raise OSError(errno.EPROTONOSUPPORT, "Unix-domain sockets are unavailable")
+    return socket.AF_UNIX, str(instance.socket_path)
+
+
+def _socket_probe_error(instance: BridgeInstance, timeout: float = 0.2) -> OSError | None:
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        family, address = _socket_args(instance)
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
-            sock.connect(str(socket_path))
+            sock.connect(address)
         return None
     except OSError as exc:
         return exc
@@ -73,23 +94,45 @@ def _mode_for_registry(payload: dict[str, Any], path: Path) -> str:
 def _load_instance(path: Path) -> BridgeInstance | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        socket_path = Path(payload["socket_path"])
         pid = int(payload["pid"])
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
 
-    if not socket_path.exists():
+    transport = str(payload.get("transport", "unix"))
+    if transport == "tcp":
+        try:
+            host = str(payload["host"])
+            port = int(payload["port"])
+            auth_token = payload["auth_token"]
+        except (KeyError, TypeError, ValueError):
+            _purge_stale_registry(path)
+            return None
+        if (
+            host != "127.0.0.1"
+            or not 1 <= port <= 65535
+            or not isinstance(auth_token, str)
+            or not auth_token
+        ):
+            _purge_stale_registry(path)
+            return None
+        socket_path = None
+    elif transport == "unix":
+        try:
+            socket_path = Path(payload["socket_path"])
+        except (KeyError, TypeError):
+            _purge_stale_registry(path)
+            return None
+        host = None
+        port = None
+        auth_token = None
+        if not socket_path.exists():
+            _purge_stale_registry(path)
+            return None
+    else:
         _purge_stale_registry(path)
         return None
 
-    probe_error = _socket_probe_error(socket_path)
-    if probe_error is not None and probe_error.errno in DENIED_SOCKET_ERRNOS:
-        payload["socket_probe_error"] = str(probe_error)
-    elif probe_error is not None:
-        _purge_stale_registry(path)
-        return None
-
-    return BridgeInstance(
+    instance = BridgeInstance(
         pid=pid,
         socket_path=socket_path,
         registry_path=path,
@@ -98,7 +141,20 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         started_at=payload.get("started_at"),
         meta=payload,
         mode=_mode_for_registry(payload, path),
+        transport=transport,
+        host=host,
+        port=port,
+        auth_token=auth_token,
     )
+
+    probe_error = _socket_probe_error(instance)
+    if probe_error is not None and probe_error.errno in DENIED_SOCKET_ERRNOS:
+        payload["socket_probe_error"] = str(probe_error)
+    elif probe_error is not None:
+        _purge_stale_registry(path)
+        return None
+
+    return instance
 
 
 def list_instances() -> list[BridgeInstance]:
@@ -196,6 +252,8 @@ def _send_request_to_instance(
     }
     if target is not None:
         payload["target"] = target
+    if instance.auth_token is not None:
+        payload["auth"] = instance.auth_token
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
 
@@ -203,10 +261,11 @@ def _send_request_to_instance(
     last_error: OSError | None = None
     for attempt in range(connect_retries):
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            family, address = _socket_args(instance)
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
                 if timeout is not None:
                     sock.settimeout(timeout)
-                sock.connect(str(instance.socket_path))
+                sock.connect(address)
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
@@ -226,11 +285,11 @@ def _send_request_to_instance(
         if isinstance(last_error, TimeoutError):
             timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
             raise BridgeError(
-                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
+                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.endpoint}"
                 f"{timeout_suffix}"
             ) from last_error
         raise BridgeError(
-            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
+            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.endpoint}: {last_error}"
         ) from last_error
 
     if not chunks:

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import io
+import json
+import socket
 import sys
 import threading
 import time
@@ -314,6 +317,27 @@ class _FakeMutationBV(_FakeBV):
         self.events.append(("commit", state))
 
 
+class _FakeFunctionCreationBV(_FakeMutationBV):
+    def __init__(self, *, create_succeeds: bool = True):
+        super().__init__()
+        self.create_succeeds = create_succeeds
+        self.create_calls: list[int] = []
+        self._undo_functions = []
+
+    def begin_undo_actions(self):
+        self._undo_functions = list(self.functions)
+        return super().begin_undo_actions()
+
+    def create_user_function(self, address: int):
+        self.create_calls.append(int(address))
+        if self.create_succeeds:
+            self.functions.append(_FakeFunction(int(address), f"sub_{int(address):x}"))
+
+    def revert_undo_actions(self, state):
+        self.functions = list(self._undo_functions)
+        super().revert_undo_actions(state)
+
+
 class _ParseResult:
     def __init__(self, *, types=None, variables=None, functions=None):
         self.types = dict(types or {})
@@ -398,6 +422,127 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     assert result["committed"] is False
     assert ("revert", "state") in bv.events
     assert ("commit", "state") not in bv.events
+
+
+def test_create_function_mutation_commits_verified_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV()
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+    monkeypatch.setattr(instance, "_function_text", lambda _bv, fn, **_kwargs: fn.name)
+
+    result = instance._mutation(
+        "active", False, [{"op": "create_function", "address": "0x401000"}]
+    )
+
+    assert result["success"] is True
+    assert result["committed"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert result["results"][0]["observed"] == {
+        "address": "0x401000",
+        "exists": True,
+        "name": "sub_401000",
+    }
+    assert result["affected_functions"][0]["address"] == "0x401000"
+    assert result["affected_functions"][0]["changed"] is True
+    assert bv.create_calls == [0x401000]
+    assert bv.get_function_at(0x401000) is not None
+    assert ("commit", "state") in bv.events
+
+
+def test_create_function_preview_verifies_then_reverts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV()
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+    monkeypatch.setattr(instance, "_function_text", lambda _bv, fn, **_kwargs: fn.name)
+
+    result = instance._mutation(
+        "active", True, [{"op": "create_function", "address": 0x402000}]
+    )
+
+    assert result["success"] is True
+    assert result["committed"] is False
+    assert result["results"][0]["status"] == "verified"
+    assert bv.get_function_at(0x402000) is None
+    assert ("revert", "state") in bv.events
+
+
+def test_create_function_existing_start_is_noop(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV()
+    bv.functions.append(_FakeFunction(0x403000, "already_there"))
+
+    result = instance._op_create_function(
+        bv, {"op": "create_function", "address": "0x403000"}
+    )
+    verified = instance._verify_operation(bv, result)
+
+    assert verified["status"] == "noop"
+    assert verified["observed"]["name"] == "already_there"
+    assert bv.create_calls == []
+
+
+def test_create_function_verification_failure_reverts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreationBV(create_succeeds=False)
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+
+    result = instance._mutation(
+        "active", False, [{"op": "create_function", "address": "0x404000"}]
+    )
+
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["results"][0]["status"] == "verification_failed"
+    assert result["results"][0]["observed"]["exists"] is False
+    assert ("revert", "state") in bv.events
+
+
+def test_non_create_mutation_reloads_handles_without_second_guess(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    stale = _FakeFunction(0x405000, "stale_name")
+    fresh = _FakeFunction(0x405000, "fresh_name")
+    bv.functions = [stale]
+    guess_calls = []
+
+    def guess(_bv, _operations):
+        guess_calls.append(True)
+        return [stale]
+
+    def update_analysis():
+        bv.events.append("refresh")
+        bv.functions = [fresh]
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+    monkeypatch.setattr(instance, "_guess_affected_functions", guess)
+    monkeypatch.setattr(instance, "_function_text", lambda _bv, fn, **_kwargs: fn.name)
+    monkeypatch.setattr(
+        instance,
+        "_apply_operation",
+        lambda _bv, _op: {"op": "rename_symbol", "address": "0x405000"},
+    )
+    monkeypatch.setattr(
+        instance,
+        "_verify_operation",
+        lambda _bv, result: {**result, "status": "verified"},
+    )
+    monkeypatch.setattr(bv, "update_analysis_and_wait", update_analysis)
+
+    result = instance._mutation(
+        "active", False, [{"op": "rename_symbol", "identifier": "stale_name"}]
+    )
+
+    assert len(guess_calls) == 1
+    assert result["affected_functions"][0]["before_name"] == "stale_name"
+    assert result["affected_functions"][0]["after_name"] == "fresh_name"
 
 
 def test_refresh_updates_analysis_and_returns_target_info(monkeypatch):
@@ -2458,3 +2603,442 @@ def test_gui_refresh_decoupled_from_ui_focus(monkeypatch):
     manager.set_active(manager.view_id_for(bv_b))
     listed = manager.refresh()
     assert [t["basename"] for t in listed if t["active"]] == ["b.so"]
+
+
+class _FakePluginSettings:
+    def __init__(self):
+        self.groups = {}
+        self.schemas = {}
+        self.values = {}
+        self.set_calls = []
+
+    def register_group(self, key, title):
+        self.groups[key] = title
+        return True
+
+    def register_setting(self, key, properties):
+        self.schemas[key] = json.loads(properties)
+        return True
+
+    def get_integer(self, key):
+        return self.values.get(key, self.schemas[key]["default"])
+
+    def set_integer(self, key, value, **kwargs):
+        self.values[key] = int(value)
+        self.set_calls.append((key, int(value), kwargs))
+        return True
+
+
+def test_gui_port_setting_is_registered_and_used(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    monkeypatch.setattr(bridge, "ui", object())
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(bridge, "bridge_tcp_port", lambda _mode: 26765)
+
+    bridge._register_gui_settings()
+
+    schema = settings.schemas[bridge.GUI_PORT_SETTING]
+    assert settings.groups[bridge.SETTINGS_GROUP] == "BN Agent Bridge"
+    assert schema["default"] == 26765
+    assert schema["minValue"] == 1
+    assert schema["maxValue"] == 65535
+    settings.values[bridge.GUI_PORT_SETTING] = 28000
+    assert bridge._configured_tcp_port("gui") == 28000
+
+
+def test_set_gui_port_command_saves_and_restarts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    settings.schemas[bridge.GUI_PORT_SETTING] = {"default": 26765}
+    messages = []
+    restarted = types.SimpleNamespace(endpoint="tcp://127.0.0.1:28000")
+    bridge._bridge = types.SimpleNamespace(port=26765, transport="tcp")
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(
+        bridge.bn,
+        "SettingsScope",
+        types.SimpleNamespace(SettingsUserScope="user"),
+        raising=False,
+    )
+    monkeypatch.setattr(bridge.bn, "get_int_input", lambda *_args: 28000, raising=False)
+    monkeypatch.setattr(bridge, "_restart_gui_bridge", lambda previous: (restarted, False))
+    monkeypatch.setattr(bridge, "_show_gui_message", messages.append)
+
+    bridge._set_gui_port_command(None)
+
+    assert settings.values[bridge.GUI_PORT_SETTING] == 28000
+    assert settings.set_calls[-1][2] == {"scope": "user"}
+    assert messages == ["Bridge is now listening on tcp://127.0.0.1:28000."]
+    bridge._bridge = None
+
+
+@pytest.mark.parametrize(
+    ("entered", "expected_messages"),
+    [
+        (None, []),
+        (0, ["Port must be between 1 and 65535."]),
+        (65536, ["Port must be between 1 and 65535."]),
+    ],
+)
+def test_set_gui_port_command_handles_cancel_and_invalid_values(
+    monkeypatch, entered, expected_messages
+):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    settings.schemas[bridge.GUI_PORT_SETTING] = {"default": 26765}
+    messages = []
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(bridge.bn, "get_int_input", lambda *_args: entered, raising=False)
+    monkeypatch.setattr(bridge, "_show_gui_message", messages.append)
+    bridge._bridge = None
+
+    bridge._set_gui_port_command(None)
+
+    assert settings.set_calls == []
+    assert messages == expected_messages
+
+
+def test_restart_gui_bridge_restores_previous_port_on_bind_failure(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    restored = types.SimpleNamespace(endpoint="tcp://127.0.0.1:26765")
+    starts = iter([None, restored])
+    stopped = []
+    restored_ports = []
+    monkeypatch.setattr(bridge, "_configured_tcp_port", lambda _mode: 28000)
+    monkeypatch.setattr(bridge, "_stop_bridge", lambda: stopped.append(True))
+    monkeypatch.setattr(bridge, "start_bridge", lambda mode: next(starts))
+    monkeypatch.setattr(bridge, "_set_gui_port_setting", restored_ports.append)
+
+    result, did_restore = bridge._restart_gui_bridge(26765)
+
+    assert stopped == [True]
+    assert restored_ports == [26765]
+    assert result is restored
+    assert did_restore is True
+
+
+def test_tcp_port_conflict_fails_without_overwriting_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bridge = _load_bridge(monkeypatch)
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    occupied_port = blocker.getsockname()[1]
+    logs = []
+    monkeypatch.setattr(bridge, "ui", object())
+    monkeypatch.setattr(bridge, "_configured_tcp_port", lambda _mode: occupied_port)
+    monkeypatch.setattr(bridge.bn, "log_error", logs.append)
+
+    instance = bridge.BinaryNinjaBridge(mode="gui")
+    instance.transport = "tcp"
+    instance.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    instance.registry_path.write_text("existing-registry", encoding="utf-8")
+    monkeypatch.setattr(bridge, "BinaryNinjaBridge", lambda mode: instance)
+    bridge._bridge = None
+    try:
+        assert bridge.start_bridge(mode="gui") is None
+        assert bridge._bridge is None
+        assert instance._server is None
+        assert instance._thread is None
+        assert instance.registry_path.read_text(encoding="utf-8") == "existing-registry"
+        assert any(str(occupied_port) in message for message in logs)
+    finally:
+        blocker.close()
+
+
+def test_shutdown_response_is_flushed_before_event(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    events = []
+
+    class _Writer(io.BytesIO):
+        def write(self, data):
+            events.append("write")
+            return super().write(data)
+
+        def flush(self):
+            events.append("flush")
+            return super().flush()
+
+    fake_bridge = types.SimpleNamespace(
+        auth_token=None,
+        dispatch=lambda _payload: {"ok": True, "result": {"accepted": True}},
+        request_shutdown=lambda: events.append("shutdown"),
+    )
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"id":"stop","op":"shutdown","params":{}}\n')
+    handler.wfile = _Writer()
+    handler.server = types.SimpleNamespace(bridge=fake_bridge)
+
+    handler.handle()
+
+    assert events == ["write", "flush", "shutdown"]
+
+
+def test_gui_bridge_rejects_shutdown(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="gui")
+
+    response = instance.dispatch({"op": "shutdown", "params": {}})
+
+    assert response["ok"] is False
+    assert "only available in headless mode" in response["error"]
+
+
+def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "bridge_tcp_port", lambda _mode: 0)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.transport = "tcp"
+    instance.start()
+
+    def _request(payload):
+        with socket.create_connection((instance.host, instance.port), timeout=2) as client:
+            client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            client.shutdown(socket.SHUT_WR)
+            chunks = []
+            while chunk := client.recv(65536):
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks))
+
+    try:
+        registry = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+        assert registry["transport"] == "tcp"
+        assert registry["host"] == "127.0.0.1"
+        assert registry["port"] == instance.port
+        assert registry["auth_token"] == instance.auth_token
+
+        denied = _request({"id": "denied", "op": "doctor", "params": {}})
+        assert denied == {
+            "error": "Unauthorized bridge request",
+            "ok": False,
+            "result": None,
+        }
+
+        allowed = _request(
+            {
+                "id": "allowed",
+                "op": "doctor",
+                "params": {},
+                "auth": instance.auth_token,
+            }
+        )
+        assert allowed["ok"] is True
+        assert allowed["result"]["transport"] == "tcp"
+
+        shutdown = _request(
+            {
+                "id": "shutdown",
+                "op": "shutdown",
+                "params": {},
+                "auth": instance.auth_token,
+            }
+        )
+        assert shutdown["ok"] is True
+        assert shutdown["result"]["accepted"] is True
+        assert instance.shutdown_event.wait(timeout=1)
+    finally:
+        instance.stop()
+
+
+def test_binary_view_reads_do_not_marshal_to_ui_thread(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    instance.targets.register(bv)
+
+    def fail_main_thread(_func):
+        raise AssertionError("BinaryView work must not be marshalled to the UI thread")
+
+    monkeypatch.setattr(bridge, "execute_on_main_thread_and_wait", fail_main_thread)
+    assert instance._memory_read("active", "0x1000", 2) == {
+        "address": "0x1000",
+        "length": 2,
+        "data_hex": "9090",
+    }
+
+
+def test_job_manager_allows_reads_and_rejects_conflicting_write(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    instance.targets.register(bv)
+    release = threading.Event()
+    entered = threading.Event()
+    active = 0
+    peak = 0
+    state_lock = threading.Lock()
+
+    def execute(op, params, target):
+        nonlocal active, peak
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 2:
+                entered.set()
+        release.wait(timeout=2)
+        with state_lock:
+            active -= 1
+        return {"op": op, "target": target}
+
+    monkeypatch.setattr(instance, "_execute_operation", execute)
+    first = instance.jobs.submit("list_functions", {}, "active")
+    second = instance.jobs.submit("strings", {}, "active")
+    assert entered.wait(timeout=1), "two reads on one target should overlap"
+
+    with pytest.raises(bridge.TargetBusyError) as exc_info:
+        instance.jobs.submit("rename_symbol", {}, "active")
+    message = str(exc_info.value)
+    assert first["job_id"] in message
+    assert second["job_id"] in message
+
+    status = instance.dispatch({"op": "job_status", "params": {"job_id": first["job_id"]}})
+    assert status["ok"] is True
+    assert status["result"]["state"] == "running"
+
+    release.set()
+    assert instance.jobs.get(first["job_id"]).done_event.wait(timeout=1)
+    assert instance.jobs.get(second["job_id"]).done_event.wait(timeout=1)
+    assert peak == 2
+
+
+def test_job_result_is_written_to_artifact_and_restored(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    monkeypatch.setattr(
+        instance,
+        "_execute_operation",
+        lambda op, params, target: {"items": [1, 2, 3], "target": target},
+    )
+
+    submitted = instance.dispatch(
+        {
+            "op": "job_submit",
+            "params": {"operation": "list_functions", "params": {}},
+            "target": "active",
+        }
+    )["result"]
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    outcome = instance.dispatch(
+        {"op": "job_result", "params": {"job_id": submitted["job_id"]}}
+    )["result"]
+    assert outcome["ready"] is True
+    assert outcome["result"]["items"] == [1, 2, 3]
+    assert Path(outcome["job"]["artifact_path"]).is_file()
+
+
+def test_job_cancel_is_cooperative_and_does_not_kill_thread(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    entered = threading.Event()
+
+    def cancellable(_op, _params, _target):
+        entered.set()
+        while True:
+            instance._check_job_cancelled()
+            time.sleep(0.005)
+
+    monkeypatch.setattr(instance, "_execute_operation", cancellable)
+    submitted = instance.jobs.submit("search_text", {}, "active")
+    assert entered.wait(timeout=1)
+    cancelled = instance.jobs.cancel(submitted["job_id"])
+    assert cancelled["accepted"] is True
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    assert record.state == "cancelled"
+
+
+def test_job_cancel_rejects_arbitrary_python(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    release = threading.Event()
+    monkeypatch.setattr(
+        instance,
+        "_execute_operation",
+        lambda _op, _params, _target: release.wait(timeout=1),
+    )
+    submitted = instance.jobs.submit("py_exec", {"script": "pass"}, "active")
+    result = instance.jobs.cancel(submitted["job_id"])
+    assert result["accepted"] is False
+    assert "not safely cancellable" in result["reason"]
+    release.set()
+
+
+def test_analysis_job_cancel_requests_binary_ninja_abort(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    aborted = threading.Event()
+    bv.abort_analysis = aborted.set
+    instance.targets.register(bv)
+    entered = threading.Event()
+
+    def analysis_wait(_op, _params, _target):
+        entered.set()
+        while not aborted.wait(timeout=0.01):
+            pass
+        instance._check_job_cancelled()
+
+    monkeypatch.setattr(instance, "_execute_operation", analysis_wait)
+    submitted = instance.jobs.submit("refresh", {}, "active")
+    assert entered.wait(timeout=1)
+    assert instance.jobs.cancel(submitted["job_id"])["accepted"] is True
+    assert aborted.wait(timeout=1)
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    assert record.state == "cancelled"
+
+
+def test_cancelled_mutation_reverts_undo_group(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    bv = _FakeFunctionCreationBV()
+    analysis_entered = threading.Event()
+    aborted = threading.Event()
+
+    def wait_for_analysis():
+        analysis_entered.set()
+        aborted.wait(timeout=1)
+
+    bv.update_analysis_and_wait = wait_for_analysis
+    bv.abort_analysis = aborted.set
+    instance.targets.register(bv)
+    submitted = instance.jobs.submit(
+        "create_function",
+        {"address": "0x401000", "preview": False},
+        "active",
+    )
+    assert analysis_entered.wait(timeout=1)
+    assert instance.jobs.cancel(submitted["job_id"])["accepted"] is True
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    assert record.state == "cancelled"
+    assert bv.functions == []
+    assert ("revert", "state") in bv.events
+
+
+def test_completed_job_history_is_bounded(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    monkeypatch.setattr(instance, "_execute_operation", lambda *_args: {"ok": True})
+
+    newest = None
+    for _ in range(bridge.COMPLETED_JOBS_LIMIT + 3):
+        newest = instance.jobs.submit("list_functions", {}, "active")
+        assert instance.jobs.get(newest["job_id"]).done_event.wait(timeout=1)
+    jobs = instance.jobs.list()
+    assert len(jobs) == bridge.COMPLETED_JOBS_LIMIT
+    assert jobs[0]["job_id"] == newest["job_id"]

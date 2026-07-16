@@ -46,13 +46,17 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 - `bn` has two parts:
   - a normal Python CLI that you can run from your shell or agent tool harness
-  - a Binary Ninja bridge that exposes the API over a Unix-domain socket
+  - a Binary Ninja bridge that exposes the API over a local transport: a Unix-domain socket on Unix, or authenticated loopback TCP on Windows
 - The bridge runs in one of two **modes**:
   - **`gui`** — loaded as a Binary Ninja plugin inside the GUI process. Works with a personal license. Started automatically when Binary Ninja opens with the plugin installed.
   - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
-- Each mode has its own socket and registry file under `~/Library/Caches/bn/` (or your platform's cache dir), so both can run simultaneously on the same machine.
+- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. On Windows, GUI defaults to `127.0.0.1:26765` and headless to `127.0.0.1:26766`; registry entries include a random authentication token and the CLI only accepts loopback endpoints. Override the defaults with `BN_BRIDGE_GUI_PORT` or `BN_BRIDGE_HEADLESS_PORT`.
 - The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
 - **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation just opens a socket, sends a JSON request, and reads the response — the binary is never re-imported.
+
+### Changing the GUI bridge port
+
+On Windows, run `BN Agent Bridge\Set GUI Port...` inside Binary Ninja to save a new user-level port and restart the bridge immediately. You can also edit **GUI Listen Port** under the **BN Agent Bridge** group in Binary Ninja Settings, then run `BN Agent Bridge\Restart Bridge`. If the new port cannot be bound, the plugin restores the previous setting and listener instead of leaving the bridge offline.
 
 ## Quick Start
 
@@ -93,6 +97,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 | `bn plugin` | Install the Binary Ninja companion plugin |
 | `bn skill` | Install the bundled skill into Codex and/or Claude Code |
 | `bn daemon` | Manage bn bridge daemons (start/stop/status/list/use) |
+| `bn job` | Inspect, retrieve, and cooperatively cancel background jobs |
 | `bn target` | Inspect/load/close/save Binary Ninja targets |
 | `bn refresh` | Refresh analysis for the selected target |
 
@@ -134,6 +139,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 
 | Command | Description |
 |---------|-------------|
+| `bn function create` | Create and verify a user function at an address |
 | `bn symbol rename` | Rename functions or data symbols |
 | `bn comment set` | Set or delete comments |
 | `bn proto set` | Set a user prototype |
@@ -250,7 +256,7 @@ The headless daemon imports `binaryninja` and requires a Binary Ninja commercial
 ```bash
 bn daemon start --foreground   # block in foreground (Docker PID 1 / systemd)
 bn daemon status               # pid, socket, target count
-bn daemon stop                 # SIGTERM + clean socket / registry
+bn daemon stop                 # authenticated graceful shutdown + registry cleanup
 ```
 
 `--foreground` is currently the only supported run mode. For true background usage, wrap with `&`, `nohup`, `screen`/`tmux`, or a process supervisor like `systemd`.
@@ -279,6 +285,23 @@ bn target close               # unload a target, free the BinaryView
 `--option KEY=VALUE` is repeatable; the value is JSON-parsed when possible (`true`/`false`/numbers/lists), otherwise treated as a string. `--options-json '{...}'` accepts an entire JSON object at once.
 
 With `--async`, `bn target load` returns immediately with `{queued: true, load_id, path}`. The actual load + analysis happen in a background thread on the daemon. Poll `bn target list` to see when the target shows up, `bn target status` to track analysis progress, and `bn target loads` to see per-attempt status and any failure messages.
+
+### Background Jobs and GUI Responsiveness
+
+Target-scoped bridge operations run on ordinary Python background threads, not Binary Ninja's UI thread. Short commands keep their existing synchronous output. By default the CLI waits for 30 seconds; if the operation is still running it exits with code `124` and prints a `job_id` while the bridge continues the work.
+
+```bash
+bn strings --target active --wait-timeout 10
+bn bundle function large_function --async
+bn decompile large_function --danger-always-wait
+
+bn job list
+bn job status <job_id>
+bn job result <job_id> --out /tmp/result.json
+bn job cancel <job_id>
+```
+
+Multiple reads on one target can run concurrently. A read/write or write/write conflict returns immediately with the blocking job id instead of silently waiting. Cancellation is cooperative: searches, enumerations and analysis waits check for cancellation, while arbitrary `py exec` and third-party plugin commands are not force-killed. `Ctrl+C` only stops the CLI from waiting and leaves the job available through `bn job`.
 
 ## Output Behavior
 
@@ -425,6 +448,7 @@ bn local rename sub_401000 0x401000:local:StackVariableSourceType:-20:2:12345 sp
 bn local retype sub_401000 0x401000:local:StackVariableSourceType:-20:2:12345 float --preview
 bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
+bn function create 0x401000 --preview
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
@@ -439,6 +463,8 @@ bn struct show Player
 bn types show Player
 bn decompile sub_401000
 ```
+
+After creating a function, verify it with `bn function info <address>` or `bn decompile <address>`.
 
 For declaration and struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
 
@@ -506,7 +532,7 @@ If `bn target list` is empty:
 - make sure the plugin is installed with `bn plugin install`
 - reload Binary Ninja plugins or restart Binary Ninja after plugin changes
 
-If `bn doctor` sees a bridge registry but reports `Operation not permitted` under Codex,
+On Unix, if `bn doctor` sees a bridge registry but reports `Operation not permitted` under Codex,
 the Codex sandbox is blocking the Unix socket that connects to the live Binary Ninja GUI
 process. Let Codex run `bn` outside the sandbox by adding this rule to
 `~/.codex/rules/default.rules`:

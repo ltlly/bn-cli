@@ -11,9 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from bn.paths import bridge_registry_path, current_daemon_mode_path
+from bn.paths import bridge_registry_path, bridge_tcp_port, current_daemon_mode_path
 from bn.transport import (
     BridgeError,
+    BridgeInstance,
+    _socket_args,
     choose_instance,
     list_instances,
     read_current_daemon_mode,
@@ -34,15 +36,73 @@ class _Handler(socketserver.StreamRequestHandler):
                 "op": payload["op"],
                 "target": payload.get("target"),
                 "params": payload.get("params"),
+                "auth": payload.get("auth"),
             },
         }
         self.wfile.write(json.dumps(response).encode("utf-8"))
 
 
-class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+HAS_UNIX_SOCKETS = hasattr(socket, "AF_UNIX") and hasattr(socketserver, "UnixStreamServer")
+requires_unix_sockets = pytest.mark.skipif(
+    not HAS_UNIX_SOCKETS, reason="Unix-domain sockets are unavailable on this platform"
+)
+
+
+if HAS_UNIX_SOCKETS:
+    class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+else:
+    _Server = None
+
+
+class _TcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
 
+def test_bridge_tcp_ports_are_fixed_and_overridable(monkeypatch):
+    monkeypatch.delenv("BN_BRIDGE_GUI_PORT", raising=False)
+    monkeypatch.delenv("BN_BRIDGE_HEADLESS_PORT", raising=False)
+    assert bridge_tcp_port("gui") == 26765
+    assert bridge_tcp_port("headless") == 26766
+
+    monkeypatch.setenv("BN_BRIDGE_GUI_PORT", "30001")
+    assert bridge_tcp_port("gui") == 30001
+
+
+def test_socket_args_rejects_non_loopback_tcp_endpoint(tmp_path):
+    instance = BridgeInstance(
+        pid=123,
+        socket_path=None,
+        registry_path=tmp_path / "gui.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.15.0",
+        started_at=None,
+        meta={},
+        transport="tcp",
+        host="0.0.0.0",
+        port=26765,
+        auth_token="secret",
+    )
+
+    with pytest.raises(OSError, match="Invalid TCP bridge endpoint"):
+        _socket_args(instance)
+
+
+def test_list_instances_purges_unix_registry_without_socket_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path("gui")
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps({"pid": os.getpid(), "transport": "unix", "mode": "gui"}),
+        encoding="utf-8",
+    )
+
+    assert list_instances() == []
+    assert not registry_path.exists()
+
+
+@requires_unix_sockets
 def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
@@ -80,6 +140,7 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
         server.server_close()
 
 
+@requires_unix_sockets
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry_path = bridge_registry_path("gui")
@@ -112,6 +173,7 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     assert stale_socket_path.exists()
 
 
+@requires_unix_sockets
 def test_list_instances_preserves_permission_denied_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry_path = bridge_registry_path("gui")
@@ -153,6 +215,62 @@ def test_list_instances_preserves_permission_denied_registry(tmp_path, monkeypat
     assert registry_path.exists()
 
 
+def test_send_request_uses_tcp_registry_and_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    server = _TcpServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    registry_path = bridge_registry_path("gui")
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "transport": "tcp",
+                "host": host,
+                "port": port,
+                "auth_token": "test-token",
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instance = choose_instance()
+        assert instance.transport == "tcp"
+        assert instance.endpoint == f"tcp://127.0.0.1:{port}"
+        response = send_request("ping", params={"hello": "world"})
+        assert response["result"]["op"] == "ping"
+        assert response["result"]["auth"] == "test-token"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_list_instances_prunes_stale_tcp_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path("gui")
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "transport": "tcp",
+                "host": "127.0.0.1",
+                "port": 1,
+                "auth_token": "test-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert list_instances() == []
+    assert not registry_path.exists()
+
+
 def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
     from bn.transport import BridgeError, BridgeInstance
 
@@ -164,6 +282,9 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        transport="tcp",
+        host="127.0.0.1",
+        port=1,
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
 
@@ -182,6 +303,9 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        transport="tcp",
+        host="127.0.0.1",
+        port=1,
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
 
@@ -200,7 +324,7 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         def connect(self, path):
             type(self).attempts += 1
             if type(self).attempts == 1:
-                raise ConnectionRefusedError(61, "Connection refused")
+                raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
 
         def sendall(self, payload):
             self.payload = payload
@@ -233,6 +357,9 @@ def test_send_request_uses_blocking_socket_by_default(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        transport="tcp",
+        host="127.0.0.1",
+        port=1,
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
 
@@ -283,6 +410,9 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        transport="tcp",
+        host="127.0.0.1",
+        port=1,
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
 
@@ -314,6 +444,7 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         send_request("ping", timeout=12.5)
 
 
+@requires_unix_sockets
 def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry_path = bridge_registry_path("gui")
@@ -347,6 +478,7 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
         server.server_close()
 
 
+@requires_unix_sockets
 def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
@@ -398,6 +530,7 @@ def _write_registry(mode: str, *, pid: int, socket_path: Path) -> Path:
     return registry_path
 
 
+@requires_unix_sockets
 def test_list_instances_discovers_both_modes(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
@@ -423,6 +556,7 @@ def test_list_instances_discovers_both_modes(tmp_path, monkeypatch):
         headless_server.server_close()
 
 
+@requires_unix_sockets
 def test_choose_instance_uses_sticky_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
@@ -447,6 +581,7 @@ def test_choose_instance_uses_sticky_mode(tmp_path, monkeypatch):
         headless_server.server_close()
 
 
+@requires_unix_sockets
 def test_choose_instance_errors_on_multiple_without_sticky(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
@@ -470,6 +605,7 @@ def test_choose_instance_errors_on_multiple_without_sticky(tmp_path, monkeypatch
         headless_server.server_close()
 
 
+@requires_unix_sockets
 def test_choose_instance_errors_when_sticky_mode_not_running(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
