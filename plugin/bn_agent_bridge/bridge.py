@@ -25,7 +25,13 @@ import binaryninja as bn
 from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
-from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, bridge_tcp_port
+from .paths import (
+    DEFAULT_BRIDGE_TCP_PORTS,
+    PLUGIN_NAME,
+    bridge_registry_path,
+    bridge_socket_path,
+    bridge_tcp_port,
+)
 from .version import VERSION, build_id_for_file
 
 try:
@@ -35,6 +41,52 @@ except Exception:  # pragma: no cover - headless raises UIPluginInHeadlessError;
 
 
 PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
+SETTINGS_GROUP = "bnAgentBridge"
+GUI_PORT_SETTING = f"{SETTINGS_GROUP}.guiPort"
+
+
+def _default_tcp_port(mode: str) -> int:
+    try:
+        return bridge_tcp_port(mode)
+    except ValueError as exc:
+        fallback = DEFAULT_BRIDGE_TCP_PORTS[mode]
+        bn.log_error(f"BN Agent Bridge ignored an invalid port override: {exc}; using {fallback}")
+        return fallback
+
+
+def _register_gui_settings() -> None:
+    if ui is None or not hasattr(bn, "Settings"):
+        return
+    settings = bn.Settings()
+    settings.register_group(SETTINGS_GROUP, "BN Agent Bridge")
+    settings.register_setting(
+        GUI_PORT_SETTING,
+        json.dumps(
+            {
+                "title": "GUI Listen Port",
+                "type": "number",
+                "default": _default_tcp_port("gui"),
+                "minValue": 1,
+                "maxValue": 65535,
+                "description": (
+                    "Authenticated loopback TCP port used by the bn CLI. "
+                    "Run 'BN Agent Bridge > Restart Bridge' after changing it."
+                ),
+            }
+        ),
+    )
+
+
+def _configured_tcp_port(mode: str) -> int:
+    if mode == "gui" and ui is not None and hasattr(bn, "Settings"):
+        port = int(bn.Settings().get_integer(GUI_PORT_SETTING))
+        if 1 <= port <= 65535:
+            return port
+        bn.log_error(
+            f"BN Agent Bridge setting {GUI_PORT_SETTING} is invalid ({port}); "
+            "using the configured default instead"
+        )
+    return _default_tcp_port(mode)
 
 
 def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:
@@ -317,6 +369,7 @@ NO_LOCK_OPS = {
     "list_targets",
     "target_info",
     "doctor",
+    "shutdown",
 }
 
 
@@ -703,9 +756,11 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         *,
         op: str | None = None,
         request_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             self.wfile.write(encoded)
+            self.wfile.flush()
+            return True
         except OSError as exc:
             if exc.errno not in {errno.EPIPE, errno.ECONNRESET}:
                 raise
@@ -716,6 +771,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                 details.append(f"id={request_id}")
             suffix = f" ({', '.join(details)})" if details else ""
             bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
+            return False
 
     def handle(self):  # pragma: no cover - exercised from CLI
         raw = self.rfile.readline()
@@ -740,11 +796,15 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             else:
                 response = self.server.bridge.dispatch(payload)
         encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
-        self._write_response(encoded, op=op, request_id=request_id)
+        delivered = self._write_response(encoded, op=op, request_id=request_id)
+        if delivered and op == "shutdown" and response.get("ok"):
+            self.server.bridge.request_shutdown()
 
 
 class _ThreadedServerMixin(socketserver.ThreadingMixIn):
     daemon_threads = True
+    # Avoid TIME_WAIT blocking a quick restart. This does not permit binding
+    # over another process that is actively listening on the same TCP port.
     allow_reuse_address = True
     request_queue_size = 64
 
@@ -803,6 +863,7 @@ class BinaryNinjaBridge:
         self.auth_token: str | None = None
         self._server: socketserver.BaseServer | None = None
         self._thread: threading.Thread | None = None
+        self.shutdown_event = threading.Event()
         self._target_locks: dict[str, _ReadWriteLock] = {}
         self._target_locks_lock = threading.Lock()
         self._global_lock = _ReadWriteLock()
@@ -860,7 +921,8 @@ class BinaryNinjaBridge:
         with self._load_attempts_lock:
             return [attempt.to_dict() for attempt in self._load_attempts]
 
-    def start(self):  # pragma: no cover - requires GUI runtime
+    def start(self) -> bool:  # pragma: no cover - requires GUI runtime
+        self.shutdown_event.clear()
         if self.transport == "unix":
             self.socket_path.parent.mkdir(parents=True, exist_ok=True)
             if self.socket_path.exists():
@@ -869,14 +931,37 @@ class BinaryNinjaBridge:
             self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
         else:
             self.auth_token = secrets.token_urlsafe(32)
-            self._server = ThreadedTcpServer(
-                ("127.0.0.1", bridge_tcp_port(self.mode)), BridgeHandler, self
-            )
+            requested_port = _configured_tcp_port(self.mode)
+            try:
+                self._server = ThreadedTcpServer(
+                    ("127.0.0.1", requested_port), BridgeHandler, self
+                )
+            except OSError as exc:
+                self._server = None
+                self.auth_token = None
+                self.host = None
+                self.port = None
+                env_name = f"BN_BRIDGE_{self.mode.upper()}_PORT"
+                configuration_hint = (
+                    "change the port in Binary Ninja Settings"
+                    if self.mode == "gui"
+                    else f"set {env_name}"
+                )
+                bn.log_error(
+                    "BN Agent Bridge could not listen on "
+                    f"tcp://127.0.0.1:{requested_port} for {self.mode} mode: {exc}. "
+                    f"Close the process using that port or {configuration_hint}."
+                )
+                return False
             self.host, self.port = self._server.server_address
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self._write_registry()
         bn.log_info(f"BN Agent Bridge listening on {self.endpoint}")
+        return True
+
+    def request_shutdown(self) -> None:
+        self.shutdown_event.set()
 
     @property
     def endpoint(self) -> str:
@@ -953,6 +1038,10 @@ class BinaryNinjaBridge:
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
 
     def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
+        if op == "shutdown":
+            if self.mode != "headless":
+                raise RuntimeError("The shutdown operation is only available in headless mode")
+            return {"accepted": True, "mode": self.mode, "pid": os.getpid()}
         if op == "doctor":
             return self._doctor()
         if op == "list_targets":
@@ -1108,7 +1197,7 @@ class BinaryNinjaBridge:
             return self._mutation(
                 target,
                 bool(params.get("preview")),
-                [{"op": "create_function", **params}],
+                [{"op": "create_function", "address": params["address"]}],
             )
         if op == "get_comment":
             return self._get_comment(target, params.get("address"), params.get("function"))
@@ -3991,9 +4080,15 @@ class BinaryNinjaBridge:
 
         try:
             bv.update_analysis_and_wait()
-            after_affected = {int(fn.start): fn for fn in affected}
-            for fn in self._guess_affected_functions(bv, operations):
-                after_affected[int(fn.start)] = fn
+            after_affected = {}
+            for fn in affected:
+                address = int(fn.start)
+                current = bv.get_function_at(address)
+                if current is not None:
+                    after_affected[address] = current
+            if any((op.get("op") or "rename_symbol") == "create_function" for op in operations):
+                for fn in self._guess_affected_functions(bv, operations):
+                    after_affected[int(fn.start)] = fn
             after = self._capture_function_snapshots(bv, after_affected.values())
             type_after = self._capture_type_snapshots(bv, operations)
             diffs = self._diff_snapshots(before, after)
@@ -6041,8 +6136,98 @@ class BinaryNinjaBridge:
 _bridge: BinaryNinjaBridge | None = None
 
 
-def _start_bridge_command(_):  # pragma: no cover - GUI runtime
-    start_bridge(mode="gui")
+def _show_gui_message(text: str) -> None:  # pragma: no cover - GUI runtime
+    show = getattr(bn, "show_message_box", None)
+    if show is not None:
+        show("BN Agent Bridge", text)
+    else:
+        bn.log_info(text)
+
+
+def _set_gui_port_setting(port: int) -> bool:
+    settings = bn.Settings()
+    scope = getattr(getattr(bn, "SettingsScope", None), "SettingsUserScope", None)
+    if scope is None:
+        return bool(settings.set_integer(GUI_PORT_SETTING, port))
+    return bool(settings.set_integer(GUI_PORT_SETTING, port, scope=scope))
+
+
+def _restart_gui_bridge(previous_port: int | None) -> tuple[BinaryNinjaBridge | None, bool]:
+    desired_port = _configured_tcp_port("gui")
+    _stop_bridge()
+    restarted = start_bridge(mode="gui")
+    if restarted is not None:
+        return restarted, False
+
+    if previous_port is None or previous_port == desired_port:
+        return None, False
+
+    _set_gui_port_setting(previous_port)
+    restored = start_bridge(mode="gui")
+    return restored, restored is not None
+
+
+def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
+    if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX"):
+        _stop_bridge()
+        restarted = start_bridge(mode="gui")
+        if restarted is not None:
+            _show_gui_message(f"Bridge is listening on {restarted.endpoint}.")
+        else:
+            _show_gui_message("Could not restart the bridge. See the Binary Ninja log for details.")
+        return
+
+    previous_port = _bridge.port if _bridge is not None and _bridge.transport == "tcp" else None
+    desired_port = _configured_tcp_port("gui")
+    restarted, restored = _restart_gui_bridge(previous_port)
+    if restarted is not None and not restored:
+        _show_gui_message(f"Bridge is listening on {restarted.endpoint}.")
+    elif restored:
+        _show_gui_message(
+            f"Could not listen on port {desired_port}; restored the bridge on {restarted.endpoint}."
+        )
+    else:
+        _show_gui_message(
+            f"Could not start the bridge on port {desired_port}. See the Binary Ninja log for details."
+        )
+
+
+def _set_gui_port_command(_):  # pragma: no cover - GUI runtime
+    previous_port = (
+        int(_bridge.port)
+        if _bridge is not None and _bridge.transport == "tcp" and _bridge.port is not None
+        else _configured_tcp_port("gui")
+    )
+    get_int_input = getattr(bn, "get_int_input", None)
+    if get_int_input is None:
+        bn.log_error("Binary Ninja integer input API is unavailable")
+        return
+    port = get_int_input(
+        f"Loopback TCP port (current: {previous_port})",
+        "BN Agent Bridge Port",
+    )
+    if port is None:
+        return
+    port = int(port)
+    if not 1 <= port <= 65535:
+        _show_gui_message("Port must be between 1 and 65535.")
+        return
+    if not _set_gui_port_setting(port):
+        _show_gui_message("Binary Ninja could not save the GUI port setting.")
+        return
+
+    restarted, restored = _restart_gui_bridge(previous_port)
+    if restarted is not None and not restored:
+        _show_gui_message(f"Bridge is now listening on {restarted.endpoint}.")
+    elif restored:
+        _show_gui_message(
+            f"Port {port} is unavailable; restored the bridge on {restarted.endpoint}."
+        )
+    else:
+        _show_gui_message(
+            f"Port {port} is unavailable and the previous listener could not be restored. "
+            "See the Binary Ninja log for details."
+        )
 
 
 def start_bridge(mode: str = "gui"):  # pragma: no cover - exercised in real bridges
@@ -6052,8 +6237,10 @@ def start_bridge(mode: str = "gui"):  # pragma: no cover - exercised in real bri
         return None
     if _bridge is not None:
         return _bridge
-    _bridge = BinaryNinjaBridge(mode=mode)
-    _bridge.start()
+    candidate = BinaryNinjaBridge(mode=mode)
+    if not candidate.start():
+        return None
+    _bridge = candidate
     return _bridge
 
 
@@ -6066,7 +6253,6 @@ def _stop_bridge():  # pragma: no cover - exercised in real bridges
 
 def _run_headless(*, foreground: bool = True) -> int:  # pragma: no cover - requires BN headless license
     import signal
-    import threading as _threading
 
     bridge = start_bridge(mode="headless")
     if bridge is None:
@@ -6075,16 +6261,14 @@ def _run_headless(*, foreground: bool = True) -> int:  # pragma: no cover - requ
     if not foreground:
         return 0
 
-    stop_event = _threading.Event()
-
     def _handle_signal(signum, _frame):
         bn.log_info(f"BN Agent Bridge received signal {signum}; shutting down")
-        stop_event.set()
+        bridge.request_shutdown()
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
     try:
-        stop_event.wait()
+        bridge.shutdown_event.wait()
     finally:
         _stop_bridge()
     return 0
@@ -6095,6 +6279,13 @@ atexit.register(_stop_bridge)
 if ui is not None:
     PluginCommand.register(
         "BN Agent Bridge\\Restart Bridge",
-        "Restart the bn CLI socket bridge",
-        _start_bridge_command,
+        "Restart the bn CLI bridge",
+        _restart_bridge_command,
     )
+    if ThreadedUnixServer is None or not hasattr(socket, "AF_UNIX"):
+        _register_gui_settings()
+        PluginCommand.register(
+            "BN Agent Bridge\\Set GUI Port...",
+            "Change the authenticated loopback TCP port and restart the bridge",
+            _set_gui_port_command,
+        )

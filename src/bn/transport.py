@@ -120,6 +120,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         try:
             socket_path = Path(payload["socket_path"])
         except (KeyError, TypeError):
+            _purge_stale_registry(path)
             return None
         host = None
         port = None

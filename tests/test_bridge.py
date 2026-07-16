@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import io
 import json
 import socket
 import sys
@@ -501,6 +502,47 @@ def test_create_function_verification_failure_reverts(monkeypatch):
     assert result["results"][0]["status"] == "verification_failed"
     assert result["results"][0]["observed"]["exists"] is False
     assert ("revert", "state") in bv.events
+
+
+def test_non_create_mutation_reloads_handles_without_second_guess(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    stale = _FakeFunction(0x405000, "stale_name")
+    fresh = _FakeFunction(0x405000, "fresh_name")
+    bv.functions = [stale]
+    guess_calls = []
+
+    def guess(_bv, _operations):
+        guess_calls.append(True)
+        return [stale]
+
+    def update_analysis():
+        bv.events.append("refresh")
+        bv.functions = [fresh]
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda _selector: bv)
+    monkeypatch.setattr(instance, "_guess_affected_functions", guess)
+    monkeypatch.setattr(instance, "_function_text", lambda _bv, fn, **_kwargs: fn.name)
+    monkeypatch.setattr(
+        instance,
+        "_apply_operation",
+        lambda _bv, _op: {"op": "rename_symbol", "address": "0x405000"},
+    )
+    monkeypatch.setattr(
+        instance,
+        "_verify_operation",
+        lambda _bv, result: {**result, "status": "verified"},
+    )
+    monkeypatch.setattr(bv, "update_analysis_and_wait", update_analysis)
+
+    result = instance._mutation(
+        "active", False, [{"op": "rename_symbol", "identifier": "stale_name"}]
+    )
+
+    assert len(guess_calls) == 1
+    assert result["affected_functions"][0]["before_name"] == "stale_name"
+    assert result["affected_functions"][0]["after_name"] == "fresh_name"
 
 
 def test_refresh_updates_analysis_and_returns_target_info(monkeypatch):
@@ -2563,6 +2605,186 @@ def test_gui_refresh_decoupled_from_ui_focus(monkeypatch):
     assert [t["basename"] for t in listed if t["active"]] == ["b.so"]
 
 
+class _FakePluginSettings:
+    def __init__(self):
+        self.groups = {}
+        self.schemas = {}
+        self.values = {}
+        self.set_calls = []
+
+    def register_group(self, key, title):
+        self.groups[key] = title
+        return True
+
+    def register_setting(self, key, properties):
+        self.schemas[key] = json.loads(properties)
+        return True
+
+    def get_integer(self, key):
+        return self.values.get(key, self.schemas[key]["default"])
+
+    def set_integer(self, key, value, **kwargs):
+        self.values[key] = int(value)
+        self.set_calls.append((key, int(value), kwargs))
+        return True
+
+
+def test_gui_port_setting_is_registered_and_used(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    monkeypatch.setattr(bridge, "ui", object())
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(bridge, "bridge_tcp_port", lambda _mode: 26765)
+
+    bridge._register_gui_settings()
+
+    schema = settings.schemas[bridge.GUI_PORT_SETTING]
+    assert settings.groups[bridge.SETTINGS_GROUP] == "BN Agent Bridge"
+    assert schema["default"] == 26765
+    assert schema["minValue"] == 1
+    assert schema["maxValue"] == 65535
+    settings.values[bridge.GUI_PORT_SETTING] = 28000
+    assert bridge._configured_tcp_port("gui") == 28000
+
+
+def test_set_gui_port_command_saves_and_restarts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    settings.schemas[bridge.GUI_PORT_SETTING] = {"default": 26765}
+    messages = []
+    restarted = types.SimpleNamespace(endpoint="tcp://127.0.0.1:28000")
+    bridge._bridge = types.SimpleNamespace(port=26765, transport="tcp")
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(
+        bridge.bn,
+        "SettingsScope",
+        types.SimpleNamespace(SettingsUserScope="user"),
+        raising=False,
+    )
+    monkeypatch.setattr(bridge.bn, "get_int_input", lambda *_args: 28000, raising=False)
+    monkeypatch.setattr(bridge, "_restart_gui_bridge", lambda previous: (restarted, False))
+    monkeypatch.setattr(bridge, "_show_gui_message", messages.append)
+
+    bridge._set_gui_port_command(None)
+
+    assert settings.values[bridge.GUI_PORT_SETTING] == 28000
+    assert settings.set_calls[-1][2] == {"scope": "user"}
+    assert messages == ["Bridge is now listening on tcp://127.0.0.1:28000."]
+    bridge._bridge = None
+
+
+@pytest.mark.parametrize(
+    ("entered", "expected_messages"),
+    [
+        (None, []),
+        (0, ["Port must be between 1 and 65535."]),
+        (65536, ["Port must be between 1 and 65535."]),
+    ],
+)
+def test_set_gui_port_command_handles_cancel_and_invalid_values(
+    monkeypatch, entered, expected_messages
+):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    settings.schemas[bridge.GUI_PORT_SETTING] = {"default": 26765}
+    messages = []
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(bridge.bn, "get_int_input", lambda *_args: entered, raising=False)
+    monkeypatch.setattr(bridge, "_show_gui_message", messages.append)
+    bridge._bridge = None
+
+    bridge._set_gui_port_command(None)
+
+    assert settings.set_calls == []
+    assert messages == expected_messages
+
+
+def test_restart_gui_bridge_restores_previous_port_on_bind_failure(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    restored = types.SimpleNamespace(endpoint="tcp://127.0.0.1:26765")
+    starts = iter([None, restored])
+    stopped = []
+    restored_ports = []
+    monkeypatch.setattr(bridge, "_configured_tcp_port", lambda _mode: 28000)
+    monkeypatch.setattr(bridge, "_stop_bridge", lambda: stopped.append(True))
+    monkeypatch.setattr(bridge, "start_bridge", lambda mode: next(starts))
+    monkeypatch.setattr(bridge, "_set_gui_port_setting", restored_ports.append)
+
+    result, did_restore = bridge._restart_gui_bridge(26765)
+
+    assert stopped == [True]
+    assert restored_ports == [26765]
+    assert result is restored
+    assert did_restore is True
+
+
+def test_tcp_port_conflict_fails_without_overwriting_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bridge = _load_bridge(monkeypatch)
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    occupied_port = blocker.getsockname()[1]
+    logs = []
+    monkeypatch.setattr(bridge, "ui", object())
+    monkeypatch.setattr(bridge, "_configured_tcp_port", lambda _mode: occupied_port)
+    monkeypatch.setattr(bridge.bn, "log_error", logs.append)
+
+    instance = bridge.BinaryNinjaBridge(mode="gui")
+    instance.transport = "tcp"
+    instance.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    instance.registry_path.write_text("existing-registry", encoding="utf-8")
+    monkeypatch.setattr(bridge, "BinaryNinjaBridge", lambda mode: instance)
+    bridge._bridge = None
+    try:
+        assert bridge.start_bridge(mode="gui") is None
+        assert bridge._bridge is None
+        assert instance._server is None
+        assert instance._thread is None
+        assert instance.registry_path.read_text(encoding="utf-8") == "existing-registry"
+        assert any(str(occupied_port) in message for message in logs)
+    finally:
+        blocker.close()
+
+
+def test_shutdown_response_is_flushed_before_event(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    events = []
+
+    class _Writer(io.BytesIO):
+        def write(self, data):
+            events.append("write")
+            return super().write(data)
+
+        def flush(self):
+            events.append("flush")
+            return super().flush()
+
+    fake_bridge = types.SimpleNamespace(
+        auth_token=None,
+        dispatch=lambda _payload: {"ok": True, "result": {"accepted": True}},
+        request_shutdown=lambda: events.append("shutdown"),
+    )
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"id":"stop","op":"shutdown","params":{}}\n')
+    handler.wfile = _Writer()
+    handler.server = types.SimpleNamespace(bridge=fake_bridge)
+
+    handler.handle()
+
+    assert events == ["write", "flush", "shutdown"]
+
+
+def test_gui_bridge_rejects_shutdown(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="gui")
+
+    response = instance.dispatch({"op": "shutdown", "params": {}})
+
+    assert response["ok"] is False
+    assert "only available in headless mode" in response["error"]
+
+
 def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     bridge = _load_bridge(monkeypatch)
@@ -2604,5 +2826,17 @@ def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
         )
         assert allowed["ok"] is True
         assert allowed["result"]["transport"] == "tcp"
+
+        shutdown = _request(
+            {
+                "id": "shutdown",
+                "op": "shutdown",
+                "params": {},
+                "auth": instance.auth_token,
+            }
+        )
+        assert shutdown["ok"] is True
+        assert shutdown["result"]["accepted"] is True
+        assert instance.shutdown_event.wait(timeout=1)
     finally:
         instance.stop()

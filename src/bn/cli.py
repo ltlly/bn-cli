@@ -1181,14 +1181,14 @@ def _render_doctor_text(value: Any) -> str:
 
 
 def _sandbox_socket_hint(instance: Any, error: str) -> str | None:
-    if not os.environ.get("CODEX_SANDBOX") or getattr(instance, "transport", "unix") != "unix":
+    if not os.environ.get("CODEX_SANDBOX") or instance.transport != "unix":
         return None
     lowered = error.lower()
     if "operation not permitted" not in lowered and "permission denied" not in lowered:
         return None
     return (
         "Codex sandbox blocked the Binary Ninja bridge socket at "
-        f"{getattr(instance, 'endpoint', instance.socket_path)}. `bn` must run outside the Codex sandbox to reach the "
+        f"{instance.endpoint}. `bn` must run outside the Codex sandbox to reach the "
         "live Binary Ninja GUI bridge. Add `prefix_rule(pattern=[\"bn\"], decision=\"allow\")` "
         "to `~/.codex/rules/default.rules`, then restart Codex or reload rules."
     )
@@ -1356,8 +1356,8 @@ def _doctor(args: argparse.Namespace) -> int:
         loaded_build_id = ping.get("plugin_build_id") if isinstance(ping, dict) else None
         instance_info = {
             "pid": instance.pid,
-            "socket_path": getattr(instance, "endpoint", str(instance.socket_path)),
-            "transport": getattr(instance, "transport", "unix"),
+            "socket_path": instance.endpoint,
+            "transport": instance.transport,
             "plugin_version": instance.plugin_version,
             "plugin_build_id": loaded_build_id,
             "installed_plugin_build_id": install_build_id,
@@ -1543,8 +1543,8 @@ def _instance_summary(instance: BridgeInstance) -> dict[str, Any]:
     return {
         "mode": instance.mode,
         "pid": instance.pid,
-        "socket_path": getattr(instance, "endpoint", str(instance.socket_path)),
-        "transport": getattr(instance, "transport", "unix"),
+        "socket_path": instance.endpoint,
+        "transport": instance.transport,
         "registry_path": str(instance.registry_path),
         "plugin_version": instance.plugin_version,
         "started_at": instance.started_at,
@@ -1615,6 +1615,18 @@ def _wait_for_registry(mode: str, *, timeout: float) -> bool:
     return False
 
 
+def _wait_for_registry_absent(mode: str, *, timeout: float) -> bool:
+    import time
+
+    deadline = time.time() + timeout
+    registry = bridge_registry_path(mode)
+    while time.time() < deadline:
+        if not registry.exists():
+            return True
+        time.sleep(0.05)
+    return not registry.exists()
+
+
 def _daemon_start(args: argparse.Namespace) -> int:
     mode = args.mode or "headless"
     if mode == "gui":
@@ -1668,8 +1680,6 @@ def _daemon_start(args: argparse.Namespace) -> int:
 
 
 def _daemon_stop(args: argparse.Namespace) -> int:
-    import signal
-
     mode = _resolve_daemon_mode_for_action(args)
     instance = _find_instance(mode)
     if instance is None:
@@ -1679,15 +1689,33 @@ def _daemon_stop(args: argparse.Namespace) -> int:
             "Refusing to stop the GUI bridge from the CLI; quit Binary Ninja itself."
         )
     try:
-        os.kill(instance.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+        response = _send_request_to_instance(
+            instance,
+            "shutdown",
+            params={},
+            target=None,
+            timeout=5.0,
+            connect_retries=1,
+        )
+    except BridgeError as exc:
+        if "Unknown operation: shutdown" in str(exc):
+            raise BridgeError(
+                "The running daemon does not support graceful shutdown. "
+                "Upgrade/restart the bn bridge, then retry `bn daemon stop`."
+            ) from exc
+        raise
+
+    if not _wait_for_registry_absent(mode, timeout=10.0):
+        raise BridgeError(
+            f"Daemon mode `{mode}` accepted shutdown but did not exit within 10 seconds"
+        )
 
     _render_result(
         {
             "stopped": True,
             "mode": mode,
             "pid": instance.pid,
+            "shutdown": response.get("result"),
             "warning": "Any unsaved analysis on running targets has been discarded.",
         },
         fmt=args.format,

@@ -36,7 +36,7 @@ bn target list                # see loaded BinaryViews on the active daemon
 
 If `bn daemon list` shows both `gui` and `headless` running and no sticky mode is set, every command that needs a bridge will error with a hint. Run `bn daemon use <mode>` to pin one, or `bn daemon use --clear` to drop the pin.
 
-On Windows, the GUI bridge listens on authenticated loopback TCP at `127.0.0.1:26765` and headless uses `127.0.0.1:26766`. Keep using the `bn` CLI so it can read the authentication token from the daemon registry.
+On Windows, the GUI bridge defaults to authenticated loopback TCP at `127.0.0.1:26765` and headless defaults to `127.0.0.1:26766`. Change the GUI listener inside Binary Ninja with `BN Agent Bridge\Set GUI Port...`, or edit **GUI Listen Port** in Binary Ninja Settings and run `BN Agent Bridge\Restart Bridge`. Keep using the `bn` CLI so it can read the authentication token from the daemon registry. `bn daemon stop` requests an authenticated graceful shutdown; it does not force-kill the daemon.
 
 2. Pick a target:
 - If exactly one BinaryView is registered, target-scoped commands can omit `--target` entirely.

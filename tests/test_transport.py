@@ -14,6 +14,8 @@ import pytest
 from bn.paths import bridge_registry_path, bridge_tcp_port, current_daemon_mode_path
 from bn.transport import (
     BridgeError,
+    BridgeInstance,
+    _socket_args,
     choose_instance,
     list_instances,
     read_current_daemon_mode,
@@ -66,6 +68,38 @@ def test_bridge_tcp_ports_are_fixed_and_overridable(monkeypatch):
 
     monkeypatch.setenv("BN_BRIDGE_GUI_PORT", "30001")
     assert bridge_tcp_port("gui") == 30001
+
+
+def test_socket_args_rejects_non_loopback_tcp_endpoint(tmp_path):
+    instance = BridgeInstance(
+        pid=123,
+        socket_path=None,
+        registry_path=tmp_path / "gui.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.15.0",
+        started_at=None,
+        meta={},
+        transport="tcp",
+        host="0.0.0.0",
+        port=26765,
+        auth_token="secret",
+    )
+
+    with pytest.raises(OSError, match="Invalid TCP bridge endpoint"):
+        _socket_args(instance)
+
+
+def test_list_instances_purges_unix_registry_without_socket_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path("gui")
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps({"pid": os.getpid(), "transport": "unix", "mode": "gui"}),
+        encoding="utf-8",
+    )
+
+    assert list_instances() == []
+    assert not registry_path.exists()
 
 
 @requires_unix_sockets

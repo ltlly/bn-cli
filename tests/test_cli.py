@@ -1208,6 +1208,8 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
         {
             "pid": 123,
             "socket_path": tmp_path / "bridge.sock",
+            "endpoint": str(tmp_path / "bridge.sock"),
+            "transport": "unix",
             "plugin_version": "0.4.0",
             "started_at": "2026-03-09T00:00:00+00:00",
         },
@@ -1256,6 +1258,8 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
         {
             "pid": 123,
             "socket_path": tmp_path / "bridge.sock",
+            "endpoint": str(tmp_path / "bridge.sock"),
+            "transport": "unix",
             "plugin_version": bn.cli.VERSION,
             "started_at": "2026-03-09T00:00:00+00:00",
         },
@@ -1302,6 +1306,8 @@ def test_doctor_reports_codex_sandbox_socket_denial(monkeypatch, tmp_path, capsy
         {
             "pid": 123,
             "socket_path": tmp_path / "bridge.sock",
+            "endpoint": str(tmp_path / "bridge.sock"),
+            "transport": "unix",
             "plugin_version": bn.cli.VERSION,
             "started_at": "2026-03-09T00:00:00+00:00",
         },
@@ -2367,6 +2373,88 @@ def test_daemon_start_background_errors_when_registry_never_appears(monkeypatch,
     rc = bn.cli.main(["daemon", "start"])
     assert rc == 2
     assert "did not register" in capsys.readouterr().err
+
+
+def _fake_headless_instance(tmp_path):
+    registry = tmp_path / "daemons" / "headless.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text("{}", encoding="utf-8")
+    return bn.cli.BridgeInstance(
+        pid=4242,
+        socket_path=None,
+        registry_path=registry,
+        plugin_name="bn_agent_bridge",
+        plugin_version=bn.cli.VERSION,
+        started_at=None,
+        meta={},
+        mode="headless",
+        transport="tcp",
+        host="127.0.0.1",
+        port=26766,
+        auth_token="secret",
+    )
+
+
+def test_daemon_stop_requests_graceful_shutdown(monkeypatch, tmp_path, capsys):
+    instance = _fake_headless_instance(tmp_path)
+    captured = {}
+
+    def send(inst, op, **kwargs):
+        captured.update(instance=inst, op=op, kwargs=kwargs)
+        instance.registry_path.unlink()
+        return {
+            "ok": True,
+            "result": {"accepted": True, "mode": "headless", "pid": 4242},
+        }
+
+    monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", send)
+
+    rc = bn.cli.main(["daemon", "stop", "--mode", "headless"])
+
+    assert rc == 0
+    assert captured["instance"] is instance
+    assert captured["op"] == "shutdown"
+    assert captured["kwargs"]["timeout"] == 5.0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stopped"] is True
+    assert payload["shutdown"]["accepted"] is True
+
+
+def test_daemon_stop_explains_old_bridge_protocol(monkeypatch, tmp_path, capsys):
+    instance = _fake_headless_instance(tmp_path)
+    monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
+    monkeypatch.setattr(
+        bn.cli,
+        "_send_request_to_instance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            bn.cli.BridgeError("ValueError: Unknown operation: shutdown")
+        ),
+    )
+
+    rc = bn.cli.main(["daemon", "stop", "--mode", "headless"])
+
+    assert rc == 2
+    assert "does not support graceful shutdown" in capsys.readouterr().err
+
+
+def test_daemon_stop_errors_when_registry_does_not_disappear(monkeypatch, tmp_path, capsys):
+    instance = _fake_headless_instance(tmp_path)
+    monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
+    monkeypatch.setattr(
+        bn.cli,
+        "_send_request_to_instance",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "result": {"accepted": True, "mode": "headless", "pid": 4242},
+        },
+    )
+    monkeypatch.setattr(bn.cli, "_wait_for_registry_absent", lambda *_args, **_kwargs: False)
+
+    rc = bn.cli.main(["daemon", "stop", "--mode", "headless"])
+
+    assert rc == 2
+    assert "did not exit within 10 seconds" in capsys.readouterr().err
 
 
 # --- IL unavailable detection tests ---
