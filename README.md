@@ -97,6 +97,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 | `bn plugin` | Install the Binary Ninja companion plugin |
 | `bn skill` | Install the bundled skill into Codex and/or Claude Code |
 | `bn daemon` | Manage bn bridge daemons (start/stop/status/list/use) |
+| `bn job` | Inspect, retrieve, and cooperatively cancel background jobs |
 | `bn target` | Inspect/load/close/save Binary Ninja targets |
 | `bn refresh` | Refresh analysis for the selected target |
 
@@ -284,6 +285,23 @@ bn target close               # unload a target, free the BinaryView
 `--option KEY=VALUE` is repeatable; the value is JSON-parsed when possible (`true`/`false`/numbers/lists), otherwise treated as a string. `--options-json '{...}'` accepts an entire JSON object at once.
 
 With `--async`, `bn target load` returns immediately with `{queued: true, load_id, path}`. The actual load + analysis happen in a background thread on the daemon. Poll `bn target list` to see when the target shows up, `bn target status` to track analysis progress, and `bn target loads` to see per-attempt status and any failure messages.
+
+### Background Jobs and GUI Responsiveness
+
+Target-scoped bridge operations run on ordinary Python background threads, not Binary Ninja's UI thread. Short commands keep their existing synchronous output. By default the CLI waits for 30 seconds; if the operation is still running it exits with code `124` and prints a `job_id` while the bridge continues the work.
+
+```bash
+bn strings --target active --wait-timeout 10
+bn bundle function large_function --async
+bn decompile large_function --danger-always-wait
+
+bn job list
+bn job status <job_id>
+bn job result <job_id> --out /tmp/result.json
+bn job cancel <job_id>
+```
+
+Multiple reads on one target can run concurrently. A read/write or write/write conflict returns immediately with the blocking job id instead of silently waiting. Cancellation is cooperative: searches, enumerations and analysis waits check for cancellation, while arbitrary `py exec` and third-party plugin commands are not force-killed. `Ctrl+C` only stops the CLI from waiting and leaves the job available through `bn job`.
 
 ## Output Behavior
 

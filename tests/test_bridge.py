@@ -2840,3 +2840,205 @@ def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
         assert instance.shutdown_event.wait(timeout=1)
     finally:
         instance.stop()
+
+
+def test_binary_view_reads_do_not_marshal_to_ui_thread(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    instance.targets.register(bv)
+
+    def fail_main_thread(_func):
+        raise AssertionError("BinaryView work must not be marshalled to the UI thread")
+
+    monkeypatch.setattr(bridge, "execute_on_main_thread_and_wait", fail_main_thread)
+    assert instance._memory_read("active", "0x1000", 2) == {
+        "address": "0x1000",
+        "length": 2,
+        "data_hex": "9090",
+    }
+
+
+def test_job_manager_allows_reads_and_rejects_conflicting_write(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    instance.targets.register(bv)
+    release = threading.Event()
+    entered = threading.Event()
+    active = 0
+    peak = 0
+    state_lock = threading.Lock()
+
+    def execute(op, params, target):
+        nonlocal active, peak
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+            if active == 2:
+                entered.set()
+        release.wait(timeout=2)
+        with state_lock:
+            active -= 1
+        return {"op": op, "target": target}
+
+    monkeypatch.setattr(instance, "_execute_operation", execute)
+    first = instance.jobs.submit("list_functions", {}, "active")
+    second = instance.jobs.submit("strings", {}, "active")
+    assert entered.wait(timeout=1), "two reads on one target should overlap"
+
+    with pytest.raises(bridge.TargetBusyError) as exc_info:
+        instance.jobs.submit("rename_symbol", {}, "active")
+    message = str(exc_info.value)
+    assert first["job_id"] in message
+    assert second["job_id"] in message
+
+    status = instance.dispatch({"op": "job_status", "params": {"job_id": first["job_id"]}})
+    assert status["ok"] is True
+    assert status["result"]["state"] == "running"
+
+    release.set()
+    assert instance.jobs.get(first["job_id"]).done_event.wait(timeout=1)
+    assert instance.jobs.get(second["job_id"]).done_event.wait(timeout=1)
+    assert peak == 2
+
+
+def test_job_result_is_written_to_artifact_and_restored(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    monkeypatch.setattr(
+        instance,
+        "_execute_operation",
+        lambda op, params, target: {"items": [1, 2, 3], "target": target},
+    )
+
+    submitted = instance.dispatch(
+        {
+            "op": "job_submit",
+            "params": {"operation": "list_functions", "params": {}},
+            "target": "active",
+        }
+    )["result"]
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    outcome = instance.dispatch(
+        {"op": "job_result", "params": {"job_id": submitted["job_id"]}}
+    )["result"]
+    assert outcome["ready"] is True
+    assert outcome["result"]["items"] == [1, 2, 3]
+    assert Path(outcome["job"]["artifact_path"]).is_file()
+
+
+def test_job_cancel_is_cooperative_and_does_not_kill_thread(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    entered = threading.Event()
+
+    def cancellable(_op, _params, _target):
+        entered.set()
+        while True:
+            instance._check_job_cancelled()
+            time.sleep(0.005)
+
+    monkeypatch.setattr(instance, "_execute_operation", cancellable)
+    submitted = instance.jobs.submit("search_text", {}, "active")
+    assert entered.wait(timeout=1)
+    cancelled = instance.jobs.cancel(submitted["job_id"])
+    assert cancelled["accepted"] is True
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    assert record.state == "cancelled"
+
+
+def test_job_cancel_rejects_arbitrary_python(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    release = threading.Event()
+    monkeypatch.setattr(
+        instance,
+        "_execute_operation",
+        lambda _op, _params, _target: release.wait(timeout=1),
+    )
+    submitted = instance.jobs.submit("py_exec", {"script": "pass"}, "active")
+    result = instance.jobs.cancel(submitted["job_id"])
+    assert result["accepted"] is False
+    assert "not safely cancellable" in result["reason"]
+    release.set()
+
+
+def test_analysis_job_cancel_requests_binary_ninja_abort(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    aborted = threading.Event()
+    bv.abort_analysis = aborted.set
+    instance.targets.register(bv)
+    entered = threading.Event()
+
+    def analysis_wait(_op, _params, _target):
+        entered.set()
+        while not aborted.wait(timeout=0.01):
+            pass
+        instance._check_job_cancelled()
+
+    monkeypatch.setattr(instance, "_execute_operation", analysis_wait)
+    submitted = instance.jobs.submit("refresh", {}, "active")
+    assert entered.wait(timeout=1)
+    assert instance.jobs.cancel(submitted["job_id"])["accepted"] is True
+    assert aborted.wait(timeout=1)
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    assert record.state == "cancelled"
+
+
+def test_cancelled_mutation_reverts_undo_group(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    bv = _FakeFunctionCreationBV()
+    analysis_entered = threading.Event()
+    aborted = threading.Event()
+
+    def wait_for_analysis():
+        analysis_entered.set()
+        aborted.wait(timeout=1)
+
+    bv.update_analysis_and_wait = wait_for_analysis
+    bv.abort_analysis = aborted.set
+    instance.targets.register(bv)
+    submitted = instance.jobs.submit(
+        "create_function",
+        {"address": "0x401000", "preview": False},
+        "active",
+    )
+    assert analysis_entered.wait(timeout=1)
+    assert instance.jobs.cancel(submitted["job_id"])["accepted"] is True
+    record = instance.jobs.get(submitted["job_id"])
+    assert record.done_event.wait(timeout=1)
+    assert record.state == "cancelled"
+    assert bv.functions == []
+    assert ("revert", "state") in bv.events
+
+
+def test_completed_job_history_is_bounded(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.jobs._root = tmp_path / "jobs"
+    instance.targets.register(_FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x"))
+    monkeypatch.setattr(instance, "_execute_operation", lambda *_args: {"ok": True})
+
+    newest = None
+    for _ in range(bridge.COMPLETED_JOBS_LIMIT + 3):
+        newest = instance.jobs.submit("list_functions", {}, "active")
+        assert instance.jobs.get(newest["job_id"]).done_event.wait(timeout=1)
+    jobs = instance.jobs.list()
+    assert len(jobs) == bridge.COMPLETED_JOBS_LIMIT
+    assert jobs[0]["job_id"] == newest["job_id"]

@@ -15,6 +15,7 @@ import socket
 import socketserver
 import threading
 import traceback
+import uuid
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from .paths import (
     DEFAULT_BRIDGE_TCP_PORTS,
     PLUGIN_NAME,
     bridge_registry_path,
+    bridge_job_root,
     bridge_socket_path,
     bridge_tcp_port,
 )
@@ -107,6 +109,20 @@ class OperationFailure(RuntimeError):
         self.message = message
         self.requested = requested or {}
         self.observed = observed or {}
+
+
+class JobCancelled(RuntimeError):
+    pass
+
+
+class TargetBusyError(RuntimeError):
+    def __init__(self, blockers: list[dict[str, Any]]):
+        self.blockers = blockers
+        details = ", ".join(
+            f"job_id={item['job_id']} op={item['op']} state={item['state']}"
+            for item in blockers
+        )
+        super().__init__(f"Target busy: {details}")
 
 
 class _ReadWriteLock:
@@ -365,11 +381,37 @@ GLOBAL_OPS = {
 
 # Ops that maintain their own locking (no need to acquire bridge-level locks).
 NO_LOCK_OPS = {
+    "job_list",
+    "job_status",
+    "job_result",
+    "job_cancel",
+    "job_submit",
     "list_loads",
     "list_targets",
     "target_info",
+    "analysis_status",
+    "analysis_progress",
+    "analysis_abort",
     "doctor",
     "shutdown",
+}
+
+ANALYSIS_WAIT_OPS = {
+    "refresh",
+    "analysis_update_and_wait",
+    "function_force_analysis",
+    "create_function",
+    "rename_symbol",
+    "set_comment",
+    "delete_comment",
+    "set_prototype",
+    "local_rename",
+    "local_retype",
+    "struct_field_set",
+    "struct_field_rename",
+    "struct_field_delete",
+    "types_declare",
+    "batch_apply",
 }
 
 
@@ -633,6 +675,12 @@ class TargetManager:
         with self._lock:
             return self._ids_by_object.get(id(bv))
 
+    def target_id_for(self, bv) -> str | None:
+        with self._lock:
+            view_id = self._ids_by_object.get(id(bv))
+            record = self._records.get(view_id) if view_id is not None else None
+            return record.target_id() if record is not None else None
+
     def most_recent(self):
         with self._lock:
             for view_id in reversed(self._load_order):
@@ -825,6 +873,7 @@ class ThreadedTcpServer(_ThreadedServerMixin, socketserver.TCPServer):
 
 
 LOAD_ATTEMPTS_LIMIT = 50
+COMPLETED_JOBS_LIMIT = 50
 
 
 @dataclass(slots=True)
@@ -851,6 +900,273 @@ class LoadAttempt:
         }
 
 
+@dataclass(slots=True)
+class JobRecord:
+    job_id: str
+    op: str
+    params: dict[str, Any]
+    target: str | None
+    target_id: str
+    view_id: str
+    access: str
+    created_at: str
+    cancelable: bool
+    state: str = "queued"
+    started_at: str | None = None
+    completed_at: str | None = None
+    progress: str | None = None
+    error: str | None = None
+    traceback: str | None = None
+    artifact_path: str | None = None
+    cancel_event: threading.Event | None = None
+    done_event: threading.Event | None = None
+    bv: Any = None
+    background_task: Any = None
+
+    def __post_init__(self) -> None:
+        if self.cancel_event is None:
+            self.cancel_event = threading.Event()
+        if self.done_event is None:
+            self.done_event = threading.Event()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "op": self.op,
+            "target_id": self.target_id,
+            "access": self.access,
+            "state": self.state,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "progress": self.progress,
+            "cancelable": self.cancelable,
+            "error": self.error,
+            "artifact_path": self.artifact_path,
+        }
+
+
+class JobManager:
+    """Owns job lifecycle, target reservations, cancellation, and result artifacts."""
+
+    def __init__(self, bridge: "BinaryNinjaBridge"):
+        self._bridge = bridge
+        self._jobs: dict[str, JobRecord] = {}
+        self._lock = threading.RLock()
+        self._readers: dict[str, set[str]] = {}
+        self._writers: dict[str, str] = {}
+        self._root = bridge_job_root(bridge.mode)
+        self._stopping = False
+
+    def _blockers(self, view_id: str, access: str) -> list[JobRecord]:
+        ids: set[str] = set()
+        writer = self._writers.get(view_id)
+        if writer is not None:
+            ids.add(writer)
+        if access == "write":
+            ids.update(self._readers.get(view_id, set()))
+        return [self._jobs[job_id] for job_id in ids if job_id in self._jobs]
+
+    def _reserve(self, job: JobRecord) -> None:
+        blockers = self._blockers(job.view_id, job.access)
+        if blockers:
+            raise TargetBusyError([item.to_dict() for item in blockers])
+        if job.access == "write":
+            self._writers[job.view_id] = job.job_id
+        else:
+            self._readers.setdefault(job.view_id, set()).add(job.job_id)
+
+    def _release(self, job: JobRecord) -> None:
+        with self._lock:
+            if job.access == "write":
+                if self._writers.get(job.view_id) == job.job_id:
+                    self._writers.pop(job.view_id, None)
+            else:
+                readers = self._readers.get(job.view_id)
+                if readers is not None:
+                    readers.discard(job.job_id)
+                    if not readers:
+                        self._readers.pop(job.view_id, None)
+
+    def submit(self, op: str, params: dict[str, Any], target: str | None) -> dict[str, Any]:
+        if self._stopping:
+            raise RuntimeError("Bridge is shutting down and cannot accept new jobs")
+        if op not in READ_LOCKED_OPS and op not in WRITE_LOCKED_OPS:
+            raise RuntimeError(f"Operation is not job-capable: {op}")
+        with self._bridge._global_lock.read():
+            bv = self._bridge.targets.resolve(target)
+            view_id = self._bridge.targets.view_id_for(bv)
+            if view_id is None:
+                raise RuntimeError(f"Target not registered: {target!r}")
+            target_id = self._bridge.targets.target_id_for(bv)
+            if target_id is None:
+                raise RuntimeError(f"Target not registered: {target!r}")
+
+        job = JobRecord(
+            job_id=uuid.uuid4().hex[:12],
+            op=op,
+            params=dict(params),
+            target=target_id,
+            target_id=target_id,
+            view_id=view_id,
+            access="write" if op in WRITE_LOCKED_OPS else "read",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            cancelable=op not in {"py_exec", "plugin_execute", "plugin_valid_commands"},
+            bv=bv,
+        )
+        with self._lock:
+            self._jobs[job.job_id] = job
+            try:
+                self._reserve(job)
+            except Exception:
+                self._jobs.pop(job.job_id, None)
+                raise
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return job.to_dict()
+
+    def _artifact_for(self, job: JobRecord) -> Path:
+        return self._root / f"{job.job_id}.json"
+
+    def _write_result(self, job: JobRecord, result: Any) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        path = self._artifact_for(job)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(result, sort_keys=True, default=str), encoding="utf-8")
+        temporary.replace(path)
+        job.artifact_path = str(path)
+
+    def _run(self, job: JobRecord) -> None:
+        try:
+            task_type = getattr(bn, "BackgroundTask", None)
+            if self._bridge.mode == "gui" and task_type is not None:
+                with contextlib.suppress(Exception):
+                    job.background_task = task_type(
+                        f"bn job {job.job_id}: {job.op}",
+                        job.cancelable,
+                    )
+                    threading.Thread(
+                        target=self._monitor_background_task,
+                        args=(job,),
+                        daemon=True,
+                    ).start()
+            if job.cancel_event is not None and job.cancel_event.is_set():
+                raise JobCancelled("Cancelled before execution")
+            job.state = "running"
+            job.started_at = datetime.now(timezone.utc).isoformat()
+            job.progress = "running"
+            result = self._bridge._execute_job(job)
+            self._bridge._check_job_cancelled()
+            if self._stopping:
+                raise JobCancelled("Bridge stopped before the result was delivered")
+            self._write_result(job, result)
+            job.state = "succeeded"
+            job.progress = "completed"
+        except JobCancelled as exc:
+            job.state = "cancelled"
+            job.error = str(exc)
+            job.progress = "cancelled"
+        except Exception as exc:
+            job.state = "failed"
+            job.error = f"{type(exc).__name__}: {exc}"
+            job.traceback = traceback.format_exc()
+            job.progress = "failed"
+            bn.log_error(job.traceback)
+        finally:
+            job.completed_at = datetime.now(timezone.utc).isoformat()
+            if job.done_event is not None:
+                job.done_event.set()
+            if job.background_task is not None:
+                with contextlib.suppress(Exception):
+                    job.background_task.finish()
+            job.bv = None
+            self._release(job)
+            self._evict_completed()
+
+    def _monitor_background_task(self, job: JobRecord) -> None:
+        assert job.done_event is not None
+        while not job.done_event.wait(timeout=0.1):
+            try:
+                cancelled = bool(job.background_task.cancelled)
+            except Exception:
+                return
+            if cancelled:
+                self.cancel(job.job_id)
+                return
+
+    def _evict_completed(self) -> None:
+        terminal = {"cancelled", "succeeded", "failed"}
+        with self._lock:
+            completed = [job for job in self._jobs.values() if job.state in terminal]
+            completed.sort(key=lambda item: item.completed_at or item.created_at)
+            for job in completed[:-COMPLETED_JOBS_LIMIT]:
+                self._jobs.pop(job.job_id, None)
+                if job.artifact_path:
+                    with contextlib.suppress(OSError):
+                        Path(job.artifact_path).unlink()
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [job.to_dict() for job in reversed(list(self._jobs.values()))]
+
+    def get(self, job_id: str) -> JobRecord:
+        with self._lock:
+            job = self._jobs.get(job_id)
+        if job is None:
+            raise RuntimeError(f"Unknown or expired job: {job_id}")
+        return job
+
+    def status(self, job_id: str) -> dict[str, Any]:
+        return self.get(job_id).to_dict()
+
+    def result(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job.state not in {"succeeded", "failed", "cancelled"}:
+            return {"ready": False, "job": job.to_dict(), "result": None}
+        result = None
+        if job.state == "succeeded" and job.artifact_path:
+            result = json.loads(Path(job.artifact_path).read_text(encoding="utf-8"))
+        return {"ready": True, "job": job.to_dict(), "result": result}
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if not job.cancelable:
+            return {"accepted": False, "reason": "operation is not safely cancellable", "job": job.to_dict()}
+        if job.state in {"succeeded", "failed", "cancelled"}:
+            return {"accepted": False, "reason": "job already completed", "job": job.to_dict()}
+        job.state = "cancel_requested"
+        job.progress = "cancellation requested"
+        assert job.cancel_event is not None
+        job.cancel_event.set()
+        if job.background_task is not None:
+            with contextlib.suppress(Exception):
+                job.background_task.cancel()
+        if job.op in ANALYSIS_WAIT_OPS:
+            with contextlib.suppress(Exception):
+                job.bv.abort_analysis()
+        return {"accepted": True, "job": job.to_dict()}
+
+    def blockers_for(self, view_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            ids = set(self._readers.get(view_id, set()))
+            writer = self._writers.get(view_id)
+            if writer:
+                ids.add(writer)
+            return [self._jobs[item].to_dict() for item in ids if item in self._jobs]
+
+    def stop(self) -> None:
+        self._stopping = True
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            if job.cancelable and job.cancel_event is not None:
+                job.cancel_event.set()
+            if job.artifact_path:
+                with contextlib.suppress(OSError):
+                    Path(job.artifact_path).unlink()
+        with contextlib.suppress(OSError):
+            self._root.rmdir()
+
+
 class BinaryNinjaBridge:
     def __init__(self, mode: str = "gui"):
         self.mode = mode
@@ -870,6 +1186,8 @@ class BinaryNinjaBridge:
         self._load_attempts: list[LoadAttempt] = []
         self._load_attempts_lock = threading.Lock()
         self._load_lock = threading.Lock()
+        self._job_local = threading.local()
+        self.jobs = JobManager(self)
 
     def _get_target_lock(self, view_id: str) -> _ReadWriteLock:
         with self._target_locks_lock:
@@ -970,6 +1288,7 @@ class BinaryNinjaBridge:
         return str(self.socket_path)
 
     def stop(self):  # pragma: no cover - requires GUI runtime
+        self.jobs.stop()
         if self._server is not None:
             with contextlib.suppress(Exception):
                 self._server.shutdown()
@@ -1009,35 +1328,76 @@ class BinaryNinjaBridge:
         params = payload.get("params") or {}
         target = payload.get("target")
         try:
+            if op == "job_submit":
+                operation = str(params.get("operation", ""))
+                operation_params = params.get("params") or {}
+                if not isinstance(operation_params, dict):
+                    raise RuntimeError("job_submit params.params must be an object")
+                result = self.jobs.submit(operation, operation_params, target)
+                return _json_response(ok=True, result=result)
+            if op == "job_list":
+                return _json_response(ok=True, result=self.jobs.list())
+            if op == "job_status":
+                return _json_response(ok=True, result=self.jobs.status(str(params["job_id"])))
+            if op == "job_result":
+                return _json_response(ok=True, result=self.jobs.result(str(params["job_id"])))
+            if op == "job_cancel":
+                return _json_response(ok=True, result=self.jobs.cancel(str(params["job_id"])))
             if op in NO_LOCK_OPS:
-                result = self._dispatch_on_main(op, params, target)
+                result = self._execute_operation(op, params, target)
                 return _json_response(ok=True, result=result)
             if op in GLOBAL_OPS:
                 with self._global_lock.write():
-                    result = self._dispatch_on_main(op, params, target)
+                    result = self._execute_operation(op, params, target)
                 return _json_response(ok=True, result=result)
             if op in WRITE_LOCKED_OPS or op in READ_LOCKED_OPS:
-                # _global_lock.read protects target resolution + lock-dict lookup
-                # from racing with concurrent close_target (which holds .write).
-                with self._global_lock.read():
-                    bv = self.targets.resolve(target)
-                    view_id = self.targets.view_id_for(bv)
-                    if view_id is None:
-                        raise RuntimeError(f"Target not registered: {target!r}")
-                    target_lock = self._get_target_lock(view_id)
-                    lock_ctx = (
-                        target_lock.write() if op in WRITE_LOCKED_OPS else target_lock.read()
-                    )
-                    with lock_ctx:
-                        result = self._dispatch_on_main(op, params, target)
-                return _json_response(ok=True, result=result)
+                # Legacy direct requests use the same job module and wait forever.
+                # The CLI normally uses job_submit so it can return a job id on timeout.
+                job = self.jobs.submit(op, params, target)
+                record = self.jobs.get(job["job_id"])
+                assert record.done_event is not None
+                record.done_event.wait()
+                outcome = self.jobs.result(record.job_id)
+                if record.state != "succeeded":
+                    raise RuntimeError(record.error or f"Job {record.state}")
+                return _json_response(ok=True, result=outcome["result"])
             # Fallback for ops without a declared lock class.
-            result = self._dispatch_on_main(op, params, target)
+            result = self._execute_operation(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
 
-    def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
+    def _execute_job(self, job: JobRecord):
+        self._job_local.record = job
+        try:
+            with self._global_lock.read():
+                # Resolve the concrete target id again while close_target is excluded.
+                self.targets.resolve(job.target_id)
+                return self._execute_operation(job.op, job.params, job.target_id)
+        finally:
+            self._job_local.record = None
+
+    def _check_job_cancelled(self) -> None:
+        job = getattr(self._job_local, "record", None)
+        if job is not None:
+            ui_cancelled = False
+            if job.background_task is not None:
+                with contextlib.suppress(Exception):
+                    ui_cancelled = bool(job.background_task.cancelled)
+            if ui_cancelled and job.cancel_event is not None:
+                job.cancel_event.set()
+            if job.cancel_event is not None and job.cancel_event.is_set():
+                raise JobCancelled(f"Job {job.job_id} was cancelled")
+
+    def _set_job_progress(self, message: str) -> None:
+        job = getattr(self._job_local, "record", None)
+        if job is not None:
+            job.progress = message
+            if job.background_task is not None:
+                with contextlib.suppress(Exception):
+                    job.background_task.progress = message
+
+    def _execute_operation(self, op: str, params: dict[str, Any], target: str | None):
         if op == "shutdown":
             if self.mode != "headless":
                 raise RuntimeError("The shutdown operation is only available in headless mode")
@@ -2981,6 +3341,7 @@ class BinaryNinjaBridge:
         lower, upper = self._parse_function_address_bounds(min_address, max_address)
         functions = []
         for fn in list(bv.functions):
+            self._check_job_cancelled()
             address = int(fn.start)
             if lower is not None and address < lower:
                 continue
@@ -3031,6 +3392,7 @@ class BinaryNinjaBridge:
                 return needle in name.lower()
 
         for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address):
+            self._check_job_cancelled()
             if matches(fn.name):
                 items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
         return items
@@ -3231,6 +3593,7 @@ class BinaryNinjaBridge:
         items = []
         needle = str(query).lower() if query else None
         for name, type_obj in list(bv.types.items()):
+            self._check_job_cancelled()
             entry = self._type_entry(name, type_obj)
             if needle and needle not in entry["name"].lower() and needle not in entry["decl"].lower():
                 continue
@@ -3276,6 +3639,7 @@ class BinaryNinjaBridge:
         items = []
         needle = str(query).lower() if query else None
         for item in list(getattr(bv, "strings", [])):
+            self._check_job_cancelled()
             value = str(getattr(item, "value", ""))
             entry = {
                 "address": hex(int(getattr(item, "start", 0))),
@@ -3293,6 +3657,7 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         items = []
         for sym in list(bv.get_symbols_of_type(bn.SymbolType.ImportedFunctionSymbol)):
+            self._check_job_cancelled()
             items.append(
                 {
                     "name": sym.name,
@@ -3330,6 +3695,8 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
         decompile = self._function_text(bv, func, view="hlil")
+        self._check_job_cancelled()
+        self._set_job_progress("collecting IL and disassembly")
         bundle = {
             "target": self._target_info(selector),
             "function": {
@@ -4080,6 +4447,7 @@ class BinaryNinjaBridge:
 
         try:
             bv.update_analysis_and_wait()
+            self._check_job_cancelled()
             after_affected = {}
             for fn in affected:
                 address = int(fn.start)
@@ -4398,7 +4766,7 @@ class BinaryNinjaBridge:
     def _patch_status(self, selector, address_raw):
         bv = self._resolve_view(selector)
         addr = _parse_address(address_raw)
-        return _run_on_main_thread(lambda: {
+        return {
             "address": hex(addr),
             "can_assemble": bv.arch.can_assemble if bv.arch else False,
             "is_never_branch_patch_available": bv.is_never_branch_patch_available(addr),
@@ -4406,7 +4774,7 @@ class BinaryNinjaBridge:
             "is_invert_branch_patch_available": bv.is_invert_branch_patch_available(addr),
             "is_skip_and_return_zero_patch_available": bv.is_skip_and_return_zero_patch_available(addr),
             "is_skip_and_return_value_patch_available": bv.is_skip_and_return_value_patch_available(addr),
-        })
+        }
 
     def _patch_assemble(self, selector, address_raw, asm_text: str):
         bv = self._resolve_view(selector)
@@ -4417,7 +4785,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"Assembly failed at {hex(addr)}: {asm_text!r}")
             bv.write(addr, result)
             return {"address": hex(addr), "asm": asm_text, "bytes_hex": result.hex(), "length": len(result)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _patch_nop(self, selector, address_raw):
         bv = self._resolve_view(selector)
@@ -4426,7 +4794,7 @@ class BinaryNinjaBridge:
             if not bv.convert_to_nop(addr):
                 raise RuntimeError(f"convert_to_nop failed at {hex(addr)}")
             return {"address": hex(addr), "patched": True, "kind": "nop"}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _patch_always_branch(self, selector, address_raw):
         bv = self._resolve_view(selector)
@@ -4435,7 +4803,7 @@ class BinaryNinjaBridge:
             if not bv.always_branch(addr):
                 raise RuntimeError(f"always_branch failed at {hex(addr)}")
             return {"address": hex(addr), "patched": True, "kind": "always_branch"}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _patch_invert_branch(self, selector, address_raw):
         bv = self._resolve_view(selector)
@@ -4444,7 +4812,7 @@ class BinaryNinjaBridge:
             if not bv.invert_branch(addr):
                 raise RuntimeError(f"invert_branch failed at {hex(addr)}")
             return {"address": hex(addr), "patched": True, "kind": "invert_branch"}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _patch_never_branch(self, selector, address_raw):
         bv = self._resolve_view(selector)
@@ -4453,7 +4821,7 @@ class BinaryNinjaBridge:
             if not bv.never_branch(addr):
                 raise RuntimeError(f"never_branch failed at {hex(addr)}")
             return {"address": hex(addr), "patched": True, "kind": "never_branch"}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _patch_skip_and_return(self, selector, address_raw, value: int):
         bv = self._resolve_view(selector)
@@ -4462,7 +4830,7 @@ class BinaryNinjaBridge:
             if not bv.skip_and_return_value(addr, value):
                 raise RuntimeError(f"skip_and_return_value failed at {hex(addr)}")
             return {"address": hex(addr), "patched": True, "kind": "skip_and_return_value", "value": value}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Memory operations
@@ -4473,27 +4841,27 @@ class BinaryNinjaBridge:
         addr = _parse_address(address_raw)
         if length < 1 or length > 65536:
             raise RuntimeError(f"length must be 1..65536, got {length}")
-        data = _run_on_main_thread(lambda: bv.read(addr, length))
+        data = bv.read(addr, length)
         return {"address": hex(addr), "length": len(data), "data_hex": data.hex()}
 
     def _memory_write(self, selector, address_raw, data_hex: str):
         bv = self._resolve_view(selector)
         addr = _parse_address(address_raw)
         data = bytes.fromhex(data_hex)
-        written = _run_on_main_thread(lambda: bv.write(addr, data))
+        written = bv.write(addr, data)
         return {"address": hex(addr), "bytes_written": written, "data_hex": data_hex}
 
     def _memory_insert(self, selector, address_raw, data_hex: str):
         bv = self._resolve_view(selector)
         addr = _parse_address(address_raw)
         data = bytes.fromhex(data_hex)
-        result = _run_on_main_thread(lambda: bv.insert(addr, data))
+        result = bv.insert(addr, data)
         return {"address": hex(addr), "bytes_inserted": result, "data_hex": data_hex}
 
     def _memory_remove(self, selector, address_raw, length: int):
         bv = self._resolve_view(selector)
         addr = _parse_address(address_raw)
-        result = _run_on_main_thread(lambda: bv.remove(addr, length))
+        result = bv.remove(addr, length)
         return {"address": hex(addr), "bytes_removed": result, "length": length}
 
     def _memory_reader_read(self, selector, address_raw, width: int, *, endian: str = "little"):
@@ -4516,7 +4884,7 @@ class BinaryNinjaBridge:
             if val is None:
                 raise RuntimeError(f"BinaryReader failed to read {width} bytes at {hex(addr)}")
             return {"address": hex(addr), "width": width, "endian": endian, "value": val, "value_hex": hex(val)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _memory_writer_write(self, selector, address_raw, width: int, value: int, *, endian: str = "little"):
         bv = self._resolve_view(selector)
@@ -4536,7 +4904,7 @@ class BinaryNinjaBridge:
             else:
                 writer.write64(value)
             return {"address": hex(addr), "width": width, "endian": endian, "value": value, "written": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Value analysis operations
@@ -4561,7 +4929,7 @@ class BinaryNinjaBridge:
                             if token_text in [str(f) for f in fn.arch.flags]:
                                 flags_read.append(token_text)
             return {"function": hex(fn_addr), "address": hex(addr), "flags_read": flags_read, "flags_written": flags_written}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _value_possible(self, selector, function_start_raw, address_raw, *, level: str = "hlil", ssa: bool = False):
         bv = self._resolve_view(selector)
@@ -4591,7 +4959,7 @@ class BinaryNinjaBridge:
                             "value": str(pv),
                         }
             return {"function": hex(fn_addr), "address": hex(addr), "level": level, "ssa": ssa, "type": "not_found", "value": None}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _value_reg(self, selector, function_start_raw, address_raw, register: str, *, after: bool = False):
         bv = self._resolve_view(selector)
@@ -4613,7 +4981,7 @@ class BinaryNinjaBridge:
                 "type": str(val.type) if hasattr(val, "type") else str(type(val).__name__),
                 "value": val.value if hasattr(val, "value") else str(val),
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _value_stack(self, selector, function_start_raw, address_raw, stack_offset: int, size: int, *, after: bool = False):
         bv = self._resolve_view(selector)
@@ -4636,7 +5004,7 @@ class BinaryNinjaBridge:
                 "type": str(val.type) if hasattr(val, "type") else str(type(val).__name__),
                 "value": val.value if hasattr(val, "value") else str(val),
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Search operations
@@ -4652,13 +5020,14 @@ class BinaryNinjaBridge:
             results = []
             offset = s
             while offset < e and len(results) < max_results:
+                self._check_job_cancelled()
                 found = bv.find_next_data(offset, search_data)
                 if found is None or found >= e:
                     break
                 results.append(hex(found))
                 offset = found + 1
             return {"pattern": data_hex, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _search_constant(self, selector, constant: int, *, start, end, limit=None):
         bv = self._resolve_view(selector)
@@ -4669,13 +5038,14 @@ class BinaryNinjaBridge:
             results = []
             offset = s
             while offset < e and len(results) < max_results:
+                self._check_job_cancelled()
                 found = bv.find_next_constant(offset, constant)
                 if found is None or found >= e:
                     break
                 results.append(hex(found))
                 offset = found + 1
             return {"constant": constant, "constant_hex": hex(constant), "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _search_text(self, selector, query: str, *, start=None, end=None, regex: bool = False, limit=None):
         bv = self._resolve_view(selector)
@@ -4686,6 +5056,7 @@ class BinaryNinjaBridge:
             results = []
             offset = s
             while offset < e and len(results) < max_results:
+                self._check_job_cancelled()
                 if regex:
                     found = bv.find_next_text(offset, query, flags=bn.FindFlag.FindCaseSensitive)
                 else:
@@ -4695,7 +5066,7 @@ class BinaryNinjaBridge:
                 results.append(hex(found))
                 offset = found + 1
             return {"query": query, "regex": regex, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Architecture operations
@@ -4715,7 +5086,7 @@ class BinaryNinjaBridge:
                 "registers": list(arch.regs.keys()) if arch else [],
                 "platform": str(platform) if platform else None,
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _arch_assemble(self, selector, asm_text: str, *, address=None, arch_name=None):
         bv = self._resolve_view(selector)
@@ -4734,7 +5105,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"Assembly failed: {err}")
             encoded = result[0] if isinstance(result, tuple) else result
             return {"asm": asm_text, "address": hex(addr), "bytes_hex": encoded.hex(), "length": len(encoded)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _arch_disasm_bytes(self, selector, data_hex: str, *, address=None, arch_name=None):
         bv = self._resolve_view(selector)
@@ -4765,7 +5136,7 @@ class BinaryNinjaBridge:
                 })
                 offset += length
             return {"data_hex": data_hex, "address": hex(addr), "instructions": instructions, "count": len(instructions)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Segments / Sections / Data Variables
@@ -4787,7 +5158,7 @@ class BinaryNinjaBridge:
                 }
                 for seg in bv.segments
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _list_sections(self, selector):
         bv = self._resolve_view(selector)
@@ -4803,7 +5174,7 @@ class BinaryNinjaBridge:
                 }
                 for name, section in bv.sections.items()
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _list_data_vars(self, selector):
         bv = self._resolve_view(selector)
@@ -4816,7 +5187,7 @@ class BinaryNinjaBridge:
                 }
                 for addr, dv in bv.data_vars
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Disassembly extended (linear, range)
@@ -4832,6 +5203,7 @@ class BinaryNinjaBridge:
             cursor = bn.LinearViewCursor(lv)
             cursor.seek_to_address(addr)
             for _ in range(count):
+                self._check_job_cancelled()
                 cur_lines = cursor.lines
                 if not cur_lines:
                     break
@@ -4844,7 +5216,7 @@ class BinaryNinjaBridge:
                 if not cursor.next():
                     break
             return lines[:count]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _disasm_range(self, selector, start_raw, end_raw):
         bv = self._resolve_view(selector)
@@ -4857,6 +5229,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError("No architecture")
             offset = s
             while offset < e:
+                self._check_job_cancelled()
                 data = bv.read(offset, min(arch.max_instr_length, e - offset))
                 if not data:
                     break
@@ -4869,7 +5242,7 @@ class BinaryNinjaBridge:
                 lines.append({"address": hex(offset), "text": text, "length": length})
                 offset += length
             return lines
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Function extended operations
@@ -4906,7 +5279,7 @@ class BinaryNinjaBridge:
                 }
                 for bb in fn.basic_blocks
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_callers(self, selector, identifier):
         bv = self._resolve_view(selector)
@@ -4919,7 +5292,7 @@ class BinaryNinjaBridge:
                     "address": hex(ref.start),
                 })
             return callers
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_callees(self, selector, identifier):
         bv = self._resolve_view(selector)
@@ -4932,7 +5305,7 @@ class BinaryNinjaBridge:
                     "address": hex(ref.start) if hasattr(ref, "start") else None,
                 })
             return callees
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_force_analysis(self, selector, identifier):
         bv = self._resolve_view(selector)
@@ -4980,7 +5353,7 @@ class BinaryNinjaBridge:
                 if status:
                     result["il_status"] = status
             return result
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_ssa_var_def_use(self, selector, identifier, *, var_name: str, version: int, il_level: str = "mlil"):
         bv = self._resolve_view(selector)
@@ -5016,7 +5389,7 @@ class BinaryNinjaBridge:
                 "definition": {"index": definition.instr_index, "address": hex(definition.address)} if definition else None,
                 "uses": [{"index": u.instr_index, "address": hex(u.address)} for u in uses],
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_ssa_memory_def_use(self, selector, identifier, *, version: int, il_level: str = "mlil"):
         bv = self._resolve_view(selector)
@@ -5037,7 +5410,7 @@ class BinaryNinjaBridge:
                 "definition": {"index": definition.instr_index, "address": hex(definition.address)} if definition else None,
                 "uses": [{"index": u.instr_index, "address": hex(u.address)} for u in uses],
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_var_refs(self, selector, identifier, *, var_name: str, il_level: str = "hlil"):
         bv = self._resolve_view(selector)
@@ -5061,7 +5434,7 @@ class BinaryNinjaBridge:
                 }
                 for ref in refs
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_var_refs_from(self, selector, identifier, *, address, il_level: str = "hlil"):
         bv = self._resolve_view(selector)
@@ -5080,7 +5453,7 @@ class BinaryNinjaBridge:
                 }
                 for ref in refs
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_metadata_query(self, selector, identifier, key: str):
         bv = self._resolve_view(selector)
@@ -5090,7 +5463,7 @@ class BinaryNinjaBridge:
             if val is None:
                 return {"key": key, "found": False, "value": None}
             return {"key": key, "found": True, "value": val}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_metadata_store(self, selector, identifier, key: str, value):
         bv = self._resolve_view(selector)
@@ -5098,7 +5471,7 @@ class BinaryNinjaBridge:
         def _do():
             fn.store_user_metadata(key, value)
             return {"key": key, "stored": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _function_metadata_remove(self, selector, identifier, key: str):
         bv = self._resolve_view(selector)
@@ -5106,7 +5479,7 @@ class BinaryNinjaBridge:
         def _do():
             fn.remove_user_metadata(key)
             return {"key": key, "removed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Database operations
@@ -5124,7 +5497,7 @@ class BinaryNinjaBridge:
                 "snapshot_count": len(db.snapshots) if hasattr(db, "snapshots") else 0,
                 "current_snapshot": db.current_snapshot.id if hasattr(db, "current_snapshot") and db.current_snapshot else None,
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _database_read_global(self, selector, key: str):
         bv = self._resolve_view(selector)
@@ -5134,7 +5507,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError("No database (save as .bndb first)")
             val = db.read_global(key)
             return {"key": key, "value": val}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _database_write_global(self, selector, key: str, value: str):
         bv = self._resolve_view(selector)
@@ -5144,7 +5517,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError("No database (save as .bndb first)")
             db.write_global(key, value)
             return {"key": key, "written": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _database_snapshots(self, selector):
         bv = self._resolve_view(selector)
@@ -5160,21 +5533,21 @@ class BinaryNinjaBridge:
                 }
                 for s in db.snapshots
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _database_save_auto_snapshot(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.file.create_database(bv.file.filename)
             return {"saved": True, "path": bv.file.filename}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _database_create_bndb(self, selector, path: str):
         bv = self._resolve_view(selector)
         def _do():
             bv.create_database(path)
             return {"created": True, "path": path}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Type extended operations
@@ -5188,7 +5561,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"Type {old_name!r} not found")
             bv.rename_type(old_name, new_name)
             return {"old_name": old_name, "new_name": new_name, "renamed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_undefine_user(self, selector, name: str):
         bv = self._resolve_view(selector)
@@ -5198,7 +5571,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"Type {name!r} not found")
             bv.undefine_user_type(name)
             return {"name": name, "undefined": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_parse_string(self, selector, type_source: str):
         bv = self._resolve_view(selector)
@@ -5208,7 +5581,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"Failed to parse type string: {type_source!r}")
             parsed_type, name = result
             return {"source": type_source, "parsed": str(parsed_type), "name": str(name) if name else None}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_import_library_type(self, selector, name: str, *, lib_id=None):
         bv = self._resolve_view(selector)
@@ -5228,7 +5601,7 @@ class BinaryNinjaBridge:
                     bv.define_user_type(name, t)
                     return {"name": name, "imported": True, "library": lib.name}
             raise RuntimeError(f"Type {name!r} not found in any type library")
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_import_library_object(self, selector, name: str, *, lib_id=None):
         bv = self._resolve_view(selector)
@@ -5247,7 +5620,7 @@ class BinaryNinjaBridge:
                     bv.define_user_type(name, obj)
                     return {"name": name, "imported": True, "library": lib.name}
             raise RuntimeError(f"Object {name!r} not found in any type library")
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_export_to_library(self, selector, type_library_id: str, type_source: str, *, name=None):
         bv = self._resolve_view(selector)
@@ -5266,7 +5639,7 @@ class BinaryNinjaBridge:
             export_name = name or str(parsed_name)
             target_lib.add_named_type(export_name, parsed_type)
             return {"name": export_name, "exported": True, "library": target_lib.name}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_library_list(self, selector):
         bv = self._resolve_view(selector)
@@ -5279,7 +5652,7 @@ class BinaryNinjaBridge:
                 }
                 for lib in bv.type_libraries
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_library_get(self, selector, type_library_id: str):
         bv = self._resolve_view(selector)
@@ -5297,7 +5670,7 @@ class BinaryNinjaBridge:
                         "object_count": len(named_objects),
                     }
             raise RuntimeError(f"Type library {type_library_id!r} not found")
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_library_create(self, selector, name: str, *, path=None, add_to_view: bool = False):
         bv = self._resolve_view(selector)
@@ -5308,7 +5681,7 @@ class BinaryNinjaBridge:
             if add_to_view:
                 bv.add_type_library(lib)
             return {"name": lib.name, "created": True, "added_to_view": add_to_view}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_library_load(self, selector, path: str, *, add_to_view: bool = True):
         bv = self._resolve_view(selector)
@@ -5317,7 +5690,7 @@ class BinaryNinjaBridge:
             if add_to_view:
                 bv.add_type_library(lib)
             return {"name": lib.name, "loaded": True, "added_to_view": add_to_view}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_archive_list(self, selector):
         bv = self._resolve_view(selector)
@@ -5330,7 +5703,7 @@ class BinaryNinjaBridge:
                 }
                 for a in archives
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_archive_get(self, selector, type_archive_id: str):
         bv = self._resolve_view(selector)
@@ -5345,7 +5718,7 @@ class BinaryNinjaBridge:
                         "count": len(type_names),
                     }
             raise RuntimeError(f"Type archive {type_archive_id!r} not found")
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_archive_create(self, selector, path: str, *, attach: bool = False):
         bv = self._resolve_view(selector)
@@ -5354,7 +5727,7 @@ class BinaryNinjaBridge:
             if attach and hasattr(bv, "attach_type_archive"):
                 bv.attach_type_archive(archive)
             return {"created": True, "path": path, "attached": attach}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_archive_open(self, selector, path: str, *, attach: bool = False):
         bv = self._resolve_view(selector)
@@ -5363,7 +5736,7 @@ class BinaryNinjaBridge:
             if attach and hasattr(bv, "attach_type_archive"):
                 bv.attach_type_archive(archive)
             return {"opened": True, "path": path, "attached": attach}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_archive_pull(self, selector, type_archive_id: str, names: list):
         bv = self._resolve_view(selector)
@@ -5378,7 +5751,7 @@ class BinaryNinjaBridge:
                             pulled.append(name)
                     return {"pulled": pulled, "count": len(pulled)}
             raise RuntimeError(f"Type archive {type_archive_id!r} not found")
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _type_archive_push(self, selector, type_archive_id: str, names: list):
         bv = self._resolve_view(selector)
@@ -5393,7 +5766,7 @@ class BinaryNinjaBridge:
                             pushed.append(name)
                     return {"pushed": pushed, "count": len(pushed)}
             raise RuntimeError(f"Type archive {type_archive_id!r} not found")
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Annotation operations
@@ -5411,7 +5784,7 @@ class BinaryNinjaBridge:
             else:
                 bv.add_tag(addr, tag_type, data)
             return {"address": hex(addr), "tag_type": tag_type, "data": data, "added": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _annotation_get_tags(self, selector, address):
         bv = self._resolve_view(selector)
@@ -5426,7 +5799,7 @@ class BinaryNinjaBridge:
             for tag in addr_tags:
                 tags.append({"type": tag.type.name, "data": tag.data})
             return tags
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _annotation_define_data_var(self, selector, address, *, type_name=None, name=None, width=None):
         bv = self._resolve_view(selector)
@@ -5445,7 +5818,7 @@ class BinaryNinjaBridge:
                 sym = bn.Symbol(bn.SymbolType.DataSymbol, addr, name)
                 bv.define_user_symbol(sym)
             return {"address": hex(addr), "defined": True, "type": type_name, "name": name}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _annotation_undefine_data_var(self, selector, address):
         bv = self._resolve_view(selector)
@@ -5453,7 +5826,7 @@ class BinaryNinjaBridge:
         def _do():
             bv.undefine_user_data_var(addr)
             return {"address": hex(addr), "undefined": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _annotation_define_symbol(self, selector, address, name: str, *, symbol_type=None):
         bv = self._resolve_view(selector)
@@ -5471,7 +5844,7 @@ class BinaryNinjaBridge:
             sym = bn.Symbol(st, addr, name)
             bv.define_user_symbol(sym)
             return {"address": hex(addr), "name": name, "symbol_type": str(st), "defined": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _annotation_undefine_symbol(self, selector, address):
         bv = self._resolve_view(selector)
@@ -5482,7 +5855,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"No symbol at {hex(addr)}")
             bv.undefine_user_symbol(sym)
             return {"address": hex(addr), "undefined": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _annotation_rename_data_var(self, selector, address, new_name: str):
         bv = self._resolve_view(selector)
@@ -5494,7 +5867,7 @@ class BinaryNinjaBridge:
             new_sym = bn.Symbol(bn.SymbolType.DataSymbol, addr, new_name)
             bv.define_user_symbol(new_sym)
             return {"address": hex(addr), "new_name": new_name, "renamed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Undo operations
@@ -5505,35 +5878,35 @@ class BinaryNinjaBridge:
         def _do():
             bv.begin_undo_actions()
             return {"begun": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _undo_commit(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.commit_undo_actions()
             return {"committed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _undo_revert(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.revert_undo_actions()
             return {"reverted": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _undo_undo(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.undo()
             return {"undone": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _undo_redo(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.redo()
             return {"redone": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # UIDF (User IL Data Flow) operations
@@ -5572,7 +5945,7 @@ class BinaryNinjaBridge:
             else:
                 raise RuntimeError("set_user_var_value not available")
             return {"function": fn.name, "var": var_name, "value": value_raw, "set": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _uidf_clear(self, selector, params):
         bv = self._resolve_view(selector)
@@ -5599,7 +5972,7 @@ class BinaryNinjaBridge:
             else:
                 raise RuntimeError("clear_user_var_value not available")
             return {"function": fn.name, "var": var_name, "cleared": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _uidf_list(self, selector, function_start):
         bv = self._resolve_view(selector)
@@ -5617,7 +5990,7 @@ class BinaryNinjaBridge:
                     "info": str(val_info),
                 })
             return results
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _uidf_parse(self, selector, value: str, state: str):
         bv = self._resolve_view(selector)
@@ -5632,7 +6005,7 @@ class BinaryNinjaBridge:
             if rv_type is None:
                 return {"value": value, "state": state, "valid": False, "error": f"Unknown state: {state}"}
             return {"value": value, "state": state, "valid": True, "parsed_value": int(value, 0) if isinstance(value, str) else value}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Loader operations
@@ -5647,7 +6020,7 @@ class BinaryNinjaBridge:
             for key in keys:
                 result[key] = settings.get_string(key) if hasattr(settings, "get_string") else None
             return {"type_name": type_name, "settings": result}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _loader_settings_set(self, selector, type_name: str, key: str, value):
         bv = self._resolve_view(selector)
@@ -5660,13 +6033,13 @@ class BinaryNinjaBridge:
             else:
                 settings.set_string(key, str(value))
             return {"type_name": type_name, "key": key, "set": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _loader_settings_types(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             return {"view_type": bv.view_type, "available_view_types": [str(v) for v in bv.available_view_types] if hasattr(bv, "available_view_types") else []}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _loader_rebase(self, selector, address, *, force: bool = False):
         bv = self._resolve_view(selector)
@@ -5678,7 +6051,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError("BinaryView does not support rebase")
             bv.update_analysis_and_wait()
             return {"new_base": hex(addr), "rebased": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # External library/location operations
@@ -5691,7 +6064,7 @@ class BinaryNinjaBridge:
             if lib is None:
                 raise RuntimeError("add_external_library not available or failed")
             return {"name": name, "added": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _external_library_list(self, selector):
         bv = self._resolve_view(selector)
@@ -5704,7 +6077,7 @@ class BinaryNinjaBridge:
                 }
                 for lib in libs
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _external_library_remove(self, selector, name: str):
         bv = self._resolve_view(selector)
@@ -5714,7 +6087,7 @@ class BinaryNinjaBridge:
             else:
                 raise RuntimeError("remove_external_library not available")
             return {"name": name, "removed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _external_location_add(self, selector, params):
         bv = self._resolve_view(selector)
@@ -5734,7 +6107,7 @@ class BinaryNinjaBridge:
             else:
                 raise RuntimeError("add_external_location not available")
             return {"source_address": hex(source_addr), "added": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _external_location_get(self, selector, source_address):
         bv = self._resolve_view(selector)
@@ -5752,7 +6125,7 @@ class BinaryNinjaBridge:
                     "target_address": hex(loc.target_address) if hasattr(loc, "target_address") and loc.target_address else None,
                 }
             raise RuntimeError("get_external_location_at not available")
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _external_location_remove(self, selector, source_address):
         bv = self._resolve_view(selector)
@@ -5763,7 +6136,7 @@ class BinaryNinjaBridge:
             else:
                 raise RuntimeError("remove_external_location not available")
             return {"address": hex(addr), "removed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Analysis operations
@@ -5783,7 +6156,7 @@ class BinaryNinjaBridge:
                 "total": total,
                 "done": done,
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _analysis_progress(self, selector):
         bv = self._resolve_view(selector)
@@ -5799,14 +6172,14 @@ class BinaryNinjaBridge:
                 "total": total,
                 "done": done,
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _analysis_abort(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.abort_analysis()
             return {"aborted": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _analysis_set_hold(self, selector, hold: bool):
         bv = self._resolve_view(selector)
@@ -5814,21 +6187,21 @@ class BinaryNinjaBridge:
             if hold:
                 bv.abort_analysis()
             return {"hold": hold, "set": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _analysis_update(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.update_analysis()
             return {"update_requested": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _analysis_update_and_wait(self, selector):
         bv = self._resolve_view(selector)
         def _do():
             bv.update_analysis_and_wait()
             return {"updated": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Metadata (view-level) operations
@@ -5844,14 +6217,14 @@ class BinaryNinjaBridge:
             if val is None:
                 return {"key": key, "found": False, "value": None}
             return {"key": key, "found": True, "value": str(val)}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _metadata_store(self, selector, key: str, value):
         bv = self._resolve_view(selector)
         def _do():
             bv.store_metadata(key, value)
             return {"key": key, "stored": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _metadata_remove(self, selector, key: str):
         bv = self._resolve_view(selector)
@@ -5861,7 +6234,7 @@ class BinaryNinjaBridge:
             except KeyError:
                 return {"key": key, "removed": False, "error": "key not found"}
             return {"key": key, "removed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Data typed at address
@@ -5881,7 +6254,7 @@ class BinaryNinjaBridge:
                 "auto_discovered": dv.auto_discovered if hasattr(dv, "auto_discovered") else None,
                 "name": str(dv.name) if hasattr(dv, "name") else None,
             }
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Xref extended operations
@@ -5901,7 +6274,7 @@ class BinaryNinjaBridge:
                 }
                 for ref in refs
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _xref_code_refs_to(self, selector, address, *, limit: int = 100):
         bv = self._resolve_view(selector)
@@ -5915,7 +6288,7 @@ class BinaryNinjaBridge:
                 }
                 for ref in refs
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _xref_data_refs_from(self, selector, address, *, length=None):
         bv = self._resolve_view(selector)
@@ -5926,7 +6299,7 @@ class BinaryNinjaBridge:
             else:
                 refs = bv.get_data_refs_from(addr)
             return [{"address": hex(ref)} for ref in refs]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _xref_data_refs_to(self, selector, address, *, limit: int = 100):
         bv = self._resolve_view(selector)
@@ -5934,7 +6307,7 @@ class BinaryNinjaBridge:
         def _do():
             refs = list(bv.get_data_refs(addr))[:limit]
             return [{"address": hex(ref)} for ref in refs]
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # IL extended operations
@@ -5959,7 +6332,7 @@ class BinaryNinjaBridge:
                 if instr.address == addr:
                     return {"function": fn.name, "address": hex(addr), "index": i, "level": level}
             return {"function": fn.name, "address": hex(addr), "index": None, "level": level, "note": "no instruction at exact address"}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _il_index_to_address(self, selector, function_start, index: int, *, level: str = "hlil"):
         bv = self._resolve_view(selector)
@@ -5978,7 +6351,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"Index {index} out of range (0..{len(il)-1})")
             instr = il[index]
             return {"function": fn.name, "index": index, "address": hex(instr.address), "level": level}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _il_instruction_by_addr(self, selector, function_start, address, *, level: str = "hlil"):
         bv = self._resolve_view(selector)
@@ -6005,7 +6378,7 @@ class BinaryNinjaBridge:
                         "operation": str(instr.operation) if hasattr(instr, "operation") else None,
                     }
             raise RuntimeError(f"No {level} instruction at {hex(addr)} in {fn.name}")
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Section/Segment user operations
@@ -6019,14 +6392,14 @@ class BinaryNinjaBridge:
         def _do():
             bv.add_user_section(name, start, length)
             return {"name": name, "start": hex(start), "length": length, "added": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _section_remove_user(self, selector, name: str):
         bv = self._resolve_view(selector)
         def _do():
             bv.remove_user_section(name)
             return {"name": name, "removed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _segment_add_user(self, selector, params):
         bv = self._resolve_view(selector)
@@ -6038,7 +6411,7 @@ class BinaryNinjaBridge:
         def _do():
             bv.add_user_segment(start, length, data_offset, data_length, flags)
             return {"start": hex(start), "length": length, "added": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _segment_remove_user(self, selector, start, *, length=None):
         bv = self._resolve_view(selector)
@@ -6049,7 +6422,7 @@ class BinaryNinjaBridge:
             else:
                 bv.remove_user_segment(s, 0)
             return {"start": hex(s), "removed": True}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Debug info operations
@@ -6060,7 +6433,7 @@ class BinaryNinjaBridge:
         def _do():
             parsers = bn.DebugInfoParser.get_parsers_for_view(bv) if hasattr(bn, "DebugInfoParser") else []
             return [{"name": p.name if hasattr(p, "name") else str(p)} for p in parsers]
-        return _run_on_main_thread(_do)
+        return _do()
 
     def _debug_parse_and_apply(self, selector, *, parser_name=None, debug_path=None):
         bv = self._resolve_view(selector)
@@ -6081,7 +6454,7 @@ class BinaryNinjaBridge:
                 bv.update_analysis_and_wait()
                 return {"applied": True, "parser": parser_name}
             return {"applied": False, "reason": "no debug info or apply_debug_info unavailable"}
-        return _run_on_main_thread(_do)
+        return _do()
 
     # =========================================================================
     # Plugin command operations
@@ -6130,7 +6503,7 @@ class BinaryNinjaBridge:
                 }
                 for bb in bbs
             ]
-        return _run_on_main_thread(_do)
+        return _do()
 
 
 _bridge: BinaryNinjaBridge | None = None

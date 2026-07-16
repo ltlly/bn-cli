@@ -74,6 +74,27 @@ On Windows, the GUI bridge defaults to authenticated loopback TCP at `127.0.0.1:
 
 Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata. Use `--out <path>` when you want the full body at a known location, or pipe through `head` to grab just the first N lines.
 
+## Background Jobs
+
+Target-scoped operations run outside Binary Ninja's UI thread. The CLI waits for 30 seconds by default and preserves the normal command output if the job finishes. When it takes longer, the CLI exits `124`, prints a `job_id`, and leaves the operation running:
+
+```bash
+bn strings --target active --wait-timeout 10
+bn bundle function large_function --async
+bn decompile large_function --danger-always-wait
+
+bn job list
+bn job status <job_id>
+bn job result <job_id> --out /tmp/result.json
+bn job cancel <job_id>
+```
+
+- Prefer the default bounded wait for agent work. Treat exit `124` as "still running", not failure; poll `bn job status` and retrieve the terminal value with `bn job result`.
+- Use `--async` when you already expect a long operation. Use `--danger-always-wait` only when the caller intentionally accepts an unbounded wait.
+- Read jobs may overlap. If a write conflicts with active work on the same target, the bridge returns `TargetBusyError` immediately with the blocking job id.
+- Cancellation is cooperative. Never assume `job cancel` killed arbitrary Python or a third-party plugin callback; those jobs report `cancelable: false`.
+- `Ctrl+C` stops waiting but does not cancel the bridge job.
+
 ## Headless Daemon Workflow
 
 When you're driving `bn` from a container / CI / agent loop, you usually want headless mode. The daemon is started once (often as a container PID 1) and then receives per-task `bn target load` commands:
@@ -517,7 +538,7 @@ If any op fails verification, the entire batch is reverted.
 ## Full Command Quick-Reference
 
 ### Core
-`bn setup`, `bn doctor`, `bn plugin install`, `bn skill install`, `bn daemon {start,stop,status,list,use}`, `bn target {list,load,use,close,save,status,loads,info}`, `bn refresh`
+`bn setup`, `bn doctor`, `bn plugin install`, `bn skill install`, `bn daemon {start,stop,status,list,use}`, `bn job {list,status,result,cancel}`, `bn target {list,load,use,close,save,status,loads,info}`, `bn refresh`
 
 ### Read / Inspect
 `bn function {list,search,info}`, `bn decompile`, `bn il`, `bn disasm`, `bn disasm-linear`, `bn disasm-range`, `bn xrefs`, `bn xref-ext`, `bn callsites`, `bn types`, `bn strings`, `bn imports`, `bn segments`, `bn sections`, `bn data-vars`, `bn data-typed-at`, `bn binary-bbs-at`, `bn il-nav`, `bn proto get`, `bn local list`, `bn comment get`, `bn arch`, `bn search`, `bn value`, `bn memory read`, `bn workflow`, `bn api-docs`, `bn bundle function`

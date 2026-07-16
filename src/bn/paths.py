@@ -72,6 +72,10 @@ def bridge_socket_path(mode: str) -> Path:
     return cache_home() / f"{PLUGIN_NAME}.{_validate_mode(mode)}.sock"
 
 
+def bridge_job_root(mode: str) -> Path:
+    return cache_home() / "jobs" / _validate_mode(mode)
+
+
 def bridge_tcp_port(mode: str) -> int:
     mode = _validate_mode(mode)
     env_name = f"BN_BRIDGE_{mode.upper()}_PORT"

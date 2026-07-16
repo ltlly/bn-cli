@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +34,19 @@ from .transport import (
 from .version import VERSION, build_id_for_file
 
 FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
+DEFAULT_JOB_WAIT_TIMEOUT = 30.0
+DIRECT_CONTROL_OPS = {
+    "analysis_status",
+    "analysis_progress",
+    "analysis_abort",
+    "close_target",
+    "doctor",
+    "list_targets",
+    "target_info",
+    "shutdown",
+    "set_active_target",
+}
+_JOB_CAPABLE_SEND_REQUEST = send_request
 
 
 class _HelpFullAction(argparse.Action):
@@ -164,6 +178,25 @@ def _target_option(
         "required": required,
     }
     parser.add_argument("--target", **kwargs)
+    wait_group = parser.add_mutually_exclusive_group()
+    wait_group.add_argument(
+        "--async",
+        dest="async_job",
+        action="store_true",
+        help="Submit the operation and return its job id immediately",
+    )
+    wait_group.add_argument(
+        "--danger-always-wait",
+        action="store_true",
+        help="Wait indefinitely instead of returning a job id after the timeout",
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=DEFAULT_JOB_WAIT_TIMEOUT,
+        metavar="SECONDS",
+        help="Seconds to wait before returning a still-running job id (default: 30)",
+    )
 
 
 def _render_result(
@@ -304,6 +337,81 @@ def _mutation_exit_code(result: Any) -> int:
     return 0
 
 
+def _render_job_envelope(args: argparse.Namespace, job: dict[str, Any], *, timed_out: bool) -> None:
+    envelope = {
+        "completed": False,
+        "timed_out": timed_out,
+        "job_id": job.get("job_id"),
+        "op": job.get("op"),
+        "state": job.get("state"),
+        "target_id": job.get("target_id"),
+        "cancelable": job.get("cancelable"),
+    }
+    _render_result(
+        envelope,
+        fmt=args.format,
+        out_path=None,
+        stem="job-submit",
+        spill_label="job submission",
+        spill_context=envelope,
+    )
+
+
+def _job_backed_request(
+    args: argparse.Namespace,
+    op: str,
+    params: dict[str, Any],
+    target: str | None,
+) -> tuple[dict[str, Any] | None, int | None]:
+    timeout = float(getattr(args, "wait_timeout", DEFAULT_JOB_WAIT_TIMEOUT))
+    if timeout <= 0:
+        raise BridgeError("--wait-timeout must be greater than zero")
+    submitted = send_request(
+        "job_submit",
+        params={"operation": op, "params": params},
+        target=target,
+    )["result"]
+    if not isinstance(submitted, dict) or not submitted.get("job_id"):
+        raise BridgeError("Binary Ninja bridge returned a malformed job submission")
+    job_id = str(submitted["job_id"])
+    if getattr(args, "async_job", False):
+        _render_job_envelope(args, submitted, timed_out=False)
+        return None, 0
+
+    deadline = None if getattr(args, "danger_always_wait", False) else time.monotonic() + timeout
+    latest = submitted
+    try:
+        while True:
+            status_response = send_request("job_status", params={"job_id": job_id}, target=None)
+            latest = status_response["result"]
+            state = latest.get("state") if isinstance(latest, dict) else None
+            if state in {"succeeded", "failed", "cancelled"}:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                _render_job_envelope(args, latest, timed_out=True)
+                print(
+                    f"Job {job_id} is still running. Use `bn job status {job_id}` and "
+                    f"`bn job result {job_id}` to continue.",
+                    file=sys.stderr,
+                )
+                return None, 124
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print(
+            f"\nStopped waiting; job {job_id} is still managed by the bridge. "
+            f"Use `bn job status {job_id}` or `bn job cancel {job_id}`.",
+            file=sys.stderr,
+        )
+        return None, 130
+
+    if state != "succeeded":
+        raise BridgeError(str(latest.get("error") or f"Job {job_id} {state}"))
+    outcome = send_request("job_result", params={"job_id": job_id}, target=None)["result"]
+    if not isinstance(outcome, dict) or not outcome.get("ready"):
+        raise BridgeError(f"Job {job_id} completed without an available result")
+    return {"ok": True, "result": outcome.get("result"), "error": None}, None
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -330,11 +438,24 @@ def _call(
         require_target=require_target,
         allow_implicit_target=allow_implicit_target,
     )
-    response = send_request(
-        op,
-        params=request_params,
-        target=target,
+    # Alternate transport adapters used by embedders may only implement the
+    # legacy direct-operation interface. The built-in adapter supports jobs.
+    job_enabled = (
+        hasattr(args, "async_job")
+        and op not in DIRECT_CONTROL_OPS
+        and send_request is _JOB_CAPABLE_SEND_REQUEST
     )
+    if job_enabled:
+        response, early_exit = _job_backed_request(args, op, request_params, target)
+        if early_exit is not None:
+            return early_exit
+        assert response is not None
+    else:
+        response = send_request(
+            op,
+            params=request_params,
+            target=target,
+        )
     result = response["result"]
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
     if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
@@ -3804,6 +3925,41 @@ def _binary_basic_blocks_at(args: argparse.Namespace) -> int:
     return _call(args, "binary_basic_blocks_at", {"address": args.address}, require_target=True, allow_implicit_target=True, text_renderer=_render_binary_bbs_at_text, stem="binary-bbs-at")
 
 
+def _job_list(args: argparse.Namespace) -> int:
+    jobs = send_request("job_list", params={}, target=None)["result"]
+    if args.state:
+        jobs = [job for job in jobs if job.get("state") == args.state]
+    _render_result(jobs, fmt=args.format, out_path=args.out, stem="job-list")
+    return 0
+
+
+def _job_status(args: argparse.Namespace) -> int:
+    result = send_request("job_status", params={"job_id": args.job_id}, target=None)["result"]
+    _render_result(result, fmt=args.format, out_path=args.out, stem="job-status")
+    return 0
+
+
+def _job_result(args: argparse.Namespace) -> int:
+    outcome = send_request("job_result", params={"job_id": args.job_id}, target=None)["result"]
+    if not outcome.get("ready"):
+        _render_result(outcome, fmt=args.format, out_path=args.out, stem="job-result")
+        print(f"Job {args.job_id} has not completed yet.", file=sys.stderr)
+        return 124
+    job = outcome.get("job") or {}
+    if job.get("state") != "succeeded":
+        _render_result(outcome, fmt=args.format, out_path=args.out, stem="job-result")
+        return 2
+    result = outcome.get("result")
+    _render_result(result, fmt=args.format, out_path=args.out, stem=f"job-{args.job_id}")
+    return _mutation_exit_code(result)
+
+
+def _job_cancel(args: argparse.Namespace) -> int:
+    result = send_request("job_cancel", params={"job_id": args.job_id}, target=None)["result"]
+    _render_result(result, fmt=args.format, out_path=args.out, stem="job-cancel")
+    return 0 if result.get("accepted") else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
@@ -3821,6 +3977,31 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Validate bridge discovery and installation")
     _common_io_options(doctor)
     doctor.set_defaults(handler=_doctor)
+
+    job = subparsers.add_parser("job", help="Inspect and control bridge background jobs")
+    job_sub = job.add_subparsers(dest="job_command")
+    job_list = job_sub.add_parser("list", help="List recent and running jobs")
+    _common_io_options(job_list)
+    job_list.add_argument(
+        "--state",
+        choices=("queued", "running", "cancel_requested", "cancelled", "succeeded", "failed"),
+    )
+    job_list.set_defaults(handler=_job_list)
+
+    job_status = job_sub.add_parser("status", help="Show one job's status")
+    _common_io_options(job_status)
+    job_status.add_argument("job_id")
+    job_status.set_defaults(handler=_job_status)
+
+    job_result = job_sub.add_parser("result", help="Read a completed job's result")
+    _common_io_options(job_result, default_format="json")
+    job_result.add_argument("job_id")
+    job_result.set_defaults(handler=_job_result)
+
+    job_cancel = job_sub.add_parser("cancel", help="Request cooperative job cancellation")
+    _common_io_options(job_cancel, default_format="json")
+    job_cancel.add_argument("job_id")
+    job_cancel.set_defaults(handler=_job_cancel)
 
     plugin = subparsers.add_parser("plugin", help="Install the Binary Ninja companion plugin")
     plugin_sub = plugin.add_subparsers(dest="plugin_command")
