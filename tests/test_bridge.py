@@ -2625,9 +2625,17 @@ class _FakePluginSettings:
     def get_integer(self, key):
         return self.values.get(key, self.schemas[key]["default"])
 
+    def get_string(self, key):
+        return self.values.get(key, self.schemas[key]["default"])
+
     def set_integer(self, key, value, **kwargs):
         self.values[key] = int(value)
         self.set_calls.append((key, int(value), kwargs))
+        return True
+
+    def set_string(self, key, value, **kwargs):
+        self.values[key] = str(value)
+        self.set_calls.append((key, str(value), kwargs))
         return True
 
 
@@ -2640,13 +2648,46 @@ def test_gui_port_setting_is_registered_and_used(monkeypatch):
 
     bridge._register_gui_settings()
 
-    schema = settings.schemas[bridge.GUI_PORT_SETTING]
+    transport_schema = settings.schemas[bridge.GUI_TRANSPORT_SETTING]
+    port_schema = settings.schemas[bridge.GUI_PORT_SETTING]
     assert settings.groups[bridge.SETTINGS_GROUP] == "BN Agent Bridge"
-    assert schema["default"] == 26765
-    assert schema["minValue"] == 1
-    assert schema["maxValue"] == 65535
+    assert transport_schema["default"] == "pipe"
+    assert transport_schema["enum"] == ["pipe", "tcp"]
+    assert transport_schema["enumDescriptions"] == ["Named Pipe", "Loopback TCP"]
+    assert transport_schema["requiresRestart"] is True
+    assert port_schema["default"] == 26765
+    assert port_schema["minValue"] == 1
+    assert port_schema["maxValue"] == 65535
+    assert port_schema["requiresRestart"] is True
     settings.values[bridge.GUI_PORT_SETTING] = 28000
     assert bridge._configured_tcp_port("gui") == 28000
+
+
+def test_gui_transport_setting_is_used_in_auto_mode(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    monkeypatch.delenv("BN_BRIDGE_TRANSPORT", raising=False)
+    monkeypatch.setattr(bridge, "ui", object())
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(bridge.os, "name", "nt")
+    bridge._register_gui_settings()
+
+    settings.values[bridge.GUI_TRANSPORT_SETTING] = "tcp"
+
+    assert bridge._configured_transport("gui") == "tcp"
+    assert bridge._configured_transport("headless") == bridge.bridge_transport()
+
+
+def test_explicit_transport_environment_overrides_gui_setting(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    monkeypatch.setenv("BN_BRIDGE_TRANSPORT", "pipe")
+    monkeypatch.setattr(bridge, "ui", object())
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    bridge._register_gui_settings()
+    settings.values[bridge.GUI_TRANSPORT_SETTING] = "tcp"
+
+    assert bridge._configured_transport("gui") == "pipe"
 
 
 def test_set_gui_port_command_saves_and_restarts(monkeypatch):
@@ -2664,7 +2705,12 @@ def test_set_gui_port_command_saves_and_restarts(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(bridge.bn, "get_int_input", lambda *_args: 28000, raising=False)
-    monkeypatch.setattr(bridge, "_restart_gui_bridge", lambda previous: (restarted, False))
+    monkeypatch.setattr(bridge, "_configured_transport", lambda _mode: "tcp")
+    monkeypatch.setattr(
+        bridge,
+        "_restart_gui_bridge",
+        lambda previous_transport, previous_port: (restarted, False),
+    )
     monkeypatch.setattr(bridge, "_show_gui_message", messages.append)
 
     bridge._set_gui_port_command(None)
@@ -2708,16 +2754,65 @@ def test_restart_gui_bridge_restores_previous_port_on_bind_failure(monkeypatch):
     stopped = []
     restored_ports = []
     monkeypatch.setattr(bridge, "_configured_tcp_port", lambda _mode: 28000)
+    monkeypatch.setattr(bridge, "_configured_transport", lambda _mode: "tcp")
     monkeypatch.setattr(bridge, "_stop_bridge", lambda: stopped.append(True))
     monkeypatch.setattr(bridge, "start_bridge", lambda mode: next(starts))
-    monkeypatch.setattr(bridge, "_set_gui_port_setting", restored_ports.append)
+    def restore_port(value):
+        restored_ports.append(value)
+        return True
 
-    result, did_restore = bridge._restart_gui_bridge(26765)
+    monkeypatch.setattr(bridge, "_set_gui_port_setting", restore_port)
+
+    result, did_restore = bridge._restart_gui_bridge("tcp", 26765)
 
     assert stopped == [True]
     assert restored_ports == [26765]
     assert result is restored
     assert did_restore is True
+
+
+def test_restart_gui_bridge_restores_previous_transport_on_failure(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    restored = types.SimpleNamespace(endpoint="pipe://\\\\.\\pipe\\bn-agent-bridge-gui")
+    starts = iter([None, restored])
+    restored_transports = []
+    monkeypatch.setattr(bridge, "_configured_transport", lambda _mode: "tcp")
+    monkeypatch.setattr(bridge, "_stop_bridge", lambda: None)
+    monkeypatch.setattr(bridge, "start_bridge", lambda mode: next(starts))
+    def restore_transport(value):
+        restored_transports.append(value)
+        return True
+
+    monkeypatch.setattr(bridge, "_set_gui_transport_setting", restore_transport)
+
+    result, did_restore = bridge._restart_gui_bridge("pipe", None)
+
+    assert restored_transports == ["pipe"]
+    assert result is restored
+    assert did_restore is True
+
+
+def test_set_gui_port_command_only_saves_while_pipe_is_selected(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    settings = _FakePluginSettings()
+    settings.schemas[bridge.GUI_PORT_SETTING] = {"default": 26765}
+    messages = []
+    monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
+    monkeypatch.setattr(bridge.bn, "get_int_input", lambda *_args: 28000, raising=False)
+    monkeypatch.setattr(bridge, "_configured_transport", lambda _mode: "pipe")
+    monkeypatch.setattr(
+        bridge,
+        "_restart_gui_bridge",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not restart")),
+    )
+    monkeypatch.setattr(bridge, "_show_gui_message", messages.append)
+    bridge._bridge = types.SimpleNamespace(port=None, transport="pipe")
+
+    bridge._set_gui_port_command(None)
+
+    assert settings.values[bridge.GUI_PORT_SETTING] == 28000
+    assert messages == ["Port 28000 saved for Loopback TCP mode."]
+    bridge._bridge = None
 
 
 def test_tcp_port_conflict_fails_without_overwriting_registry(monkeypatch, tmp_path):

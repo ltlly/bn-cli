@@ -56,9 +56,11 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 ### Transport selection
 
-`BN_BRIDGE_TRANSPORT=auto|pipe|tcp|unix` controls the bridge transport. `auto` is the default: Windows selects `pipe`, while Unix selects `unix`. Unsupported platform combinations fail explicitly and never fall back silently.
+On Windows, choose **Named Pipe** or **Loopback TCP** with **GUI Transport** under the **BN Agent Bridge** group in Binary Ninja Settings. **GUI Listen Port** configures the TCP port. Run `BN Agent Bridge\Restart Bridge` after changing either setting. If the new transport or port cannot start, the plugin restores the previous working configuration.
 
-For temporary Windows compatibility, set `BN_BRIDGE_TRANSPORT=tcp` before starting Binary Ninja or the headless daemon. TCP remains restricted to `127.0.0.1`, requires the registry authentication token, and uses `BN_BRIDGE_GUI_PORT` / `BN_BRIDGE_HEADLESS_PORT` or the GUI **Listen Port** setting. CLI and plugin should be upgraded together because older CLIs do not understand Pipe registry entries.
+`BN_BRIDGE_TRANSPORT=auto|pipe|tcp|unix` also controls the bridge transport. `auto` is the default: the Windows GUI reads **GUI Transport**, Windows headless selects `pipe`, and Unix selects `unix`. An explicit environment value overrides the GUI setting. Unsupported platform combinations fail explicitly and never fall back silently.
+
+For Windows automation or headless compatibility, set `BN_BRIDGE_TRANSPORT=tcp` before starting Binary Ninja or the headless daemon. TCP remains restricted to `127.0.0.1`, requires the registry authentication token, and uses `BN_BRIDGE_GUI_PORT` / `BN_BRIDGE_HEADLESS_PORT` or the GUI **Listen Port** setting. CLI and plugin should be upgraded together because older CLIs do not understand Pipe registry entries.
 
 ## Quick Start
 

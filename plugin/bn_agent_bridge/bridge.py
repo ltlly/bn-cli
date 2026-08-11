@@ -47,7 +47,9 @@ except Exception:  # pragma: no cover - headless raises UIPluginInHeadlessError;
 
 PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
 SETTINGS_GROUP = "bnAgentBridge"
+GUI_TRANSPORT_SETTING = f"{SETTINGS_GROUP}.guiTransport"
 GUI_PORT_SETTING = f"{SETTINGS_GROUP}.guiPort"
+GUI_TRANSPORTS = ("pipe", "tcp")
 
 
 def _default_tcp_port(mode: str) -> int:
@@ -65,6 +67,24 @@ def _register_gui_settings() -> None:
     settings = bn.Settings()
     settings.register_group(SETTINGS_GROUP, "BN Agent Bridge")
     settings.register_setting(
+        GUI_TRANSPORT_SETTING,
+        json.dumps(
+            {
+                "title": "GUI Transport",
+                "type": "string",
+                "default": "pipe",
+                "enum": list(GUI_TRANSPORTS),
+                "enumDescriptions": ["Named Pipe", "Loopback TCP"],
+                "description": (
+                    "Local transport used by the GUI bridge on Windows. Explicit "
+                    "BN_BRIDGE_TRANSPORT values override this setting."
+                ),
+                "requiresRestart": True,
+                "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
+            }
+        ),
+    )
+    settings.register_setting(
         GUI_PORT_SETTING,
         json.dumps(
             {
@@ -74,12 +94,36 @@ def _register_gui_settings() -> None:
                 "minValue": 1,
                 "maxValue": 65535,
                 "description": (
-                    "Authenticated loopback TCP port used by the bn CLI. "
+                    "Authenticated loopback TCP port used when GUI Transport is Loopback TCP. "
                     "Run 'BN Agent Bridge > Restart Bridge' after changing it."
                 ),
+                "requiresRestart": True,
+                "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
             }
         ),
     )
+
+
+def _configured_transport(mode: str) -> str:
+    selected = bridge_transport()
+    env_value = os.environ.get("BN_BRIDGE_TRANSPORT", "auto").strip().lower()
+    if (
+        mode != "gui"
+        or os.name != "nt"
+        or env_value != "auto"
+        or ui is None
+        or not hasattr(bn, "Settings")
+    ):
+        return selected
+
+    configured = str(bn.Settings().get_string(GUI_TRANSPORT_SETTING)).strip().lower()
+    if configured in GUI_TRANSPORTS:
+        return configured
+    bn.log_error(
+        f"BN Agent Bridge setting {GUI_TRANSPORT_SETTING} is invalid ({configured!r}); "
+        f"using {selected}"
+    )
+    return selected
 
 
 def _configured_tcp_port(mode: str) -> int:
@@ -1275,7 +1319,7 @@ class BinaryNinjaBridge:
         self.targets = TargetManager(mode=mode)
         self.socket_path = bridge_socket_path(mode)
         self.registry_path = bridge_registry_path(mode)
-        self.transport = bridge_transport()
+        self.transport = _configured_transport(mode)
         self.host: str | None = None
         self.port: int | None = None
         self.pipe_name: str | None = None
@@ -6658,48 +6702,67 @@ def _set_gui_port_setting(port: int) -> bool:
     return bool(settings.set_integer(GUI_PORT_SETTING, port, scope=scope))
 
 
-def _restart_gui_bridge(previous_port: int | None) -> tuple[BinaryNinjaBridge | None, bool]:
+def _set_gui_transport_setting(transport: str) -> bool:
+    if transport not in GUI_TRANSPORTS:
+        raise ValueError(f"Unsupported GUI transport: {transport!r}")
+    settings = bn.Settings()
+    scope = getattr(getattr(bn, "SettingsScope", None), "SettingsUserScope", None)
+    if scope is None:
+        return bool(settings.set_string(GUI_TRANSPORT_SETTING, transport))
+    return bool(settings.set_string(GUI_TRANSPORT_SETTING, transport, scope=scope))
+
+
+def _restart_gui_bridge(
+    previous_transport: str | None,
+    previous_port: int | None,
+) -> tuple[BinaryNinjaBridge | None, bool]:
+    desired_transport = _configured_transport("gui")
     desired_port = _configured_tcp_port("gui")
     _stop_bridge()
     restarted = start_bridge(mode="gui")
     if restarted is not None:
         return restarted, False
 
-    if previous_port is None or previous_port == desired_port:
+    restored_setting = False
+    if previous_transport is not None and previous_transport != desired_transport:
+        restored_setting = _set_gui_transport_setting(previous_transport)
+    elif (
+        desired_transport == "tcp"
+        and previous_port is not None
+        and previous_port != desired_port
+    ):
+        restored_setting = _set_gui_port_setting(previous_port)
+
+    if not restored_setting:
         return None, False
 
-    _set_gui_port_setting(previous_port)
     restored = start_bridge(mode="gui")
     return restored, restored is not None
 
 
 def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
     try:
-        selected_transport = bridge_transport()
+        selected_transport = _configured_transport("gui")
     except ValueError as exc:
         _show_gui_message(f"Transport configuration is invalid: {exc}")
         return
-    if selected_transport != "tcp":
-        _stop_bridge()
-        restarted = start_bridge(mode="gui")
-        if restarted is not None:
-            _show_gui_message(f"Bridge is listening on {restarted.endpoint}.")
-        else:
-            _show_gui_message("Could not restart the bridge. See the Binary Ninja log for details.")
-        return
-
-    previous_port = _bridge.port if _bridge is not None and _bridge.transport == "tcp" else None
-    desired_port = _configured_tcp_port("gui")
-    restarted, restored = _restart_gui_bridge(previous_port)
+    previous_transport = _bridge.transport if _bridge is not None else None
+    previous_port = (
+        int(_bridge.port)
+        if _bridge is not None and _bridge.transport == "tcp" and _bridge.port is not None
+        else None
+    )
+    restarted, restored = _restart_gui_bridge(previous_transport, previous_port)
     if restarted is not None and not restored:
         _show_gui_message(f"Bridge is listening on {restarted.endpoint}.")
     elif restored:
         _show_gui_message(
-            f"Could not listen on port {desired_port}; restored the bridge on {restarted.endpoint}."
+            f"Could not start {selected_transport}; restored the bridge on {restarted.endpoint}."
         )
     else:
         _show_gui_message(
-            f"Could not start the bridge on port {desired_port}. See the Binary Ninja log for details."
+            f"Could not start the bridge with {selected_transport}. "
+            "See the Binary Ninja log for details."
         )
 
 
@@ -6727,7 +6790,13 @@ def _set_gui_port_command(_):  # pragma: no cover - GUI runtime
         _show_gui_message("Binary Ninja could not save the GUI port setting.")
         return
 
-    restarted, restored = _restart_gui_bridge(previous_port)
+    selected_transport = _configured_transport("gui")
+    if selected_transport != "tcp":
+        _show_gui_message(f"Port {port} saved for Loopback TCP mode.")
+        return
+
+    previous_transport = _bridge.transport if _bridge is not None else "tcp"
+    restarted, restored = _restart_gui_bridge(previous_transport, previous_port)
     if restarted is not None and not restored:
         _show_gui_message(f"Bridge is now listening on {restarted.endpoint}.")
     elif restored:
@@ -6797,11 +6866,7 @@ if ui is not None:
         "Restart the bn CLI bridge",
         _restart_bridge_command,
     )
-    try:
-        _configured_plugin_transport = bridge_transport()
-    except ValueError:
-        _configured_plugin_transport = None
-    if _configured_plugin_transport == "tcp":
+    if os.name == "nt":
         _register_gui_settings()
         PluginCommand.register(
             "BN Agent Bridge\\Set GUI Port...",
