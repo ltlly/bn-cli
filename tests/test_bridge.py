@@ -2876,7 +2876,7 @@ def test_named_pipe_bridge_registry_auth_and_concurrency(monkeypatch, tmp_path):
         assert registry["transport"] == "pipe"
         assert registry["pipe_name"] == instance.pipe_name
         assert registry["auth_token"] == instance.auth_token
-        assert instance.endpoint.startswith("pipe://\\\\.\\pipe\\bn-agent-bridge-headless-")
+        assert instance.endpoint == "pipe://\\\\.\\pipe\\bn-agent-bridge-headless"
 
         results = []
         threads = [

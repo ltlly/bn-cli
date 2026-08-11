@@ -50,7 +50,7 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 - The bridge runs in one of two **modes**:
   - **`gui`** — loaded as a Binary Ninja plugin inside the GUI process. Works with a personal license. Started automatically when Binary Ninja opens with the plugin installed.
   - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
-- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. Windows uses a fresh local Named Pipe for each bridge start; the registry contains its name and a random authentication token. The CLI rejects remote or nested pipe names.
+- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. Windows uses the fixed local Named Pipes `\\.\pipe\bn-agent-bridge-gui` and `\\.\pipe\bn-agent-bridge-headless`; the registry contains the selected endpoint and a random authentication token. The CLI rejects remote or nested pipe names.
 - The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
 - **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation opens the registered endpoint, sends a JSON request, and reads the response — the binary is never re-imported.
 

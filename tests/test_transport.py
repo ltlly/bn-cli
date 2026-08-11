@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from bn.paths import (
+    bridge_pipe_name,
     bridge_registry_path,
     bridge_tcp_port,
     bridge_transport,
@@ -85,6 +86,11 @@ def test_bridge_transport_defaults_by_platform(monkeypatch):
 
     monkeypatch.setattr("bn.paths.platform.system", lambda: "Linux")
     assert bridge_transport() == "unix"
+
+
+def test_bridge_pipe_names_are_fixed_per_mode():
+    assert bridge_pipe_name("gui") == r"\\.\pipe\bn-agent-bridge-gui"
+    assert bridge_pipe_name("headless") == r"\\.\pipe\bn-agent-bridge-headless"
 
 
 def test_bridge_transport_validates_explicit_platform_choices(monkeypatch):

@@ -92,6 +92,10 @@ def bridge_socket_path(mode: str) -> Path:
     return cache_home() / f"{PLUGIN_NAME}.{_validate_mode(mode)}.sock"
 
 
+def bridge_pipe_name(mode: str) -> str:
+    return rf"\\.\pipe\bn-agent-bridge-{_validate_mode(mode)}"
+
+
 def bridge_job_root(mode: str) -> Path:
     return cache_home() / "jobs" / _validate_mode(mode)
 

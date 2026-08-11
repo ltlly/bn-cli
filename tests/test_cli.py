@@ -2375,7 +2375,8 @@ def test_daemon_start_background_errors_when_registry_never_appears(monkeypatch,
     assert "did not register" in capsys.readouterr().err
 
 
-def _fake_headless_instance(tmp_path):
+def _fake_headless_instance(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry = tmp_path / "daemons" / "headless.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
     registry.write_text("{}", encoding="utf-8")
@@ -2396,7 +2397,7 @@ def _fake_headless_instance(tmp_path):
 
 
 def test_daemon_stop_requests_graceful_shutdown(monkeypatch, tmp_path, capsys):
-    instance = _fake_headless_instance(tmp_path)
+    instance = _fake_headless_instance(tmp_path, monkeypatch)
     captured = {}
 
     def send(inst, op, **kwargs):
@@ -2422,7 +2423,7 @@ def test_daemon_stop_requests_graceful_shutdown(monkeypatch, tmp_path, capsys):
 
 
 def test_daemon_stop_explains_old_bridge_protocol(monkeypatch, tmp_path, capsys):
-    instance = _fake_headless_instance(tmp_path)
+    instance = _fake_headless_instance(tmp_path, monkeypatch)
     monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
     monkeypatch.setattr(
         bn.cli,
@@ -2439,7 +2440,7 @@ def test_daemon_stop_explains_old_bridge_protocol(monkeypatch, tmp_path, capsys)
 
 
 def test_daemon_stop_errors_when_registry_does_not_disappear(monkeypatch, tmp_path, capsys):
-    instance = _fake_headless_instance(tmp_path)
+    instance = _fake_headless_instance(tmp_path, monkeypatch)
     monkeypatch.setattr(bn.cli, "_find_instance", lambda _mode: instance)
     monkeypatch.setattr(
         bn.cli,

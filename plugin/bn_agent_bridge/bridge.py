@@ -32,6 +32,7 @@ from .paths import (
     PLUGIN_NAME,
     bridge_registry_path,
     bridge_job_root,
+    bridge_pipe_name,
     bridge_socket_path,
     bridge_tcp_port,
     bridge_transport,
@@ -1354,9 +1355,7 @@ class BinaryNinjaBridge:
             self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
         elif self.transport == "pipe":
             self.auth_token = secrets.token_urlsafe(32)
-            self.pipe_name = (
-                rf"\\.\pipe\bn-agent-bridge-{self.mode}-{os.getpid()}-{secrets.token_hex(16)}"
-            )
+            self.pipe_name = bridge_pipe_name(self.mode)
             try:
                 self._server = ThreadedNamedPipeServer(self.pipe_name, self)
             except (OSError, ValueError) as exc:
