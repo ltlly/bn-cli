@@ -36,7 +36,7 @@ bn skill install
 
 # Smoke-check the running bridge(s)
 bn doctor
-bn daemon list                # mode + pid + socket + target count per running daemon
+bn daemon list                # mode + pid + endpoint + target count per running daemon
 
 # Start a headless daemon (needs BN headless license on PYTHONPATH)
 PYTHONPATH=/path/to/binaryninja/python bn daemon start --foreground
@@ -49,10 +49,10 @@ Tests do **not** require Binary Ninja. `tests/test_bridge.py` constructs a fake 
 ### Wire path
 
 1. A bridge is running: GUI auto-starts when Binary Ninja loads the plugin; headless is started by `bn daemon start`.
-2. `BinaryNinjaBridge.start()` binds an `AF_UNIX` socket at `paths.bridge_socket_path(mode)` and writes a registry JSON at `paths.bridge_registry_path(mode)` (i.e. `cache_home()/daemons/{mode}.json`) carrying `pid`, `socket_path`, `plugin_version`, `plugin_build_id`, and `mode`.
+2. `BinaryNinjaBridge.start()` selects its transport with `BN_BRIDGE_TRANSPORT=auto|pipe|tcp|unix`. `auto` means Unix-domain socket on Unix and authenticated Named Pipe on Windows. It writes a mode registry at `paths.bridge_registry_path(mode)` carrying the endpoint, authentication data when required, plugin metadata, and mode.
 3. The CLI (`src/bn/transport.py`) calls `list_instances()` which scans `cache_home()/daemons/`. `choose_instance()` picks one via the sticky pointer at `cache_home()/current_daemon`, falling back to "the only one running" when no sticky is set. With both `gui` and `headless` alive and no sticky, the CLI errors and hints the user to run `bn daemon use <mode>`.
-4. The CLI opens the chosen socket and sends a one-line JSON request: `{"id", "op", "params", "target"}`. It then `shutdown(SHUT_WR)` and reads the whole response until EOF.
-5. `BridgeHandler.handle` parses the request and calls `BinaryNinjaBridge.dispatch`. Target-scoped operations are submitted to `JobManager`, which resolves the target to a concrete id, reserves read/write access, and executes `_execute_operation` on an ordinary Python background thread. Multiple reads may run concurrently; read/write and write/write conflicts fail immediately with the blocking job id instead of waiting.
+4. The CLI opens the chosen endpoint and sends `{"id", "op", "params", "target"}`. Unix/TCP use a one-line stream request and read until EOF; Windows Pipe uses `multiprocessing.connection` message framing. TCP and Pipe requests include the registry token.
+5. The transport handler authenticates and parses the request, then calls `BinaryNinjaBridge.dispatch`. Target-scoped operations are submitted to `JobManager`, which resolves the target to a concrete id, reserves read/write access, and executes `_execute_operation` on an ordinary Python background thread. Multiple reads may run concurrently; read/write and write/write conflicts fail immediately with the blocking job id instead of waiting.
 6. The bridge replies with `{"ok", "result", "error"}`; the CLI raises `BridgeError` if `ok` is false.
 
 When adding a new operation: add the dispatch branch in `_execute_operation`, add the op name to either `READ_LOCKED_OPS` or `WRITE_LOCKED_OPS` (or deliberately leave it lock-free for state that has its own mutex), and add the matching CLI subparser + handler in `src/bn/cli.py`.
@@ -113,7 +113,7 @@ So every mutation lane has four possible result statuses — `verified`, `previe
 
 ### `paths.py` is the single source of truth for filesystem layout
 
-`src/bn/paths.py` and the symlinked `plugin/bn_agent_bridge/paths.py` define every path the system uses: per-mode bridge socket (`bridge_socket_path(mode)`), per-mode registry (`bridge_registry_path(mode)` under `bridge_registry_dir()`), sticky daemon mode pointer (`current_daemon_mode_path()`), cache home, spill root, plugin install dir, skill install dirs for both Codex (`$CODEX_HOME/skills/bn`) and Codex (`$CLAUDE_CONFIG_DIR/skills/bn`). The plugin's `paths.py` and `version.py` are **symlinks** into `src/bn/` — keep them as symlinks so the GUI plugin and the CLI agree on path layout without duplication.
+`src/bn/paths.py` and the symlinked `plugin/bn_agent_bridge/paths.py` define the transport selection, per-mode Unix socket (`bridge_socket_path(mode)`), per-mode registry (`bridge_registry_path(mode)` under `bridge_registry_dir()`), sticky daemon mode pointer (`current_daemon_mode_path()`), cache home, spill root, plugin install dir, and skill install directories. The plugin's `paths.py` and `version.py` are **symlinks** into `src/bn/` — keep them as symlinks so the GUI plugin and the CLI agree without duplication.
 
 ### Async load tracking
 

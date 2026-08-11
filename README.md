@@ -46,17 +46,19 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 - `bn` has two parts:
   - a normal Python CLI that you can run from your shell or agent tool harness
-  - a Binary Ninja bridge that exposes the API over a local transport: a Unix-domain socket on Unix, or authenticated loopback TCP on Windows
+  - a Binary Ninja bridge that exposes the API over a local transport: a Unix-domain socket on Unix, or an authenticated Windows Named Pipe on Windows
 - The bridge runs in one of two **modes**:
   - **`gui`** — loaded as a Binary Ninja plugin inside the GUI process. Works with a personal license. Started automatically when Binary Ninja opens with the plugin installed.
   - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
-- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. On Windows, GUI defaults to `127.0.0.1:26765` and headless to `127.0.0.1:26766`; registry entries include a random authentication token and the CLI only accepts loopback endpoints. Override the defaults with `BN_BRIDGE_GUI_PORT` or `BN_BRIDGE_HEADLESS_PORT`.
+- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. Windows uses a fresh local Named Pipe for each bridge start; the registry contains its name and a random authentication token. The CLI rejects remote or nested pipe names.
 - The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
-- **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation just opens a socket, sends a JSON request, and reads the response — the binary is never re-imported.
+- **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation opens the registered endpoint, sends a JSON request, and reads the response — the binary is never re-imported.
 
-### Changing the GUI bridge port
+### Transport selection
 
-On Windows, run `BN Agent Bridge\Set GUI Port...` inside Binary Ninja to save a new user-level port and restart the bridge immediately. You can also edit **GUI Listen Port** under the **BN Agent Bridge** group in Binary Ninja Settings, then run `BN Agent Bridge\Restart Bridge`. If the new port cannot be bound, the plugin restores the previous setting and listener instead of leaving the bridge offline.
+`BN_BRIDGE_TRANSPORT=auto|pipe|tcp|unix` controls the bridge transport. `auto` is the default: Windows selects `pipe`, while Unix selects `unix`. Unsupported platform combinations fail explicitly and never fall back silently.
+
+For temporary Windows compatibility, set `BN_BRIDGE_TRANSPORT=tcp` before starting Binary Ninja or the headless daemon. TCP remains restricted to `127.0.0.1`, requires the registry authentication token, and uses `BN_BRIDGE_GUI_PORT` / `BN_BRIDGE_HEADLESS_PORT` or the GUI **Listen Port** setting. CLI and plugin should be upgraded together because older CLIs do not understand Pipe registry entries.
 
 ## Quick Start
 
@@ -255,7 +257,7 @@ The headless daemon imports `binaryninja` and requires a Binary Ninja commercial
 
 ```bash
 bn daemon start --foreground   # block in foreground (Docker PID 1 / systemd)
-bn daemon status               # pid, socket, target count
+bn daemon status               # pid, endpoint, target count
 bn daemon stop                 # authenticated graceful shutdown + registry cleanup
 ```
 
@@ -531,6 +533,8 @@ If `bn target list` is empty:
 - make sure a binary or `.bndb` is open
 - make sure the plugin is installed with `bn plugin install`
 - reload Binary Ninja plugins or restart Binary Ninja after plugin changes
+
+On Windows, `bn doctor` should report a `pipe://\\.\pipe\...` endpoint. If Pipe creation or access fails, check that the CLI and plugin run as the same Windows user. For explicit compatibility mode, set `BN_BRIDGE_TRANSPORT=tcp` in both environments and restart the bridge; there is no automatic TCP fallback.
 
 On Unix, if `bn doctor` sees a bridge registry but reports `Operation not permitted` under Codex,
 the Codex sandbox is blocking the Unix socket that connects to the live Binary Ninja GUI

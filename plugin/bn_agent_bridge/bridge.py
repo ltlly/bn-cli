@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import json
+import multiprocessing.connection
 import os
 import re
 import secrets
@@ -33,6 +34,7 @@ from .paths import (
     bridge_job_root,
     bridge_socket_path,
     bridge_tcp_port,
+    bridge_transport,
 )
 from .version import VERSION, build_id_for_file
 
@@ -797,6 +799,42 @@ class TargetManager:
         raise RuntimeError(f"Unknown target selector: {selector}{hint}")
 
 
+def _process_bridge_request(bridge, raw: bytes) -> tuple[bytes, str | None, str | None, bool]:
+    op = None
+    request_id = None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("request must be a JSON object")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        response = _json_response(ok=False, error="Invalid JSON request")
+    else:
+        op = payload.get("op")
+        request_id = payload.get("id")
+        expected_auth = bridge.auth_token
+        supplied_auth = payload.get("auth")
+        if expected_auth is not None and (
+            not isinstance(supplied_auth, str)
+            or not hmac.compare_digest(supplied_auth, expected_auth)
+        ):
+            response = _json_response(ok=False, error="Unauthorized bridge request")
+        else:
+            response = bridge.dispatch(payload)
+    encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+    should_shutdown = op == "shutdown" and bool(response.get("ok"))
+    return encoded, op, request_id, should_shutdown
+
+
+def _log_disconnected_client(op: str | None, request_id: str | None) -> None:
+    details = []
+    if op:
+        details.append(f"op={op}")
+    if request_id:
+        details.append(f"id={request_id}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
+
+
 class BridgeHandler(socketserver.StreamRequestHandler):
     def _write_response(
         self,
@@ -812,40 +850,18 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         except OSError as exc:
             if exc.errno not in {errno.EPIPE, errno.ECONNRESET}:
                 raise
-            details = []
-            if op:
-                details.append(f"op={op}")
-            if request_id:
-                details.append(f"id={request_id}")
-            suffix = f" ({', '.join(details)})" if details else ""
-            bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
+            _log_disconnected_client(op, request_id)
             return False
 
     def handle(self):  # pragma: no cover - exercised from CLI
         raw = self.rfile.readline()
         if not raw:
             return
-        op = None
-        request_id = None
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            response = _json_response(ok=False, error="Invalid JSON request")
-        else:
-            op = payload.get("op")
-            request_id = payload.get("id")
-            expected_auth = self.server.bridge.auth_token
-            supplied_auth = payload.get("auth")
-            if expected_auth is not None and (
-                not isinstance(supplied_auth, str)
-                or not hmac.compare_digest(supplied_auth, expected_auth)
-            ):
-                response = _json_response(ok=False, error="Unauthorized bridge request")
-            else:
-                response = self.server.bridge.dispatch(payload)
-        encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+        encoded, op, request_id, should_shutdown = _process_bridge_request(
+            self.server.bridge, raw
+        )
         delivered = self._write_response(encoded, op=op, request_id=request_id)
-        if delivered and op == "shutdown" and response.get("ok"):
+        if delivered and should_shutdown:
             self.server.bridge.request_shutdown()
 
 
@@ -870,6 +886,91 @@ class ThreadedTcpServer(_ThreadedServerMixin, socketserver.TCPServer):
     def __init__(self, address: tuple[str, int], handler, bridge):
         self.bridge = bridge
         super().__init__(address, handler)
+
+
+class ThreadedNamedPipeServer:
+    def __init__(self, pipe_name: str, bridge):
+        self.pipe_name = pipe_name
+        self.bridge = bridge
+        self._listener = multiprocessing.connection.Listener(
+            pipe_name,
+            family="AF_PIPE",
+            backlog=64,
+            authkey=None,
+        )
+        self._stopping = threading.Event()
+        self._stopped = threading.Event()
+        self._connections: set[Any] = set()
+        self._connections_lock = threading.Lock()
+
+    def serve_forever(self) -> None:
+        try:
+            while not self._stopping.is_set():
+                try:
+                    connection = self._listener.accept()
+                except (EOFError, OSError) as exc:
+                    if not self._stopping.is_set():
+                        bn.log_error(f"BN Agent Bridge Named Pipe accept failed: {exc}")
+                    return
+                if self._stopping.is_set():
+                    connection.close()
+                    return
+                with self._connections_lock:
+                    self._connections.add(connection)
+                threading.Thread(
+                    target=self._handle_connection,
+                    args=(connection,),
+                    daemon=True,
+                ).start()
+        finally:
+            self._stopped.set()
+
+    def _handle_connection(self, connection) -> None:
+        op = None
+        request_id = None
+        try:
+            try:
+                raw = connection.recv_bytes()
+            except EOFError:
+                return
+            encoded, op, request_id, should_shutdown = _process_bridge_request(
+                self.bridge, raw
+            )
+            try:
+                connection.send_bytes(encoded)
+            except (BrokenPipeError, EOFError, OSError):
+                _log_disconnected_client(op, request_id)
+                return
+            if should_shutdown:
+                self.bridge.request_shutdown()
+        finally:
+            with self._connections_lock:
+                self._connections.discard(connection)
+            with contextlib.suppress(OSError):
+                connection.close()
+
+    def shutdown(self) -> None:
+        if self._stopping.is_set():
+            return
+        self._stopping.set()
+        with contextlib.suppress(Exception):
+            wakeup = multiprocessing.connection.Client(
+                self.pipe_name,
+                family="AF_PIPE",
+                authkey=None,
+            )
+            wakeup.close()
+        self._stopped.wait(timeout=2.0)
+
+    def server_close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._listener.close()
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            with contextlib.suppress(OSError):
+                connection.close()
 
 
 LOAD_ATTEMPTS_LIMIT = 50
@@ -1173,11 +1274,12 @@ class BinaryNinjaBridge:
         self.targets = TargetManager(mode=mode)
         self.socket_path = bridge_socket_path(mode)
         self.registry_path = bridge_registry_path(mode)
-        self.transport = "unix" if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX") else "tcp"
+        self.transport = bridge_transport()
         self.host: str | None = None
         self.port: int | None = None
+        self.pipe_name: str | None = None
         self.auth_token: str | None = None
-        self._server: socketserver.BaseServer | None = None
+        self._server: Any = None
         self._thread: threading.Thread | None = None
         self.shutdown_event = threading.Event()
         self._target_locks: dict[str, _ReadWriteLock] = {}
@@ -1242,12 +1344,31 @@ class BinaryNinjaBridge:
     def start(self) -> bool:  # pragma: no cover - requires GUI runtime
         self.shutdown_event.clear()
         if self.transport == "unix":
+            if ThreadedUnixServer is None or not hasattr(socket, "AF_UNIX"):
+                bn.log_error("BN Agent Bridge Unix-domain sockets are unavailable")
+                return False
             self.socket_path.parent.mkdir(parents=True, exist_ok=True)
             if self.socket_path.exists():
                 self.socket_path.unlink()
             assert ThreadedUnixServer is not None
             self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
-        else:
+        elif self.transport == "pipe":
+            self.auth_token = secrets.token_urlsafe(32)
+            self.pipe_name = (
+                rf"\\.\pipe\bn-agent-bridge-{self.mode}-{os.getpid()}-{secrets.token_hex(16)}"
+            )
+            try:
+                self._server = ThreadedNamedPipeServer(self.pipe_name, self)
+            except (OSError, ValueError) as exc:
+                self._server = None
+                self.auth_token = None
+                bn.log_error(
+                    f"BN Agent Bridge could not create Named Pipe {self.pipe_name}: {exc}. "
+                    "Check the current user's Named Pipe permissions or set "
+                    "BN_BRIDGE_TRANSPORT=tcp for explicit compatibility mode."
+                )
+                return False
+        elif self.transport == "tcp":
             self.auth_token = secrets.token_urlsafe(32)
             requested_port = _configured_tcp_port(self.mode)
             try:
@@ -1272,6 +1393,9 @@ class BinaryNinjaBridge:
                 )
                 return False
             self.host, self.port = self._server.server_address
+        else:
+            bn.log_error(f"BN Agent Bridge does not support transport {self.transport!r}")
+            return False
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self._write_registry()
@@ -1285,6 +1409,8 @@ class BinaryNinjaBridge:
     def endpoint(self) -> str:
         if self.transport == "tcp":
             return f"tcp://{self.host}:{self.port}"
+        if self.transport == "pipe":
+            return f"pipe://{self.pipe_name}"
         return str(self.socket_path)
 
     def stop(self):  # pragma: no cover - requires GUI runtime
@@ -1317,6 +1443,13 @@ class BinaryNinjaBridge:
                 {
                     "host": self.host,
                     "port": self.port,
+                    "auth_token": self.auth_token,
+                }
+            )
+        elif self.transport == "pipe":
+            payload.update(
+                {
+                    "pipe_name": self.pipe_name,
                     "auth_token": self.auth_token,
                 }
             )
@@ -1929,6 +2062,7 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "pid": os.getpid(),
             "socket_path": self.endpoint,
+            "endpoint": self.endpoint,
             "transport": self.transport,
             "mode": self.mode,
             "targets": self.targets.refresh(),
@@ -6541,7 +6675,12 @@ def _restart_gui_bridge(previous_port: int | None) -> tuple[BinaryNinjaBridge | 
 
 
 def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
-    if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX"):
+    try:
+        selected_transport = bridge_transport()
+    except ValueError as exc:
+        _show_gui_message(f"Transport configuration is invalid: {exc}")
+        return
+    if selected_transport != "tcp":
         _stop_bridge()
         restarted = start_bridge(mode="gui")
         if restarted is not None:
@@ -6610,7 +6749,11 @@ def start_bridge(mode: str = "gui"):  # pragma: no cover - exercised in real bri
         return None
     if _bridge is not None:
         return _bridge
-    candidate = BinaryNinjaBridge(mode=mode)
+    try:
+        candidate = BinaryNinjaBridge(mode=mode)
+    except ValueError as exc:
+        bn.log_error(f"BN Agent Bridge transport configuration is invalid: {exc}")
+        return None
     if not candidate.start():
         return None
     _bridge = candidate
@@ -6655,7 +6798,11 @@ if ui is not None:
         "Restart the bn CLI bridge",
         _restart_bridge_command,
     )
-    if ThreadedUnixServer is None or not hasattr(socket, "AF_UNIX"):
+    try:
+        _configured_plugin_transport = bridge_transport()
+    except ValueError:
+        _configured_plugin_transport = None
+    if _configured_plugin_transport == "tcp":
         _register_gui_settings()
         PluginCommand.register(
             "BN Agent Bridge\\Set GUI Port...",

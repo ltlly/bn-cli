@@ -4,6 +4,8 @@ import importlib
 import importlib.util
 import io
 import json
+import multiprocessing.connection
+import os
 import socket
 import sys
 import threading
@@ -2840,6 +2842,59 @@ def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
         assert instance.shutdown_event.wait(timeout=1)
     finally:
         instance.stop()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Named Pipes are unavailable")
+def test_named_pipe_bridge_registry_auth_and_concurrency(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_BRIDGE_TRANSPORT", "pipe")
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    assert instance.start() is True
+
+    def request(request_id):
+        connection = multiprocessing.connection.Client(
+            instance.pipe_name, family="AF_PIPE", authkey=None
+        )
+        try:
+            connection.send_bytes(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "op": "doctor",
+                        "params": {},
+                        "auth": instance.auth_token,
+                    }
+                ).encode("utf-8")
+            )
+            return json.loads(connection.recv_bytes().decode("utf-8"))
+        finally:
+            connection.close()
+
+    try:
+        registry = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+        assert registry["transport"] == "pipe"
+        assert registry["pipe_name"] == instance.pipe_name
+        assert registry["auth_token"] == instance.auth_token
+        assert instance.endpoint.startswith("pipe://\\\\.\\pipe\\bn-agent-bridge-headless-")
+
+        results = []
+        threads = [
+            threading.Thread(target=lambda i=i: results.append(request(str(i))))
+            for i in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        assert len(results) == 4
+        assert all(result["ok"] is True for result in results)
+        assert all(result["result"]["transport"] == "pipe" for result in results)
+    finally:
+        instance.stop()
+
+    assert not instance.registry_path.exists()
 
 
 def test_binary_view_reads_do_not_marshal_to_ui_thread(monkeypatch):

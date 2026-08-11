@@ -1290,8 +1290,9 @@ def _render_doctor_text(value: Any) -> str:
             lines.append("  stale: loaded plugin code does not match installed plugin file")
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
-        if item.get("socket_path"):
-            lines.append(f"  socket: {item['socket_path']}")
+        endpoint = item.get("endpoint") or item.get("socket_path")
+        if endpoint:
+            lines.append(f"  endpoint: {endpoint}")
         error = doctor.get("error")
         if error:
             lines.append(f"  error: {error}")
@@ -1478,6 +1479,7 @@ def _doctor(args: argparse.Namespace) -> int:
         instance_info = {
             "pid": instance.pid,
             "socket_path": instance.endpoint,
+            "endpoint": instance.endpoint,
             "transport": instance.transport,
             "plugin_version": instance.plugin_version,
             "plugin_build_id": loaded_build_id,
@@ -1628,7 +1630,8 @@ def _render_daemon_list_text(value: Any) -> str:
         flag = " [current]" if sticky and item.get("mode") == sticky else ""
         lines.append(
             f"- mode={item.get('mode', '<unknown>')}  pid={item.get('pid', '?')}  "
-            f"socket={item.get('socket_path', '<unknown>')}  targets={item.get('target_count', '?')}{flag}"
+            f"endpoint={item.get('endpoint') or item.get('socket_path', '<unknown>')}  "
+            f"targets={item.get('target_count', '?')}{flag}"
         )
     return "\n".join(lines)
 
@@ -1641,7 +1644,7 @@ def _render_daemon_status_text(value: Any) -> str:
     lines = [
         f"mode: {value.get('mode')}",
         f"pid: {value.get('pid')}",
-        f"socket: {value.get('socket_path')}",
+        f"endpoint: {value.get('endpoint') or value.get('socket_path')}",
         f"registry: {value.get('registry_path')}",
         f"plugin_version: {value.get('plugin_version')}",
         f"target_count: {value.get('target_count')}",
@@ -1665,6 +1668,7 @@ def _instance_summary(instance: BridgeInstance) -> dict[str, Any]:
         "mode": instance.mode,
         "pid": instance.pid,
         "socket_path": instance.endpoint,
+        "endpoint": instance.endpoint,
         "transport": instance.transport,
         "registry_path": str(instance.registry_path),
         "plugin_version": instance.plugin_version,

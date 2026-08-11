@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import errno
+import multiprocessing.connection
 import socket
 import socketserver
 import threading
@@ -11,11 +12,18 @@ from pathlib import Path
 
 import pytest
 
-from bn.paths import bridge_registry_path, bridge_tcp_port, current_daemon_mode_path
+from bn.paths import (
+    bridge_registry_path,
+    bridge_tcp_port,
+    bridge_transport,
+    current_daemon_mode_path,
+)
 from bn.transport import (
     BridgeError,
     BridgeInstance,
+    _send_request_to_instance,
     _socket_args,
+    _validate_pipe_name,
     choose_instance,
     list_instances,
     read_current_daemon_mode,
@@ -68,6 +76,197 @@ def test_bridge_tcp_ports_are_fixed_and_overridable(monkeypatch):
 
     monkeypatch.setenv("BN_BRIDGE_GUI_PORT", "30001")
     assert bridge_tcp_port("gui") == 30001
+
+
+def test_bridge_transport_defaults_by_platform(monkeypatch):
+    monkeypatch.delenv("BN_BRIDGE_TRANSPORT", raising=False)
+    monkeypatch.setattr("bn.paths.platform.system", lambda: "Windows")
+    assert bridge_transport() == "pipe"
+
+    monkeypatch.setattr("bn.paths.platform.system", lambda: "Linux")
+    assert bridge_transport() == "unix"
+
+
+def test_bridge_transport_validates_explicit_platform_choices(monkeypatch):
+    monkeypatch.setattr("bn.paths.platform.system", lambda: "Windows")
+    monkeypatch.setenv("BN_BRIDGE_TRANSPORT", "tcp")
+    assert bridge_transport() == "tcp"
+
+    monkeypatch.setenv("BN_BRIDGE_TRANSPORT", "unix")
+    with pytest.raises(ValueError, match="not supported on Windows"):
+        bridge_transport()
+
+    monkeypatch.setenv("BN_BRIDGE_TRANSPORT", "bogus")
+    with pytest.raises(ValueError, match="must be one of"):
+        bridge_transport()
+
+
+def test_pipe_name_validation_rejects_remote_and_nested_names():
+    assert _validate_pipe_name(r"\\.\pipe\bn-agent-bridge-gui-1-token") == (
+        r"\\.\pipe\bn-agent-bridge-gui-1-token"
+    )
+    with pytest.raises(OSError, match="Invalid local Named Pipe endpoint"):
+        _validate_pipe_name(r"\\server\pipe\bn-agent-bridge")
+    with pytest.raises(OSError, match="Invalid local Named Pipe endpoint"):
+        _validate_pipe_name(r"\\.\pipe\nested\bn-agent-bridge")
+
+
+def test_list_instances_reads_pipe_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport._socket_probe_error", lambda _instance: None)
+    registry_path = bridge_registry_path("gui")
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    pipe_name = r"\\.\pipe\bn-agent-bridge-gui-123-token"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "transport": "pipe",
+                "pipe_name": pipe_name,
+                "auth_token": "secret",
+                "mode": "gui",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    instances = list_instances()
+
+    assert len(instances) == 1
+    assert instances[0].pipe_name == pipe_name
+    assert instances[0].endpoint == f"pipe://{pipe_name}"
+    assert instances[0].auth_token == "secret"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Named Pipes are unavailable")
+def test_send_request_over_real_windows_named_pipe(tmp_path):
+    pipe_name = rf"\\.\pipe\bn-agent-bridge-test-{os.getpid()}-{uuid.uuid4().hex}"
+    listener = multiprocessing.connection.Listener(
+        pipe_name, family="AF_PIPE", backlog=4, authkey=None
+    )
+
+    def serve():
+        connection = listener.accept()
+        try:
+            payload = json.loads(connection.recv_bytes().decode("utf-8"))
+            connection.send_bytes(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "result": {
+                            "op": payload["op"],
+                            "auth": payload["auth"],
+                        },
+                    }
+                ).encode("utf-8")
+            )
+        finally:
+            connection.close()
+            listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    instance = BridgeInstance(
+        pid=os.getpid(),
+        socket_path=None,
+        registry_path=tmp_path / "gui.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.15.0",
+        started_at=None,
+        meta={},
+        transport="pipe",
+        pipe_name=pipe_name,
+        auth_token="test-token",
+    )
+
+    response = _send_request_to_instance(instance, "doctor", timeout=2.0)
+
+    assert response["result"] == {"op": "doctor", "auth": "test-token"}
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def _pipe_instance(tmp_path):
+    return BridgeInstance(
+        pid=999,
+        socket_path=None,
+        registry_path=tmp_path / "gui.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.15.0",
+        started_at=None,
+        meta={},
+        transport="pipe",
+        pipe_name=r"\\.\pipe\bn-agent-bridge-gui-999-test",
+        auth_token="secret",
+    )
+
+
+def test_pipe_request_retries_busy_endpoint(monkeypatch, tmp_path):
+    class _Connection:
+        def send_bytes(self, payload):
+            self.payload = json.loads(payload.decode("utf-8"))
+
+        def recv_bytes(self):
+            return json.dumps({"ok": True, "result": self.payload}).encode("utf-8")
+
+        def close(self):
+            pass
+
+    attempts = []
+
+    def connect(_pipe_name, _timeout):
+        attempts.append(True)
+        if len(attempts) == 1:
+            error = OSError(231, "All pipe instances are busy")
+            error.winerror = 231
+            raise error
+        return _Connection()
+
+    monkeypatch.setattr("bn.transport._pipe_connect", connect)
+    monkeypatch.setattr("bn.transport.time.sleep", lambda _delay: None)
+
+    response = _send_request_to_instance(_pipe_instance(tmp_path), "doctor")
+
+    assert len(attempts) == 2
+    assert response["result"]["auth"] == "secret"
+
+
+def test_pipe_request_reports_response_timeout(monkeypatch, tmp_path):
+    class _Connection:
+        def send_bytes(self, _payload):
+            pass
+
+        def poll(self, _timeout):
+            return False
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "bn.transport._pipe_connect", lambda _pipe_name, _timeout: _Connection()
+    )
+
+    with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999"):
+        _send_request_to_instance(_pipe_instance(tmp_path), "doctor", timeout=0.01)
+
+
+def test_pipe_request_wraps_early_eof(monkeypatch, tmp_path):
+    class _Connection:
+        def send_bytes(self, _payload):
+            pass
+
+        def recv_bytes(self):
+            raise EOFError
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "bn.transport._pipe_connect", lambda _pipe_name, _timeout: _Connection()
+    )
+
+    with pytest.raises(BridgeError, match="Failed to contact Binary Ninja bridge pid 999"):
+        _send_request_to_instance(_pipe_instance(tmp_path), "doctor")
 
 
 def test_socket_args_rejects_non_loopback_tcp_endpoint(tmp_path):
