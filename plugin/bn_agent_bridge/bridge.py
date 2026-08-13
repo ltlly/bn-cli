@@ -5179,14 +5179,17 @@ class BinaryNinjaBridge:
     def _list_data_vars(self, selector):
         bv = self._resolve_view(selector)
         def _do():
-            return [
-                {
-                    "address": hex(addr),
-                    "type": str(dv.type) if dv.type else None,
-                    "auto_discovered": dv.auto_discovered if hasattr(dv, "auto_discovered") else None,
-                }
-                for addr, dv in bv.data_vars
-            ]
+            result = []
+            for addr in bv.data_vars:
+                dv = bv.get_data_var_at(addr)
+                result.append(
+                    {
+                        "address": hex(addr),
+                        "type": str(dv.type) if dv.type else None,
+                        "auto_discovered": dv.auto_discovered if hasattr(dv, "auto_discovered") else None,
+                    }
+                )
+            return result
         return _do()
 
     # =========================================================================
