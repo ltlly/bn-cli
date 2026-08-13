@@ -1736,11 +1736,10 @@ def _wait_for_registry(mode: str, *, timeout: float) -> bool:
     return False
 
 
-def _wait_for_registry_absent(mode: str, *, timeout: float) -> bool:
+def _wait_for_registry_absent(registry: Path, *, timeout: float) -> bool:
     import time
 
     deadline = time.time() + timeout
-    registry = bridge_registry_path(mode)
     while time.time() < deadline:
         if not registry.exists():
             return True
@@ -1826,7 +1825,7 @@ def _daemon_stop(args: argparse.Namespace) -> int:
             ) from exc
         raise
 
-    if not _wait_for_registry_absent(mode, timeout=10.0):
+    if not _wait_for_registry_absent(instance.registry_path, timeout=10.0):
         raise BridgeError(
             f"Daemon mode `{mode}` accepted shutdown but did not exit within 10 seconds"
         )
