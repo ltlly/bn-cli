@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import api_docs
+from .artifacts import select_result, diff_results
+from .schema import command_schema
 from .output import write_output_result
 from .paths import (
     DAEMON_MODES,
@@ -21,6 +23,7 @@ from .paths import (
     plugin_source_dir,
     skill_install_dir_for,
     skill_source_dir,
+    spill_root,
 )
 from .transport import (
     BridgeError,
@@ -28,10 +31,11 @@ from .transport import (
     _send_request_to_instance,
     list_instances,
     read_current_daemon_mode,
+    request_session,
     send_request,
     write_current_daemon_mode,
 )
-from .version import VERSION, build_id_for_file
+from .version import VERSION, bridge_build_id
 
 FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
 DEFAULT_JOB_WAIT_TIMEOUT = 30.0
@@ -173,11 +177,13 @@ def _target_option(
     kwargs: dict[str, Any] = {
         "help": (
             "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id); "
-            "omit only when exactly one target is open, or use `active` to follow the GUI-selected target explicitly"
+            "omit when exactly one target is open or one is CLI-selected active"
         ),
         "required": required,
     }
     parser.add_argument("--target", **kwargs)
+    parser.add_argument("--with-context", action="store_true",
+                        help="Wrap output with target/address context (bare addresses are BN virtual addresses)")
     wait_group = parser.add_mutually_exclusive_group()
     wait_group.add_argument(
         "--async",
@@ -243,28 +249,6 @@ def _render_result(
         print("\n".join(lines), file=sys.stderr)
         return
     sys.stdout.write(result.rendered)
-
-
-def _render_and_output(
-    args: argparse.Namespace,
-    result: Any,
-    *,
-    text_renderer: Callable[[Any], str] | None = None,
-    stem: str,
-) -> int:
-    """Render result and write output (mini version of _call's tail for direct-request handlers)."""
-    spill_context = result
-    if text_renderer is not None and args.format == "text":
-        result = text_renderer(result)
-    _render_result(
-        result,
-        fmt=args.format,
-        out_path=args.out,
-        stem=stem,
-        spill_label=stem.replace("-", " "),
-        spill_context=spill_context,
-    )
-    return 0
 
 
 def _render_target_choice(value: Any) -> str:
@@ -382,7 +366,11 @@ def _job_backed_request(
     latest = submitted
     try:
         while True:
-            status_response = send_request("job_status", params={"job_id": job_id}, target=None)
+            if submitted.get("wait_supported"):
+                remaining = max(0, deadline - time.monotonic()) if deadline is not None else 30
+                status_response = send_request("job_wait", params={"job_id": job_id, "timeout": min(30, remaining)}, target=None)
+            else:
+                status_response = send_request("job_status", params={"job_id": job_id}, target=None)
             latest = status_response["result"]
             state = latest.get("state") if isinstance(latest, dict) else None
             if state in {"succeeded", "failed", "cancelled"}:
@@ -395,7 +383,8 @@ def _job_backed_request(
                     file=sys.stderr,
                 )
                 return None, 124
-            time.sleep(0.1)
+            if not submitted.get("wait_supported"):
+                time.sleep(0.1)
     except KeyboardInterrupt:
         print(
             f"\nStopped waiting; job {job_id} is still managed by the bridge. "
@@ -405,11 +394,23 @@ def _job_backed_request(
         return None, 130
 
     if state != "succeeded":
+        _show_address_context(latest.get("address_context"))
         raise BridgeError(str(latest.get("error") or f"Job {job_id} {state}"))
     outcome = send_request("job_result", params={"job_id": job_id}, target=None)["result"]
     if not isinstance(outcome, dict) or not outcome.get("ready"):
         raise BridgeError(f"Job {job_id} completed without an available result")
-    return {"ok": True, "result": outcome.get("result"), "error": None}, None
+    return {"ok": True, "result": outcome.get("result"), "error": None,
+            "address_context": (outcome.get("job") or {}).get("address_context")}, None
+
+
+def _show_address_context(context) -> None:
+    if not context:
+        return
+    spaces = context.get("external_spaces") or {}
+    names = ",".join(f"{name}{'(stale)' if item.get('stale') else ''}" for name, item in spaces.items()) or "none"
+    print(f"address context: target={context.get('target_id')} space=bn_va "
+          f"image_base={context.get('image_base')} view_start={context.get('view_start')} "
+          f"maps={names}; use rva:OFFSET, file:OFFSET, map:NAME:ADDRESS", file=sys.stderr)
 
 
 def _call(
@@ -425,13 +426,14 @@ def _call(
     page_label: str | None = None,
     stem: str,
     result_exit_code: Callable[[Any], int] | None = None,
+    render_error_result: bool = True,
     bridge_writes_output: bool = False,
 ) -> int:
     request_params = dict(params or {})
     effective_page_limit = None
     if page_limit is not None and page_limit >= 0:
         effective_page_limit = page_limit
-        request_params["limit"] = page_limit + 1
+        request_params["limit"] = page_limit + 1 if page_limit else 0
 
     target = _resolve_target(
         args,
@@ -457,7 +459,11 @@ def _call(
             target=target,
         )
     result = response["result"]
+    address_context = response.get("address_context") or (result.get("address_context") if isinstance(result, dict) else None)
+    _show_address_context(address_context)
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
+    if exit_code and not render_error_result:
+        return exit_code
     if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
         result = result[:effective_page_limit]
         label = page_label or op
@@ -467,7 +473,9 @@ def _call(
             file=sys.stderr,
         )
     spill_context = result
-    if text_renderer is not None and args.format == "text":
+    if getattr(args, "with_context", False):
+        result = {"address_context": address_context, "result": result}
+    elif text_renderer is not None and args.format == "text":
         result = text_renderer(result)
     _render_result(
         result,
@@ -1284,6 +1292,10 @@ def _render_doctor_text(value: Any) -> str:
         build_id = item.get("plugin_build_id")
         if build_id:
             lines.append(f"  build: {build_id}")
+        if doctor.get("binaryninja_version"):
+            lines.append(f"  Binary Ninja: {doctor['binaryninja_version']}")
+        if doctor.get("capabilities"):
+            lines.append("  capabilities: " + ", ".join(name for name, available in doctor["capabilities"].items() if available))
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
         if item.get("stale_plugin_code"):
@@ -1456,8 +1468,8 @@ def _doctor(args: argparse.Namespace) -> int:
     source_dir = plugin_source_dir()
     install_bridge = install_dir / "bridge.py"
     source_bridge = source_dir / "bridge.py"
-    install_build_id = build_id_for_file(install_bridge)
-    source_build_id = build_id_for_file(source_bridge)
+    install_build_id = bridge_build_id(install_bridge)
+    source_build_id = bridge_build_id(source_bridge)
     instances = []
     for instance in list_instances():
         ping: dict[str, Any]
@@ -2340,6 +2352,10 @@ def _workflow_machine_overrides(args: argparse.Namespace) -> int:
 
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
+    if args.offset < 0 or args.limit < -1:
+        raise ValueError("--offset must be nonnegative and --limit must be -1 or nonnegative")
+    if args.offset:
+        params["offset"] = args.offset
     if args.min_address is not None:
         params["min_address"] = args.min_address
     if args.max_address is not None:
@@ -2352,6 +2368,8 @@ def _function_list(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         page_label="function list",
+        page_limit=args.limit,
+        page_offset=args.offset,
         stem="functions",
     )
 
@@ -2361,6 +2379,10 @@ def _function_search(args: argparse.Namespace) -> int:
         "query": args.query,
         "regex": bool(args.regex),
     }
+    if args.offset < 0 or args.limit < -1:
+        raise ValueError("--offset must be nonnegative and --limit must be -1 or nonnegative")
+    if args.offset:
+        params["offset"] = args.offset
     if args.min_address is not None:
         params["min_address"] = args.min_address
     if args.max_address is not None:
@@ -2373,6 +2395,8 @@ def _function_search(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         page_label="function search",
+        page_limit=args.limit,
+        page_offset=args.offset,
         stem="function-search",
     )
 
@@ -2407,26 +2431,20 @@ def _handle_il_unavailable(result: dict[str, Any]) -> int:
     return 4
 
 
+def _il_result_exit_code(result) -> int:
+    return _handle_il_unavailable(result) if result.get("il_unavailable") else 0
+
+
 def _decompile(args: argparse.Namespace) -> int:
-    target = _resolve_target(args, require_target=True, allow_implicit_target=True)
-    response = send_request("decompile", params={"identifier": args.identifier}, target=target)
-    result = response["result"]
-    if result.get("il_unavailable"):
-        return _handle_il_unavailable(result)
-    return _render_and_output(args, result, text_renderer=_text_field("text"), stem="decompile")
+    return _call(args, "decompile", {"identifier": args.identifier}, require_target=True,
+                 allow_implicit_target=True, text_renderer=_text_field("text"), stem="decompile",
+                 result_exit_code=_il_result_exit_code, render_error_result=False)
 
 
 def _il(args: argparse.Namespace) -> int:
-    target = _resolve_target(args, require_target=True, allow_implicit_target=True)
-    response = send_request(
-        "il",
-        params={"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
-        target=target,
-    )
-    result = response["result"]
-    if result.get("il_unavailable"):
-        return _handle_il_unavailable(result)
-    return _render_and_output(args, result, text_renderer=_text_field("text"), stem="il")
+    return _call(args, "il", {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
+                 require_target=True, allow_implicit_target=True, text_renderer=_text_field("text"), stem="il",
+                 result_exit_code=_il_result_exit_code, render_error_result=False)
 
 
 def _disasm(args: argparse.Namespace) -> int:
@@ -2486,7 +2504,7 @@ def _patch_assemble(args: argparse.Namespace) -> int:
     return _call(
         args,
         "patch_assemble",
-        {"address": args.address, "asm": args.asm},
+        {"address": args.address, "asm": args.assembly},
         require_target=True,
         allow_implicit_target=True,
         stem="patch-assemble",
@@ -2497,7 +2515,7 @@ def _patch_nop(args: argparse.Namespace) -> int:
     return _call(
         args,
         "patch_nop",
-        {"address": args.address},
+        {"address": args.address, "length": args.length},
         require_target=True,
         allow_implicit_target=True,
         stem="patch-nop",
@@ -2625,71 +2643,14 @@ def _memory_writer(args: argparse.Namespace) -> int:
 # =========================================================================
 
 
-def _value_reg(args: argparse.Namespace) -> int:
-    return _call(
-        args,
-        "value_reg",
-        {
-            "function_start": args.function,
-            "address": args.address,
-            "register": args.register,
-            "after": args.after,
-        },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_value_result_text,
-        stem="value-reg",
-    )
-
-
-def _value_stack(args: argparse.Namespace) -> int:
-    return _call(
-        args,
-        "value_stack",
-        {
-            "function_start": args.function,
-            "address": args.address,
-            "stack_offset": args.offset,
-            "size": args.size,
-            "after": args.after,
-        },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_value_result_text,
-        stem="value-stack",
-    )
-
-
-def _value_possible(args: argparse.Namespace) -> int:
-    return _call(
-        args,
-        "value_possible",
-        {
-            "function_start": args.function,
-            "address": args.address,
-            "level": args.level,
-            "ssa": args.ssa,
-        },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_value_result_text,
-        stem="value-possible",
-    )
-
-
-def _value_flags(args: argparse.Namespace) -> int:
-    return _call(
-        args,
-        "value_flags_at",
-        {
-            "function_start": args.function,
-            "address": args.address,
-        },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_value_result_text,
-        stem="value-flags",
-    )
+def _value_command(args: argparse.Namespace) -> int:
+    params = {"function_start": args.function, "kind": args.value_command,
+              "address": args.address, "instruction_index": args.instr_index, "after": args.after}
+    for key in ("register", "flag", "offset", "size"):
+        if hasattr(args, key):
+            params[key] = getattr(args, key)
+    return _call(args, "value_query", params, require_target=True, allow_implicit_target=True,
+                 text_renderer=_render_value_result_text, stem="value-" + args.value_command)
 
 
 # =========================================================================
@@ -2717,7 +2678,7 @@ def _search_bytes(args: argparse.Namespace) -> int:
 
 
 def _search_constant(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"constant": args.value}
+    params: dict[str, Any] = {"constant": args.value, "start": args.start, "end": args.end}
     if args.limit:
         params["limit"] = args.limit
     return _call(
@@ -2768,7 +2729,7 @@ def _arch_info(args: argparse.Namespace) -> int:
 
 
 def _arch_assemble(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"asm": args.asm}
+    params: dict[str, Any] = {"asm": args.assembly}
     if args.address:
         params["address"] = args.address
     if hasattr(args, "arch_name") and args.arch_name:
@@ -2784,7 +2745,7 @@ def _arch_assemble(args: argparse.Namespace) -> int:
 
 
 def _arch_disasm_bytes(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"data_hex": args.hex_bytes}
+    params: dict[str, Any] = {"data_hex": args.hex_bytes, "count": args.count}
     if args.address:
         params["address"] = args.address
     if hasattr(args, "arch_name") and args.arch_name:
@@ -3945,12 +3906,18 @@ def _job_result(args: argparse.Namespace) -> int:
         print(f"Job {args.job_id} has not completed yet.", file=sys.stderr)
         return 124
     job = outcome.get("job") or {}
+    _show_address_context(job.get("address_context"))
     if job.get("state") != "succeeded":
         _render_result(outcome, fmt=args.format, out_path=args.out, stem="job-result")
         return 2
     result = outcome.get("result")
+    if job.get("op") in {"decompile", "il"} and isinstance(result, dict) and result.get("il_unavailable"):
+        return _handle_il_unavailable(result)
+    exit_code = _mutation_exit_code(result)
+    if getattr(args, "with_context", False):
+        result = {"address_context": job.get("address_context"), "result": result}
     _render_result(result, fmt=args.format, out_path=args.out, stem=f"job-{args.job_id}")
-    return _mutation_exit_code(result)
+    return exit_code
 
 
 def _job_cancel(args: argparse.Namespace) -> int:
@@ -3959,11 +3926,133 @@ def _job_cancel(args: argparse.Namespace) -> int:
     return 0 if result.get("accepted") else 2
 
 
+def _job_wait(args: argparse.Namespace) -> int:
+    if args.wait_timeout <= 0:
+        raise BridgeError("--wait-timeout must be positive")
+    deadline = None if args.danger_always_wait else time.monotonic() + args.wait_timeout
+    previous = None
+    try:
+        while True:
+            remaining = max(0, deadline - time.monotonic()) if deadline is not None else 30
+            result = send_request("job_wait", params={"job_id": args.job_id, "timeout": min(1 if args.watch else 30, remaining)}, target=None)["result"]
+            current = (result.get("state"), result.get("progress"))
+            if args.watch and current != previous:
+                print(f"{args.job_id}: {current[0]}: {current[1] or ''}", file=sys.stderr)
+                previous = current
+            if result.get("state") in {"succeeded", "failed", "cancelled"}:
+                return _job_result(args)
+            if deadline is not None and time.monotonic() >= deadline:
+                _render_result(result, fmt=args.format, out_path=args.out, stem="job-wait")
+                return 124
+    except KeyboardInterrupt:
+        print(f"Stopped waiting; job {args.job_id} continues. Use `bn job cancel {args.job_id}` to request cancellation.", file=sys.stderr)
+        return 130
+
+
+def _address_command(args: argparse.Namespace) -> int:
+    params = {}
+    for key in ("name", "base", "size", "source", "bn_base", "addresses", "address", "bytes", "kind"):
+        if getattr(args, key, None) is not None:
+            params[key] = getattr(args, key)
+    if getattr(args, "manifest", None) is not None:
+        params["manifest"] = json.loads(args.manifest.read_text(encoding="utf-8"))
+    return _call(args, args.address_op, params, require_target=True,
+                 allow_implicit_target=True, stem=args.address_op.replace("_", "-"),
+                 result_exit_code=(lambda value: 0 if value.get("matches") else 3) if args.address_op == "address_verify" else None)
+
+
+def _inspect(args: argparse.Namespace) -> int:
+    return _call(args, "inspect", {"identifier": args.identifier}, require_target=True,
+                 allow_implicit_target=True, stem="inspect")
+
+
+def _schema(args: argparse.Namespace) -> int:
+    result = command_schema(build_parser(), args.path)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="command-schema")
+    return 0
+
+
+def _result_command(args: argparse.Namespace) -> int:
+    if args.result_action == "list":
+        if args.limit < 0:
+            raise ValueError("--limit must be nonnegative")
+        files = sorted((p for p in spill_root().glob("*/*") if p.is_file() and not p.name.startswith(".")),
+                       key=lambda p: p.stat().st_mtime_ns, reverse=True)
+        result = [{"artifact_path": str(p), "bytes": p.stat().st_size} for p in files[:args.limit]]
+    elif args.result_action == "show":
+        result = select_result(args.path, key=args.key, offset=args.offset, limit=args.limit, fields=args.fields)
+    else:
+        result = diff_results(args.before, args.after)
+    _render_result(result, fmt=args.format, out_path=args.out, stem=f"result-{args.result_action}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
+    parser.add_argument("--daemon", choices=DAEMON_MODES, help="Select a daemon for this invocation without changing the global selection")
     parser.set_defaults(handler=None)
 
     subparsers = parser.add_subparsers(dest="command")
+
+    schema = subparsers.add_parser("schema", help="Machine-readable command help from the live parser; no daemon required")
+    _common_io_options(schema, default_format="json")
+    schema.add_argument("path", nargs="*", help="Command path, e.g. memory read")
+    schema.set_defaults(handler=_schema)
+
+    result = subparsers.add_parser("result", help="Inspect and compare local output artifacts without rerunning BN")
+    result_sub = result.add_subparsers(dest="result_action")
+    for name in ("list", "show", "diff"):
+        command = result_sub.add_parser(name)
+        _common_io_options(command, default_format="json")
+        if name in {"list", "show"}:
+            command.add_argument("--limit", type=int, default=20)
+        if name == "show":
+            command.add_argument("path", type=Path)
+            command.add_argument("--offset", type=int, default=0)
+            command.add_argument("--key", help="Dotted object key selecting the result list")
+            command.add_argument("--fields", help="Comma-separated object fields")
+        if name == "diff":
+            command.add_argument("before", type=Path)
+            command.add_argument("after", type=Path)
+        command.set_defaults(handler=_result_command)
+
+    inspect_p = subparsers.add_parser("inspect", help="Address coordinates, bytes, function, xrefs and decompilation")
+    _common_io_options(inspect_p, default_format="json")
+    _target_option(inspect_p, required=False)
+    inspect_p.add_argument("identifier", help="Function name or va:/rva:/file:/map:NAME:/expr: address")
+    inspect_p.set_defaults(handler=_inspect)
+
+    address = subparsers.add_parser("address", help="Explicit BN VA, RVA, file and external address coordinates")
+    address_sub = address.add_subparsers(dest="address_command")
+    for name in ("context", "resolve", "verify"):
+        command = address_sub.add_parser(name, help={"context": "Show address layout", "resolve": "Resolve addresses into every registered space", "verify": "Compare bytes observed externally against BN at a resolved address"}[name])
+        _common_io_options(command, default_format="json")
+        _target_option(command, required=False)
+        if name == "resolve":
+            command.add_argument("addresses", nargs="+")
+        if name == "verify":
+            command.add_argument("address")
+            command.add_argument("--bytes", required=True, help="Hex bytes read at this address in the external process/emulator")
+        command.set_defaults(handler=_address_command, address_op=f"address_{name}")
+    maps = address_sub.add_parser("map", help="Session-scoped external maps; no process attachment or BN rebase")
+    maps_sub = maps.add_subparsers(dest="map_command")
+    for name in ("add", "import", "list", "export", "remove"):
+        command = maps_sub.add_parser(name)
+        _common_io_options(command, default_format="json")
+        _target_option(command, required=False)
+        if name != "list":
+            command.add_argument("name", help="Distinct name for this process/emulator session")
+        if name in {"add", "import"}:
+            command.add_argument("--source", required=True, help="Process or emulator session identity; user-declared")
+        if name == "add":
+            command.add_argument("--base", required=True, help="External address corresponding to --bn-base")
+            command.add_argument("--size", required=True, help="Module span in bytes (decimal or 0x hex); excludes synthetic BN regions outside it")
+        if name in {"add", "import"}:
+            command.add_argument("--bn-base", help="BN module anchor (default: BinaryView.image_base, NOT view.start)")
+        if name == "import":
+            command.add_argument("manifest", type=Path, help="JSON with regions: bn_start, external_start, length")
+            command.add_argument("--kind", choices=("regions", "frida-module"), default="regions", help="frida-module accepts a snapshot containing base and size")
+        command.set_defaults(handler=_address_command, address_op=f"address_map_{name}")
 
     setup = subparsers.add_parser(
         "setup",
@@ -3995,12 +4084,22 @@ def build_parser() -> argparse.ArgumentParser:
     job_result = job_sub.add_parser("result", help="Read a completed job's result")
     _common_io_options(job_result, default_format="json")
     job_result.add_argument("job_id")
+    job_result.add_argument("--with-context", action="store_true", help="Include the original target/address context")
     job_result.set_defaults(handler=_job_result)
 
     job_cancel = job_sub.add_parser("cancel", help="Request cooperative job cancellation")
     _common_io_options(job_cancel, default_format="json")
     job_cancel.add_argument("job_id")
     job_cancel.set_defaults(handler=_job_cancel)
+
+    for name in ("wait", "watch"):
+        command = job_sub.add_parser(name, help="Resume waiting and return the original job result")
+        _common_io_options(command, default_format="json")
+        command.add_argument("job_id")
+        command.add_argument("--wait-timeout", type=float, default=DEFAULT_JOB_WAIT_TIMEOUT)
+        command.add_argument("--danger-always-wait", action="store_true")
+        command.add_argument("--with-context", action="store_true")
+        command.set_defaults(handler=_job_wait, watch=name == "watch")
 
     plugin = subparsers.add_parser("plugin", help="Install the Binary Ninja companion plugin")
     plugin_sub = plugin.add_subparsers(dest="plugin_command")
@@ -4380,11 +4479,15 @@ def build_parser() -> argparse.ArgumentParser:
     function = subparsers.add_parser("function", help="Function discovery helpers")
     function_sub = function.add_subparsers(dest="function_command")
     function_list = function_sub.add_parser("list", help="List functions")
+    _add_paged_args(function_list)
+    function_list.set_defaults(limit=-1)
     _common_io_options(function_list)
     _target_option(function_list, required=False)
     _add_function_address_args(function_list)
     function_list.set_defaults(handler=_function_list)
     function_search = function_sub.add_parser("search", help="Search functions by substring or regex")
+    _add_paged_args(function_search)
+    function_search.set_defaults(limit=-1)
     _common_io_options(function_search)
     _target_option(function_search, required=False)
     _add_function_address_args(function_search)
@@ -4669,6 +4772,7 @@ def build_parser() -> argparse.ArgumentParser:
     patch_status_p = patch_sub.add_parser("status", help="Show current patch status")
     _common_io_options(patch_status_p)
     _target_option(patch_status_p, required=False)
+    patch_status_p.add_argument("address")
     patch_status_p.set_defaults(handler=_patch_status)
     patch_assemble_p = patch_sub.add_parser("assemble", help="Assemble and patch at address")
     _common_io_options(patch_assemble_p, default_format="json")
@@ -4680,7 +4784,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(patch_nop_p, default_format="json")
     _target_option(patch_nop_p, required=False)
     patch_nop_p.add_argument("address")
-    patch_nop_p.add_argument("--length", type=int, default=4)
+    patch_nop_p.add_argument("--length", type=int, help="Exact byte range ending on an instruction boundary (default: one instruction)")
     patch_nop_p.set_defaults(handler=_patch_nop)
     patch_always_p = patch_sub.add_parser("always-branch", help="Force branch to always be taken")
     _common_io_options(patch_always_p, default_format="json")
@@ -4735,9 +4839,10 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(memory_reader_p)
     _target_option(memory_reader_p, required=False)
     memory_reader_p.add_argument("address")
-    memory_reader_p.add_argument("--length", type=int, default=256)
+    memory_reader_p.add_argument("--width", "--length", type=int, choices=(1, 2, 4, 8), default=4, help="Integer width in bytes")
+    memory_reader_p.add_argument("--endian", choices=("little", "big"), default="little")
     memory_reader_p.set_defaults(handler=_memory_reader)
-    memory_writer_p = memory_sub.add_parser("writer", help="Write typed value using BinaryWriter")
+    memory_writer_p = memory_sub.add_parser("writer", help="Write and verify an integer in the selected byte order")
     _common_io_options(memory_writer_p, default_format="json")
     _target_option(memory_writer_p, required=False)
     memory_writer_p.add_argument("address")
@@ -4749,35 +4854,21 @@ def build_parser() -> argparse.ArgumentParser:
     # --- value ---
     value = subparsers.add_parser("value", help="Register/stack value analysis at IL instructions")
     value_sub = value.add_subparsers(dest="value_command")
-    value_reg_p = value_sub.add_parser("reg", help="Get register value at an instruction")
-    _common_io_options(value_reg_p)
-    _target_option(value_reg_p, required=False)
-    value_reg_p.add_argument("function", help="Function identifier")
-    value_reg_p.add_argument("instr_index", type=int, help="IL instruction index")
-    value_reg_p.add_argument("register", help="Register name")
-    value_reg_p.set_defaults(handler=_value_reg)
-    value_stack_p = value_sub.add_parser("stack", help="Get stack value at an instruction")
-    _common_io_options(value_stack_p)
-    _target_option(value_stack_p, required=False)
-    value_stack_p.add_argument("function", help="Function identifier")
-    value_stack_p.add_argument("instr_index", type=int, help="IL instruction index")
-    value_stack_p.add_argument("offset", type=int, help="Stack offset")
-    value_stack_p.add_argument("--size", type=int, default=8)
-    value_stack_p.set_defaults(handler=_value_stack)
-    value_possible_p = value_sub.add_parser("possible", help="Get possible values at an instruction")
-    _common_io_options(value_possible_p)
-    _target_option(value_possible_p, required=False)
-    value_possible_p.add_argument("function", help="Function identifier")
-    value_possible_p.add_argument("instr_index", type=int, help="IL instruction index")
-    value_possible_p.add_argument("register", help="Register name")
-    value_possible_p.set_defaults(handler=_value_possible)
-    value_flags_p = value_sub.add_parser("flags", help="Get flag values at an instruction")
-    _common_io_options(value_flags_p)
-    _target_option(value_flags_p, required=False)
-    value_flags_p.add_argument("function", help="Function identifier")
-    value_flags_p.add_argument("instr_index", type=int, help="IL instruction index")
-    value_flags_p.add_argument("flag", help="Flag name")
-    value_flags_p.set_defaults(handler=_value_flags)
+    for name in ("reg", "stack", "possible", "flags"):
+        command = value_sub.add_parser(name, help="Query native LLIL data-flow values")
+        _common_io_options(command)
+        _target_option(command, required=False)
+        command.add_argument("function", help="Function identifier")
+        location = command.add_mutually_exclusive_group(required=True)
+        location.add_argument("instr_index", nargs="?", type=int, help="LLIL instruction index; never a machine address")
+        location.add_argument("--address", help="Machine address (supports va:/rva:/file:/map:NAME:)")
+        if name == "stack":
+            command.add_argument("offset", type=int, help="Signed stack offset")
+            command.add_argument("--size", type=int, default=8)
+        else:
+            command.add_argument("flag" if name == "flags" else "register")
+        command.add_argument("--after", action="store_true", help="Query after this LLIL instruction")
+        command.set_defaults(handler=_value_command)
 
     # --- search ---
     search = subparsers.add_parser("search", help="Search binary content")
@@ -4785,7 +4876,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_bytes_p = search_sub.add_parser("bytes", help="Search for byte pattern")
     _common_io_options(search_bytes_p)
     _target_option(search_bytes_p, required=False)
-    search_bytes_p.add_argument("pattern", help="Hex byte pattern (e.g. '48 8b 05 ?? ?? ?? ??')")
+    search_bytes_p.add_argument("pattern", help="Exact hex bytes (e.g. '48 8b 05'); wildcard bytes are not supported")
     search_bytes_p.add_argument("--start", help="Start address")
     search_bytes_p.add_argument("--end", help="End address")
     search_bytes_p.add_argument("--limit", type=int, default=100)
@@ -4795,6 +4886,8 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(search_constant_p, required=False)
     search_constant_p.add_argument("value", help="Constant value (hex or decimal)")
     search_constant_p.add_argument("--limit", type=int, default=100)
+    search_constant_p.add_argument("--start")
+    search_constant_p.add_argument("--end")
     search_constant_p.set_defaults(handler=_search_constant)
     search_text_p = search_sub.add_parser("text", help="Search for text/regex in decompiled output")
     _common_io_options(search_text_p)
@@ -4817,6 +4910,7 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(arch_assemble_p, required=False)
     arch_assemble_p.add_argument("assembly", help="Assembly code to assemble")
     arch_assemble_p.add_argument("--address", default="0x0", help="Address context for assembly")
+    arch_assemble_p.add_argument("--arch", dest="arch_name", help="Explicit architecture name")
     arch_assemble_p.set_defaults(handler=_arch_assemble)
     arch_disasm_p = arch_sub.add_parser("disasm-bytes", help="Disassemble raw bytes")
     _common_io_options(arch_disasm_p)
@@ -4824,6 +4918,7 @@ def build_parser() -> argparse.ArgumentParser:
     arch_disasm_p.add_argument("hex_bytes", help="Hex string of bytes to disassemble")
     arch_disasm_p.add_argument("--address", default="0x0", help="Address context")
     arch_disasm_p.add_argument("--count", type=int, help="Max instructions to decode")
+    arch_disasm_p.add_argument("--arch", dest="arch_name", help="Explicit architecture name")
     arch_disasm_p.set_defaults(handler=_arch_disasm_bytes)
 
     # --- segments / sections / data-vars ---
@@ -5532,7 +5627,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        return handler(args)
-    except BridgeError as exc:
+        with request_session(args.daemon):
+            return handler(args)
+    except (BridgeError, OSError, ValueError, TypeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

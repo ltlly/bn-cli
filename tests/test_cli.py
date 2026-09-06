@@ -239,14 +239,13 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
 
 
-def test_function_commands_do_not_accept_paging_flags():
+def test_function_commands_accept_opt_in_paging_and_default_to_all():
     parser = bn.cli.build_parser()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["function", "list", "--limit", "10"])
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(["function", "search", "--offset", "10", "attach"])
+    assert parser.parse_args(["function", "list", "--limit", "10"]).limit == 10
+    assert parser.parse_args(["function", "search", "--offset", "10", "attach"]).offset == 10
+    assert parser.parse_args(["function", "list"]).limit == -1
+    assert parser.parse_args(["function", "search", "attach"]).limit == -1
 
 
 def test_callsites_requires_exactly_one_scope_flag():
@@ -1157,7 +1156,7 @@ def test_help_full_prints_recursive_root_help(capsys):
 
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn\n" in stdout
+    assert "usage: bn [--daemon {gui,headless}]" in stdout
     assert "usage: bn struct {show,field} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "-h, --help" not in stdout

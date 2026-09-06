@@ -6,6 +6,7 @@ import json
 import socket
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,25 @@ from .paths import (
 
 class BridgeError(RuntimeError):
     pass
+
+
+_request_mode: ContextVar[str | None] = ContextVar("bn_request_mode", default=None)
+_request_instance: ContextVar[BridgeInstance | None] = ContextVar("bn_request_instance", default=None)
+_session_active: ContextVar[bool] = ContextVar("bn_session_active", default=False)
+
+
+@contextlib.contextmanager
+def request_session(mode: str | None = None):
+    """Lazily pin one connection for a complete CLI invocation, including jobs."""
+    mode_token = _request_mode.set(mode)
+    instance_token = _request_instance.set(None)
+    active_token = _session_active.set(True)
+    try:
+        yield
+    finally:
+        _session_active.reset(active_token)
+        _request_instance.reset(instance_token)
+        _request_mode.reset(mode_token)
 
 
 TRANSIENT_SOCKET_ERRNOS = {
@@ -220,6 +240,13 @@ def choose_instance() -> BridgeInstance:
             "Start one with `bn daemon start` or open Binary Ninja."
         )
 
+    explicit = _request_mode.get()
+    if explicit is not None:
+        for instance in instances:
+            if instance.mode == explicit:
+                return instance
+        raise BridgeError(f"No {explicit!r} daemon is running; run `bn daemon start --mode {explicit}`")
+
     sticky = read_current_daemon_mode()
     if sticky is not None:
         for instance in instances:
@@ -318,7 +345,11 @@ def send_request(
     timeout: float | None = None,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
-    instance = choose_instance()
+    instance = _request_instance.get()
+    if instance is None:
+        instance = choose_instance()
+        if _session_active.get():
+            _request_instance.set(instance)
     return _send_request_to_instance(
         instance,
         op,

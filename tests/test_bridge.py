@@ -2846,6 +2846,7 @@ def test_binary_view_reads_do_not_marshal_to_ui_thread(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge(mode="headless")
     bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    bv.segments = [types.SimpleNamespace(start=0x1000, end=0x2000, data_offset=0, data_length=0x1000)]
     instance.targets.register(bv)
 
     def fail_main_thread(_func):

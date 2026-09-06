@@ -26,6 +26,20 @@ bn skill install              # agent skill only (supports --client, --mode, --d
 
 ## Workflow
 
+### Headless and cross-tool addresses (read before using Frida/Unicorn observations)
+
+- Prefer `bn --daemon headless ...` in headless work. This selects and pins the daemon for this invocation without changing other clients' sticky selection. Use a concrete `--target` in parallel work.
+- Every target job reports its BN address context on stderr. Bare numbers and `va:` mean **BN virtual addresses**. Never feed an unlabelled Frida/Unicorn address back as a BN VA, and never interpret an IL index as a machine address.
+- Use `rva:0xOFFSET` relative to the current `BinaryView.image_base`. `view.start` and `original_image_base` can differ. Use `file:0xOFFSET` for backing-data offsets; do not calculate `base + file_offset`. Ambiguous file mappings are rejected and BSS can have no file offset.
+- Start with `bn inspect ADDRESS` to get coordinates, bytes, containing functions, xrefs and decompilation. `bn address resolve ADDRESS...` returns corresponding registered external addresses. These typed inputs work in existing decompile, memory, xref, value and mutation commands.
+- Capture Frida's actual module `{name,path,base: m.base.toString(),size}`. Save the JSON and run `bn address map import frida-SESSION module.json --kind frida-module --source pid:PID/session:SESSION`. If BN image base and view start differ, explicitly supply `--bn-base` identifying the BN address corresponding to `Module.base`. Then use `map:frida-SESSION:0xACTUAL_ADDRESS` directly.
+- For Unicorn, import a JSON object with `regions`, each containing exact `bn_start`, `external_start`, and `length` (hex strings are accepted): `bn address map import uc-SESSION regions.json --source unicorn:SESSION`. This supports independently placed code/data regions. Do not invent a global slide for a piecewise layout.
+- Use `bn address verify map:NAME:ADDRESS --bytes HEX` with **bytes actually read externally**. Exit 3 means mismatch; check the mapping, build identity, relocations and runtime modifications rather than guessing another base. This is a byte comparison, not process identity or whole-program equivalence verification.
+- Maps are user-declared, session-scoped, target-isolated, bounded, and rejected after BN layout changes. Re-register after external process restart or emulator remap, which bn-cli cannot observe. Do not reuse another run's ASLR base. Pointer tags/PAC/Thumb bits are never silently stripped.
+- Export reusable results with `--with-context --format json --out PATH`; without that flag the default result shape stays compatible. Use `bn job wait JOB --with-context` or `job watch` to resume tasks, and `bn result show PATH` to inspect saved results.
+- `bn value reg FUNCTION INDEX REGISTER` uses an LLIL index. For a machine address, use `bn value reg FUNCTION REGISTER --address map:NAME:ADDRESS`. `--after` queries after the selected instruction. Read both `address` and `llil_address`: the native mapping may associate different addresses. Native BN flag names come from `bn arch info` (e.g. x86 `z`, not `zf`).
+- `bn schema COMMAND...` is generated from the installed parser and requires no daemon; prefer it over guessing flags or relying on older examples. `bn doctor` reports actual BN version/capabilities. Native symbol arithmetic is explicitly `expr:SYMBOL+0xOFFSET`; its numeric rules are BN's, not ordinary CLI decimal rules.
+
 1. Discover what's running:
 
 ```bash
@@ -68,11 +82,11 @@ On Windows, the GUI bridge defaults to authenticated loopback TCP at `127.0.0.1:
 - `il-instruction` → `[index] text  (level)`
 - Value commands (`value-reg`, `value-stack`, `value-possible`, `value-flags`) → `type  value`
 - Mutation, preview, setup, and export commands default to `json` for structured status.
-- Use `--format json` when you need structured/programmable data; `--format ndjson` for streaming.
+- Use `--format json` when you need structured/programmable data; `--format ndjson` for line-oriented output (the server result is still materialized).
 - Use `--out <path>` to write output to a known file instead of stdout.
-- Use shell tools (`head`, `tail`, `rg`) to slice large outputs — `bn` does not add its own pagination or built-in offset/limit.
+- Use supported `--offset`/`--limit` options (see `bn schema <command...>`), or `bn result show PATH --offset N --limit N --fields field1,field2` after spill.
 
-Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata. Use `--out <path>` when you want the full body at a known location, or pipe through `head` to grab just the first N lines.
+Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata. Use `--out <path>` when you want the full body at a known location, then inspect that artifact with `bn result show`; piping an already-spilled command to `head` cannot recover the empty stdout.
 
 ## Background Jobs
 
@@ -85,6 +99,8 @@ bn decompile large_function --danger-always-wait
 
 bn job list
 bn job status <job_id>
+bn job wait <job_id>
+bn job watch <job_id>
 bn job result <job_id> --out /tmp/result.json
 bn job cancel <job_id>
 ```
@@ -172,23 +188,23 @@ bn xref-ext code-refs-to 0x401000         # code references TO an address
 bn xref-ext code-refs-from 0x401000       # code references FROM an address
 bn xref-ext data-refs-to 0x401000         # data references TO an address
 bn xref-ext data-refs-from 0x401000       # data references FROM an address
-bn xref-ext type-refs MyStruct            # references to a named type
+bn schema xref-ext                      # available reference queries
 ```
 
 ### IL Navigation
 
 ```bash
-bn il-nav get-index-for-addr 0x401000     # address → IL index
-bn il-nav get-addr-for-index 42           # IL index → address
+bn il-nav addr-to-index 0x401000 0x401010     # address → IL index
+bn il-nav index-to-addr 0x401000 42           # IL index → address
 ```
 
 ### Memory and Binary Content
 
 ```bash
 bn memory read 0x401000 --length 64       # raw memory read (hex output)
-bn memory write 0x401000 --hex "90909090" # raw memory write
-bn search --bytes "48 89 5c 24"           # search binary content by byte pattern
-bn search --text "error"                  # search binary content by text
+bn memory write 0x401000 "90909090" # raw memory write
+bn search bytes "48 89 5c 24"           # search binary content by byte pattern
+bn search text "error"                  # search binary content by text
 bn data-typed-at 0x601000                 # typed data variable at address
 bn binary-bbs-at 0x401000                 # basic blocks at address (binary-wide)
 ```
@@ -196,14 +212,14 @@ bn binary-bbs-at 0x401000                 # basic blocks at address (binary-wide
 ### Value Analysis
 
 ```bash
-bn value --address 0x401000 --reg rax     # register value at IL instruction
-bn value --address 0x401000 --stack -8    # stack value at IL instruction
+bn value reg 0x401000 rax --address 0x401010     # register value at IL instruction
+bn value stack 0x401000 -8 --address 0x401010    # stack value at IL instruction
 ```
 
 ### Architecture
 
 ```bash
-bn arch                                   # architecture info for the target
+bn arch info                              # architecture info for the target
 ```
 
 ## Database & Undo
@@ -223,14 +239,14 @@ bn undo redo                              # redo the last undone action
 ```bash
 bn type-ext parse "int (*)(void*, int)"   # parse a C type string
 bn type-ext library-list                  # list available type libraries
-bn type-ext library-query libc            # query types in a library
+bn type-ext library-get libc              # inspect a library by id/name
 
-bn annotation get-tags --function sub_401000     # get tags for a function
-bn annotation get-tags --address 0x401000        # get tags at an address
-bn annotation create-tag "Important" "star"      # create a tag type
-bn annotation add-tag --function sub_401000 "Important" "review needed"
-bn annotation remove-tag --function sub_401000 "Important"
-bn annotation list-tag-types                     # list all tag types
+bn annotation get-tags 0x401000                 # get tags at an address
+
+bn py exec --code 'bv.create_tag_type("Important", "★")'  # create a tag type
+bn annotation add-tag 0x401000 "Important" "review needed"
+
+bn py exec --code 'result = list(bv.tag_types)'   # list tag types
 ```
 
 ## Analysis & Metadata
@@ -242,7 +258,7 @@ bn analysis update                        # trigger analysis update
 bn metadata store mykey '{"foo": "bar"}'  # store metadata key-value
 bn metadata query mykey                   # query metadata by key
 bn metadata remove mykey                  # remove metadata by key
-bn metadata keys                          # list all metadata keys
+bn schema metadata                        # available metadata operations
 ```
 
 ## Advanced Operations
@@ -250,8 +266,8 @@ bn metadata keys                          # list all metadata keys
 ### Loader & Rebase
 
 ```bash
-bn loader settings                        # show loader settings
-bn loader rebase 0x10000                  # rebase the binary
+bn loader settings-get ELF                # show loader settings
+bn loader rebase 0x10000                  # returns a NEW target id; old target/maps are retired
 ```
 
 ### External Libraries
@@ -259,38 +275,38 @@ bn loader rebase 0x10000                  # rebase the binary
 ```bash
 bn external library-list                  # list external libraries
 bn external library-add libfoo.so         # add an external library
-bn external location-list                 # list external locations
-bn external location-add libfoo.so foo 0x1000  # add an external location
+bn external location-get 0x401000          # inspect an external location
+bn external location-add 0x401000 --library-name libfoo.so --target-symbol foo
 ```
 
 ### User-Defined IL Data Flow
 
 ```bash
-bn uidf from-address 0x401000            # user IL data flow from address
+bn uidf list 0x401000                    # user-informed values for this function
 ```
 
 ### User Sections & Segments
 
 ```bash
-bn section-user create .mytext 0x1000 0x100   # create a user section
-bn section-user delete .mytext                # delete a user section
-bn segment-user create 0x1000 0x100 --flags r-x  # create a user segment
-bn segment-user delete 0x1000                    # delete a user segment
+bn section-user add .mytext 0x1000 256   # create a user section
+bn section-user remove .mytext                # delete a user section
+bn segment-user add 0x1000 256  # create a user segment
+bn segment-user remove 0x1000                    # delete a user segment
 ```
 
 ### Debug Info & Plugin Commands
 
 ```bash
-bn debug-info list                        # list debug info parsers/types/functions
+bn debug-info parsers                     # list debug info parsers
 bn plugin-cmd list                        # list registered plugin commands
-bn plugin-cmd run "My Plugin Command"     # run a registered plugin command
+bn plugin-cmd execute "My Plugin Command"     # run a registered plugin command
 ```
 
 ### Binary Patching
 
 ```bash
-bn patch --address 0x401000 --hex "90"    # patch bytes at address
-bn patch --address 0x401000 --asm "nop"   # patch assembly at address
+bn memory write 0x401000 "90"    # patch bytes at address
+bn patch assemble 0x401000 "nop"   # patch assembly at address
 ```
 
 ## API Documentation Lookup

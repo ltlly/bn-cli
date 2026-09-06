@@ -34,7 +34,9 @@ from .paths import (
     bridge_socket_path,
     bridge_tcp_port,
 )
-from .version import VERSION, build_id_for_file
+from .version import VERSION, bridge_build_id
+from .addressing import AddressResolver, AddressError
+from .artifacts import atomic_write
 
 try:
     import binaryninjaui as ui
@@ -42,7 +44,7 @@ except Exception:  # pragma: no cover - headless raises UIPluginInHeadlessError;
     ui = None
 
 
-PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
+PLUGIN_BUILD_ID = bridge_build_id(Path(__file__).resolve())
 SETTINGS_GROUP = "bnAgentBridge"
 GUI_PORT_SETTING = f"{SETTINGS_GROUP}.guiPort"
 
@@ -162,6 +164,7 @@ class _ReadWriteLock:
 READ_LOCKED_OPS = {
     "function_info",
     "get_prototype",
+    "address_context", "address_resolve", "address_verify", "address_map_list", "address_map_export", "inspect", "value_query",
     "list_functions",
     "list_locals",
     "search_functions",
@@ -294,6 +297,7 @@ WRITE_LOCKED_OPS = {
     "save_target",
     # --- patch (write) ---
     "patch_assemble",
+    "address_map_add", "address_map_import", "address_map_remove",
     "patch_nop",
     "patch_always_branch",
     "patch_invert_branch",
@@ -463,7 +467,7 @@ def _write_json_artifact(path_text: str | None, payload: Any) -> dict[str, Any] 
     path = Path(path_text).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-    path.write_bytes(data)
+    atomic_write(path, data)
     return {
         "ok": True,
         "artifact_path": str(path),
@@ -922,6 +926,7 @@ class JobRecord:
     done_event: threading.Event | None = None
     bv: Any = None
     background_task: Any = None
+    address_context: dict | None = None
 
     def __post_init__(self) -> None:
         if self.cancel_event is None:
@@ -932,6 +937,7 @@ class JobRecord:
     def to_dict(self) -> dict[str, Any]:
         return {
             "job_id": self.job_id,
+            "wait_supported": True,
             "op": self.op,
             "target_id": self.target_id,
             "access": self.access,
@@ -943,6 +949,7 @@ class JobRecord:
             "cancelable": self.cancelable,
             "error": self.error,
             "artifact_path": self.artifact_path,
+            "address_context": self.address_context,
         }
 
 
@@ -1011,7 +1018,7 @@ class JobManager:
             view_id=view_id,
             access="write" if op in WRITE_LOCKED_OPS else "read",
             created_at=datetime.now(timezone.utc).isoformat(),
-            cancelable=op not in {"py_exec", "plugin_execute", "plugin_valid_commands"},
+            cancelable=op not in {"py_exec", "plugin_execute", "plugin_valid_commands", "loader_rebase"},
             bv=bv,
         )
         with self._lock:
@@ -1030,9 +1037,7 @@ class JobManager:
     def _write_result(self, job: JobRecord, result: Any) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
         path = self._artifact_for(job)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(result, sort_keys=True, default=str), encoding="utf-8")
-        temporary.replace(path)
+        atomic_write(path, json.dumps(result, sort_keys=True, default=str).encode("utf-8"))
         job.artifact_path = str(path)
 
     def _run(self, job: JobRecord) -> None:
@@ -1055,21 +1060,23 @@ class JobManager:
             job.started_at = datetime.now(timezone.utc).isoformat()
             job.progress = "running"
             result = self._bridge._execute_job(job)
-            self._bridge._check_job_cancelled()
-            if self._stopping:
-                raise JobCancelled("Bridge stopped before the result was delivered")
+            # A completed operation (possibly a committed write) owns its outcome.
+            # Cancellation is checked inside operations before their commit point.
             self._write_result(job, result)
-            job.state = "succeeded"
-            job.progress = "completed"
+            with self._lock:
+                job.state = "succeeded"
+                job.progress = "completed"
         except JobCancelled as exc:
-            job.state = "cancelled"
-            job.error = str(exc)
-            job.progress = "cancelled"
+            with self._lock:
+                job.state = "cancelled"
+                job.error = str(exc)
+                job.progress = "cancelled"
         except Exception as exc:
-            job.state = "failed"
-            job.error = f"{type(exc).__name__}: {exc}"
-            job.traceback = traceback.format_exc()
-            job.progress = "failed"
+            with self._lock:
+                job.state = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
+                job.traceback = traceback.format_exc()
+                job.progress = "failed"
             bn.log_error(job.traceback)
         finally:
             job.completed_at = datetime.now(timezone.utc).isoformat()
@@ -1129,14 +1136,15 @@ class JobManager:
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
-        if not job.cancelable:
-            return {"accepted": False, "reason": "operation is not safely cancellable", "job": job.to_dict()}
-        if job.state in {"succeeded", "failed", "cancelled"}:
-            return {"accepted": False, "reason": "job already completed", "job": job.to_dict()}
-        job.state = "cancel_requested"
-        job.progress = "cancellation requested"
-        assert job.cancel_event is not None
-        job.cancel_event.set()
+        with self._lock:
+            if not job.cancelable:
+                return {"accepted": False, "reason": "operation is not safely cancellable", "job": job.to_dict()}
+            if job.state in {"succeeded", "failed", "cancelled"}:
+                return {"accepted": False, "reason": "job already completed", "job": job.to_dict()}
+            job.state = "cancel_requested"
+            job.progress = "cancellation requested"
+            assert job.cancel_event is not None
+            job.cancel_event.set()
         if job.background_task is not None:
             with contextlib.suppress(Exception):
                 job.background_task.cancel()
@@ -1171,6 +1179,7 @@ class BinaryNinjaBridge:
     def __init__(self, mode: str = "gui"):
         self.mode = mode
         self.targets = TargetManager(mode=mode)
+        self._address_spaces: dict[str, dict] = {}
         self.socket_path = bridge_socket_path(mode)
         self.registry_path = bridge_registry_path(mode)
         self.transport = "unix" if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX") else "tcp"
@@ -1339,6 +1348,13 @@ class BinaryNinjaBridge:
                 return _json_response(ok=True, result=self.jobs.list())
             if op == "job_status":
                 return _json_response(ok=True, result=self.jobs.status(str(params["job_id"])))
+            if op == "job_wait":
+                wait = float(params.get("timeout", 1))
+                if not 0 <= wait <= 30:
+                    raise ValueError("job_wait timeout must be between 0 and 30 seconds")
+                job = self.jobs.get(str(params["job_id"]))
+                job.done_event.wait(wait)
+                return _json_response(ok=True, result=job.to_dict())
             if op == "job_result":
                 return _json_response(ok=True, result=self.jobs.result(str(params["job_id"])))
             if op == "job_cancel":
@@ -1360,7 +1376,9 @@ class BinaryNinjaBridge:
                 outcome = self.jobs.result(record.job_id)
                 if record.state != "succeeded":
                     raise RuntimeError(record.error or f"Job {record.state}")
-                return _json_response(ok=True, result=outcome["result"])
+                response = _json_response(ok=True, result=outcome["result"])
+                response["address_context"] = record.address_context
+                return response
             # Fallback for ops without a declared lock class.
             result = self._execute_operation(op, params, target)
             return _json_response(ok=True, result=result)
@@ -1373,12 +1391,15 @@ class BinaryNinjaBridge:
             with self._global_lock.read():
                 # Resolve the concrete target id again while close_target is excluded.
                 self.targets.resolve(job.target_id)
-                return self._execute_operation(job.op, job.params, job.target_id)
+                job.address_context = self._address_context(job.bv)
+                result = self._execute_operation(job.op, job.params, job.target_id)
+                job.address_context = self._address_context(job.bv)
+                return result
         finally:
             self._job_local.record = None
 
     def _check_job_cancelled(self) -> None:
-        job = getattr(self._job_local, "record", None)
+        job = getattr(getattr(self, "_job_local", None), "record", None)
         if job is not None:
             ui_cancelled = False
             if job.background_task is not None:
@@ -1398,6 +1419,10 @@ class BinaryNinjaBridge:
                     job.background_task.progress = message
 
     def _execute_operation(self, op: str, params: dict[str, Any], target: str | None):
+        if op.startswith("address_"):
+            return self._address_operation(op, params, target)
+        if op == "inspect":
+            return self._inspect(target, params["identifier"])
         if op == "shutdown":
             if self.mode != "headless":
                 raise RuntimeError("The shutdown operation is only available in headless mode")
@@ -1418,6 +1443,7 @@ class BinaryNinjaBridge:
                 target,
                 min_address=params.get("min_address"),
                 max_address=params.get("max_address"),
+                offset=int(params.get("offset", 0)), limit=params.get("limit"),
             )
         if op == "search_functions":
             return self._search_functions(
@@ -1426,6 +1452,7 @@ class BinaryNinjaBridge:
                 regex=bool(params.get("regex", False)),
                 min_address=params.get("min_address"),
                 max_address=params.get("max_address"),
+                offset=int(params.get("offset", 0)), limit=params.get("limit"),
             )
         if op == "callsites":
             return self._callsites(
@@ -1592,7 +1619,7 @@ class BinaryNinjaBridge:
         if op == "patch_assemble":
             return self._patch_assemble(target, params["address"], str(params["asm"]))
         if op == "patch_nop":
-            return self._patch_nop(target, params["address"])
+            return self._patch_nop(target, params["address"], params.get("length"))
         if op == "patch_always_branch":
             return self._patch_always_branch(target, params["address"])
         if op == "patch_invert_branch":
@@ -1619,10 +1646,12 @@ class BinaryNinjaBridge:
         if op == "memory_writer_write":
             return self._memory_writer_write(
                 target, params["address"], int(params["width"]),
-                int(params["value"]), endian=str(params.get("endian", "little")),
+                _parse_address(params["value"]), endian=str(params.get("endian", "little")),
             )
 
         # --- value ops ---
+        if op == "value_query":
+            return self._value_query(target, params)
         if op == "value_flags_at":
             return self._value_flags_at(target, params["function_start"], params["address"])
         if op == "value_possible":
@@ -1652,8 +1681,8 @@ class BinaryNinjaBridge:
             )
         if op == "search_constant":
             return self._search_constant(
-                target, int(params["constant"]),
-                start=params["start"], end=params["end"],
+                target, _parse_address(params["constant"]),
+                start=params.get("start"), end=params.get("end"),
                 limit=params.get("limit"),
             )
         if op == "search_text":
@@ -1661,6 +1690,7 @@ class BinaryNinjaBridge:
                 target, str(params["query"]),
                 start=params.get("start"), end=params.get("end"),
                 regex=bool(params.get("regex", False)),
+                il_type=str(params.get("il_type", "hlil")),
                 limit=params.get("limit"),
             )
 
@@ -1678,6 +1708,7 @@ class BinaryNinjaBridge:
                 target, str(params["data_hex"]),
                 address=params.get("address"),
                 arch_name=params.get("arch_name"),
+                count=params.get("count"),
             )
 
         # --- segments/sections/data_vars ---
@@ -1931,6 +1962,13 @@ class BinaryNinjaBridge:
             "socket_path": self.endpoint,
             "transport": self.transport,
             "mode": self.mode,
+            "binaryninja_version": getattr(bn, "core_version", lambda: "unknown")(),
+            "capabilities": {
+                "job_wait": True, "explicit_address_spaces": True,
+                "image_base": hasattr(getattr(bn, "BinaryView", None), "image_base"),
+                "parse_expression": hasattr(getattr(bn, "BinaryView", None), "parse_expression"),
+                "file_offset_mapping": hasattr(getattr(bn, "BinaryView", None), "get_data_offset_for_address"),
+            },
             "targets": self.targets.refresh(),
         }
 
@@ -1953,6 +1991,7 @@ class BinaryNinjaBridge:
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
             "entry_point": hex(getattr(bv, "entry_point", 0)),
+            "address_context": self._address_context(bv),
         }
 
     def _set_active_target(self, params: dict[str, Any]):
@@ -2069,6 +2108,7 @@ class BinaryNinjaBridge:
             record = self.targets.unregister(view_id)
             self._remove_target_lock(view_id)
             target_id = record.target_id() if record is not None else None
+            self._address_spaces.pop(target_id, None)
             try:
                 if bv.file is not None:
                     bv.file.close()
@@ -2233,21 +2273,20 @@ class BinaryNinjaBridge:
 
     @staticmethod
     def _read_override(machine: Any, activity: str) -> bool | None:
-        try:
-            resp = machine.override_query(activity)
-        except Exception:
-            return None
-        if not isinstance(resp, dict):
-            return None
+        resp = machine.override_query(activity)
+        if not BinaryNinjaBridge._command_accepted(resp):
+            raise OperationFailure("unsupported", "Workflow override query was not accepted; state is unknown")
         response = resp.get("response")
         if not isinstance(response, dict):
-            return None
+            raise OperationFailure("unsupported", "Workflow override query has no state response")
         info = response.get("activity")
         if not isinstance(info, dict):
-            return None
+            raise OperationFailure("unsupported", "Workflow override query has no activity state")
         if "override" not in info:
             return None
-        return bool(info.get("override"))
+        if not isinstance(info["override"], bool):
+            raise OperationFailure("unsupported", "Workflow override state is not boolean")
+        return info["override"]
 
     @staticmethod
     def _command_accepted(resp: Any) -> bool:
@@ -2272,32 +2311,38 @@ class BinaryNinjaBridge:
             raise OperationFailure("unsupported", "activity name is required")
         owner, scope, machine = self._resolve_workflow_machine(selector, function)
         before = self._read_override(machine, activity)
-        if action == "set":
-            cmd_resp = machine.override_set(activity, bool(enable))
-            expected: bool | None = bool(enable)
-        elif action == "clear":
-            cmd_resp = machine.override_clear(activity)
-            expected = None
-        else:
-            raise OperationFailure("unsupported", f"Unknown override action: {action}")
+        def restore_before() -> bool:
+            try:
+                response = machine.override_clear(activity) if before is None else machine.override_set(activity, before)
+                return self._command_accepted(response) and self._read_override(machine, activity) == before
+            except Exception:
+                return False
 
-        accepted = self._command_accepted(cmd_resp)
-        after = self._read_override(machine, activity)
-        verified = after == expected
+        try:
+            if action == "set":
+                cmd_resp = machine.override_set(activity, bool(enable))
+                expected: bool | None = bool(enable)
+            elif action == "clear":
+                cmd_resp = machine.override_clear(activity)
+                expected = None
+            else:
+                raise OperationFailure("unsupported", f"Unknown override action: {action}")
+
+            accepted = self._command_accepted(cmd_resp)
+            after = self._read_override(machine, activity)
+            verified = after == expected
+
+        except Exception as exc:
+            if not restore_before():
+                raise RuntimeError("Workflow override failed and restoration could not be verified") from exc
+            raise
 
         reverted = False
         if preview or not accepted or not verified:
-            try:
-                if before is None:
-                    machine.override_clear(activity)
-                else:
-                    machine.override_set(activity, before)
-                reverted = True
-            except Exception:
-                reverted = False
+            reverted = restore_before()
 
         if preview:
-            status = "previewed" if (accepted and verified) else "verification_failed"
+            status = "previewed" if (accepted and verified and reverted) else "verification_failed"
         elif accepted and verified:
             status = "verified"
         elif not accepted:
@@ -2456,9 +2501,95 @@ class BinaryNinjaBridge:
     def _resolve_view(self, selector: str | None):
         return self.targets.resolve(selector)
 
+    def _address_resolver(self, bv) -> AddressResolver:
+        targets = getattr(self, "targets", None)
+        key = targets.target_id_for(bv) if targets is not None else None
+        spaces = getattr(self, "_address_spaces", {}).get(key, {})
+        return AddressResolver(bv, spaces)
+
+    def _address(self, bv, value, *, endpoint=False) -> int:
+        return self._address_resolver(bv).resolve(value, endpoint=endpoint)
+
+    def _address_context(self, bv) -> dict:
+        context = self._address_resolver(bv).context()
+        context["target_id"] = self.targets.target_id_for(bv)
+        context["filename"] = str(getattr(getattr(bv, "file", None), "filename", ""))
+        return context
+
+    def _address_operation(self, op, params, target):
+        bv = self._resolve_view(target)
+        if op in {"address_map_add", "address_map_import"}:
+            key = self.targets.target_id_for(bv)
+            self._address_spaces.setdefault(key, {})
+        resolver = self._address_resolver(bv)
+        if op == "address_context":
+            return {**self._address_context(bv), "segments": [
+                {key: hex(value) for key, value in row.items()} for row in resolver.segments()]}
+        if op == "address_resolve":
+            rows = [resolver.describe(value) for value in params["addresses"]]
+            for row in rows:
+                row.pop("address_context")
+            return {"address_context": self._address_context(bv),
+                    "addresses": rows}
+        if op == "address_verify":
+            location = resolver.describe(params["address"])
+            location.pop("address_context")
+            data = bytes.fromhex(params["bytes"])
+            if not data or len(data) > 65536:
+                raise AddressError("Verification requires 1..65536 observed bytes")
+            address = int(location["bn_va"], 16)
+            resolver.require_mapped(address, len(data))
+            observed = bv.read(address, len(data))
+            return {"location": location, "address_context": self._address_context(bv), "matches": data == observed, "success": data == observed, "external_bytes": data.hex(),
+                    "bn_bytes": observed.hex(), "meaning": "Byte comparison only; runtime relocations and patches may differ"}
+        if op == "address_map_add":
+            return resolver.add_slide(params["name"], params["base"], params["source"], params["size"], params.get("bn_base"))
+        if op == "address_map_import":
+            manifest = params["manifest"]
+            if params.get("kind") == "frida-module":
+                if params.get("bn_base") is None and resolver.base != bv.start:
+                    raise AddressError("BN image_base differs from view.start; specify --bn-base for the BN address corresponding to Frida Module.base")
+                return resolver.add_slide(params["name"], manifest["base"], params["source"], manifest["size"], params.get("bn_base"))
+            if params.get("bn_base") is not None:
+                raise AddressError("--bn-base applies to frida-module imports; region manifests already specify exact bn_start addresses")
+            return resolver.add_space(params["name"], manifest["regions"], params["source"], layout_id=manifest.get("layout_id"))
+        if op == "address_map_list":
+            return {"address_context": self._address_context(bv), "maps": list(resolver.spaces)}
+        if op == "address_map_export":
+            return resolver.export_space(params["name"])
+        if op == "address_map_remove":
+            if params["name"] not in resolver.spaces:
+                raise AddressError(f"Unknown address map {params['name']!r}")
+            del resolver.spaces[params["name"]]
+            return {"removed": params["name"]}
+        raise AddressError(f"Unknown address operation: {op}")
+
+    def _inspect(self, selector, identifier):
+        bv = self._resolve_view(selector)
+        resolver = self._address_resolver(bv)
+        try:
+            address = resolver.resolve(identifier)
+        except (ValueError, TypeError):
+            address = int(self._find_function(bv, identifier).start)
+        location = resolver.describe(address)
+        location.pop("address_context")
+        functions = self._functions_containing(bv, address)
+        at = bv.get_function_at(address)
+        if at is not None and all(int(fn.start) != address for fn in functions):
+            functions.insert(0, at)
+        return {
+            "location": location, "address_context": self._address_context(bv),
+            "functions": [{"name": fn.name, "address": hex(fn.start)} for fn in functions],
+            "disassembly": bv.get_disassembly(address),
+            "bytes_hex": bv.read(address, 16).hex(),
+            "xrefs": self._xrefs_to_address(bv, address),
+            "analysis_state": str(getattr(getattr(bv, "analysis_info", None), "state", "unknown")),
+            "decompile": self._decompile(selector, functions[0].start) if len(functions) == 1 else None,
+        }
+
     def _find_function(self, bv, identifier):
         try:
-            addr = _parse_address(identifier)
+            addr = self._address(bv, identifier)
             fn = bv.get_function_at(addr)
             if fn is not None:
                 return fn
@@ -2581,8 +2712,10 @@ class BinaryNinjaBridge:
         }
 
         try:
-            address = _parse_address(identifier)
-        except Exception:
+            address = self._address(bv, identifier)
+        except AddressError:
+            raise
+        except (ValueError, TypeError):
             address = None
 
         if address is not None:
@@ -3321,9 +3454,10 @@ class BinaryNinjaBridge:
         self,
         min_address: Any = None,
         max_address: Any = None,
+        bv=None,
     ) -> tuple[int | None, int | None]:
-        lower = _parse_address(min_address) if min_address not in (None, "") else None
-        upper = _parse_address(max_address) if max_address not in (None, "") else None
+        lower = self._address(bv, min_address) if min_address not in (None, "") else None
+        upper = self._address(bv, max_address) if max_address not in (None, "") else None
         if lower is not None and upper is not None and lower > upper:
             raise OperationFailure(
                 "invalid_address_range",
@@ -3338,7 +3472,7 @@ class BinaryNinjaBridge:
         min_address: Any = None,
         max_address: Any = None,
     ) -> list[Any]:
-        lower, upper = self._parse_function_address_bounds(min_address, max_address)
+        lower, upper = self._parse_function_address_bounds(min_address, max_address, bv=bv)
         functions = []
         for fn in list(bv.functions):
             self._check_job_cancelled()
@@ -3357,11 +3491,17 @@ class BinaryNinjaBridge:
         *,
         min_address: Any = None,
         max_address: Any = None,
+        offset: int = 0,
+        limit: int | None = None,
     ):
         bv = self._resolve_view(selector)
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("Pagination values must be nonnegative")
+        functions = self._filtered_functions(bv, min_address=min_address, max_address=max_address)
+        functions = functions[offset:None if limit is None else offset + limit]
         items = [
             {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
-            for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address)
+            for fn in functions
         ]
         return items
 
@@ -3373,8 +3513,12 @@ class BinaryNinjaBridge:
         regex: bool = False,
         min_address: Any = None,
         max_address: Any = None,
+        offset: int = 0,
+        limit: int | None = None,
     ):
         bv = self._resolve_view(selector)
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("Pagination values must be nonnegative")
         items = []
         if regex:
             try:
@@ -3394,6 +3538,11 @@ class BinaryNinjaBridge:
         for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address):
             self._check_job_cancelled()
             if matches(fn.name):
+                if offset:
+                    offset -= 1
+                    continue
+                if limit is not None and len(items) >= limit:
+                    break
                 items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
         return items
 
@@ -3490,8 +3639,10 @@ class BinaryNinjaBridge:
     def _xrefs(self, selector: str | None, identifier):
         bv = self._resolve_view(selector)
         try:
-            address = _parse_address(identifier)
-        except Exception:
+            address = self._address(bv, identifier)
+        except AddressError:
+            raise
+        except (ValueError, TypeError):
             address = self._find_function(bv, identifier).start
         return self._xrefs_to_address(bv, address)
 
@@ -3683,7 +3834,7 @@ class BinaryNinjaBridge:
         if address is None:
             raise RuntimeError("comment get requires --address or --function")
 
-        comment_address = _parse_address(address)
+        comment_address = self._address(bv, address)
         comment = bv.get_comment_at(comment_address)
         return {
             "address": hex(comment_address),
@@ -3820,7 +3971,7 @@ class BinaryNinjaBridge:
             functions = []
             try:
                 if kind == "create_function":
-                    fn = bv.get_function_at(_parse_address(op["address"]))
+                    fn = bv.get_function_at(self._address(bv, op["address"]))
                     functions = [fn] if fn is not None else []
                 elif kind == "rename_symbol" and op.get("kind") != "data":
                     functions = [self._find_function(bv, op["identifier"])]
@@ -3831,7 +3982,7 @@ class BinaryNinjaBridge:
                     if op.get("function"):
                         functions = [self._find_function(bv, op["function"])]
                     elif op.get("address"):
-                        functions = self._functions_containing(bv, _parse_address(op["address"]))
+                        functions = self._functions_containing(bv, self._address(bv, op["address"]))
                 elif kind.startswith("struct_") or kind == "types_declare":
                     for type_name in self._operation_type_names(bv, op):
                         functions.extend(self._guess_type_affected_functions(bv, type_name))
@@ -4104,7 +4255,7 @@ class BinaryNinjaBridge:
 
     def _verify_create_function(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         fn = bv.get_function_at(address)
         observed = {
             "address": item["address"],
@@ -4124,7 +4275,7 @@ class BinaryNinjaBridge:
 
     def _verify_rename_symbol(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         requested_name = str(item["new_name"])
         before_name = item.get("before_name")
         observed_name = None
@@ -4154,7 +4305,7 @@ class BinaryNinjaBridge:
 
     def _verify_set_comment(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         expected = str(item["requested"]["comment"])
         observed = bv.get_comment_at(address) or ""
         item["observed"] = {"address": item["address"], "comment": observed}
@@ -4170,7 +4321,7 @@ class BinaryNinjaBridge:
 
     def _verify_delete_comment(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         observed = bv.get_comment_at(address) or ""
         item["observed"] = {"address": item["address"], "comment": observed}
         if observed:
@@ -4185,7 +4336,7 @@ class BinaryNinjaBridge:
 
     def _verify_set_prototype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         fn = bv.get_function_at(address)
         if fn is None:
             raise OperationFailure(
@@ -4208,7 +4359,7 @@ class BinaryNinjaBridge:
 
     def _verify_local_rename(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         fn = bv.get_function_at(address)
         if fn is None:
             raise OperationFailure(
@@ -4236,7 +4387,7 @@ class BinaryNinjaBridge:
 
     def _verify_local_retype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
-        address = _parse_address(item["address"])
+        address = self._address(bv, item["address"])
         fn = bv.get_function_at(address)
         if fn is None:
             raise OperationFailure(
@@ -4432,8 +4583,7 @@ class BinaryNinjaBridge:
             for op in operations:
                 results.append(self._apply_operation(bv, op))
         except OperationFailure as exc:
-            with contextlib.suppress(Exception):
-                bv.revert_undo_actions(state)
+            bv.revert_undo_actions(state)
             return {
                 "preview": preview,
                 "success": False,
@@ -4444,6 +4594,9 @@ class BinaryNinjaBridge:
                 "affected_functions": [],
                 "affected_types": [],
             }
+        except Exception:
+            bv.revert_undo_actions(state)
+            raise
 
         try:
             bv.update_analysis_and_wait()
@@ -4485,12 +4638,11 @@ class BinaryNinjaBridge:
                 "affected_types": type_diffs,
             }
         except Exception:
-            with contextlib.suppress(Exception):
-                bv.revert_undo_actions(state)
+            bv.revert_undo_actions(state)
             raise
 
     def _op_create_function(self, bv, op: dict[str, Any]):
-        address = _parse_address(op["address"])
+        address = self._address(bv, op["address"])
         requested = self._operation_requested(op)
         before = bv.get_function_at(address)
         if before is None:
@@ -4556,7 +4708,7 @@ class BinaryNinjaBridge:
                 "before_comment": before_comment,
                 "requested": self._operation_requested(op),
             }
-        address = _parse_address(op["address"])
+        address = self._address(bv, op["address"])
         before_comment = bv.get_comment_at(address) or ""
         if before_comment != comment:
             bv.set_comment_at(address, comment)
@@ -4580,7 +4732,7 @@ class BinaryNinjaBridge:
                 "before_comment": before_comment,
                 "requested": self._operation_requested(op),
             }
-        address = _parse_address(op["address"])
+        address = self._address(bv, op["address"])
         before_comment = bv.get_comment_at(address) or ""
         if before_comment:
             bv.set_comment_at(address, None)
@@ -4765,7 +4917,7 @@ class BinaryNinjaBridge:
 
     def _patch_status(self, selector, address_raw):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         return {
             "address": hex(addr),
             "can_assemble": bv.arch.can_assemble if bv.arch else False,
@@ -4776,29 +4928,71 @@ class BinaryNinjaBridge:
             "is_skip_and_return_value_patch_available": bv.is_skip_and_return_value_patch_available(addr),
         }
 
+    def _instruction_arch(self, bv, address):
+        get_blocks = getattr(bv, "get_basic_blocks_at", None)
+        arches = {str(block.arch): block.arch for block in get_blocks(address)} if get_blocks else {}
+        if len(arches) > 1:
+            raise RuntimeError(f"Ambiguous instruction architecture at {hex(address)}: {list(arches)}")
+        arch = next(iter(arches.values()), bv.arch)
+        if arch is None:
+            raise RuntimeError("No architecture available")
+        return arch
+
+    def _write_bytes(self, bv, address, data):
+        if not data:
+            raise RuntimeError("Refusing an empty byte write")
+        self._address_resolver(bv).require_mapped(address, len(data))
+        before = bv.read(address, len(data))
+        if len(before) != len(data):
+            raise RuntimeError(f"Cannot read full write range at {hex(address)}")
+        state = bv.begin_undo_actions()
+        try:
+            written = bv.write(address, data)
+            if written != len(data) or bv.read(address, len(data)) != data:
+                raise RuntimeError(f"Write verification failed at {hex(address)}: wrote {written}/{len(data)} bytes")
+            self._check_job_cancelled()
+            bv.commit_undo_actions(state)
+        except Exception:
+            bv.revert_undo_actions(state)
+            raise
+        return {"address": hex(address), "bytes_written": written, "before_hex": before.hex(), "data_hex": data.hex()}
+
     def _patch_assemble(self, selector, address_raw, asm_text: str):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
-        def _do():
-            result = bv.assemble(asm_text, addr)
-            if result is None:
-                raise RuntimeError(f"Assembly failed at {hex(addr)}: {asm_text!r}")
-            bv.write(addr, result)
-            return {"address": hex(addr), "asm": asm_text, "bytes_hex": result.hex(), "length": len(result)}
-        return _do()
+        addr = self._address(bv, address_raw)
+        arch = self._instruction_arch(bv, addr)
+        result = arch.assemble(asm_text, addr)
+        if not isinstance(result, bytes) or not result:
+            raise RuntimeError(f"Assembly failed at {hex(addr)}: {asm_text!r}")
+        write = self._write_bytes(bv, addr, result)
+        return {**write, "asm": asm_text, "arch": str(arch), "bytes_hex": result.hex(), "length": len(result)}
 
-    def _patch_nop(self, selector, address_raw):
+    def _patch_nop(self, selector, address_raw, length=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
-        def _do():
-            if not bv.convert_to_nop(addr):
-                raise RuntimeError(f"convert_to_nop failed at {hex(addr)}")
-            return {"address": hex(addr), "patched": True, "kind": "nop"}
-        return _do()
+        addr = self._address(bv, address_raw)
+        arch = self._instruction_arch(bv, addr)
+        size = bv.get_instruction_length(addr, arch) if length is None else int(length)
+        if size <= 0:
+            raise RuntimeError("NOP length must be positive")
+        self._address_resolver(bv).require_mapped(addr, size)
+        original = bv.read(addr, size)
+        cursor = 0
+        while cursor < size:
+            self._check_job_cancelled()
+            if str(self._instruction_arch(bv, addr + cursor)) != str(arch):
+                raise RuntimeError("NOP range crosses instruction architectures")
+            info = arch.get_instruction_info(original[cursor:], addr + cursor)
+            if info is None or info.length <= 0 or cursor + info.length > size:
+                raise RuntimeError("NOP range must end on an instruction boundary")
+            cursor += info.length
+        result = arch.convert_to_nop(original, addr)
+        if result is None or len(result) != size:
+            raise RuntimeError(f"convert_to_nop failed at {hex(addr)}")
+        return {**self._write_bytes(bv, addr, result), "patched": True, "kind": "nop", "length": size}
 
     def _patch_always_branch(self, selector, address_raw):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             if not bv.always_branch(addr):
                 raise RuntimeError(f"always_branch failed at {hex(addr)}")
@@ -4807,7 +5001,7 @@ class BinaryNinjaBridge:
 
     def _patch_invert_branch(self, selector, address_raw):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             if not bv.invert_branch(addr):
                 raise RuntimeError(f"invert_branch failed at {hex(addr)}")
@@ -4816,7 +5010,7 @@ class BinaryNinjaBridge:
 
     def _patch_never_branch(self, selector, address_raw):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             if not bv.never_branch(addr):
                 raise RuntimeError(f"never_branch failed at {hex(addr)}")
@@ -4825,7 +5019,7 @@ class BinaryNinjaBridge:
 
     def _patch_skip_and_return(self, selector, address_raw, value: int):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             if not bv.skip_and_return_value(addr, value):
                 raise RuntimeError(f"skip_and_return_value failed at {hex(addr)}")
@@ -4838,35 +5032,37 @@ class BinaryNinjaBridge:
 
     def _memory_read(self, selector, address_raw, length: int):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         if length < 1 or length > 65536:
             raise RuntimeError(f"length must be 1..65536, got {length}")
+        self._address_resolver(bv).require_mapped(addr, length)
         data = bv.read(addr, length)
+        if len(data) != length:
+            raise AddressError(f"Short read at {hex(addr)}: {len(data)}/{length} bytes")
         return {"address": hex(addr), "length": len(data), "data_hex": data.hex()}
 
     def _memory_write(self, selector, address_raw, data_hex: str):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         data = bytes.fromhex(data_hex)
-        written = bv.write(addr, data)
-        return {"address": hex(addr), "bytes_written": written, "data_hex": data_hex}
+        return self._write_bytes(bv, addr, data)
 
     def _memory_insert(self, selector, address_raw, data_hex: str):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         data = bytes.fromhex(data_hex)
         result = bv.insert(addr, data)
         return {"address": hex(addr), "bytes_inserted": result, "data_hex": data_hex}
 
     def _memory_remove(self, selector, address_raw, length: int):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         result = bv.remove(addr, length)
         return {"address": hex(addr), "bytes_removed": result, "length": length}
 
     def _memory_reader_read(self, selector, address_raw, width: int, *, endian: str = "little"):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         if width not in (1, 2, 4, 8):
             raise RuntimeError(f"width must be 1, 2, 4, or 8; got {width}")
         def _do():
@@ -4888,32 +5084,62 @@ class BinaryNinjaBridge:
 
     def _memory_writer_write(self, selector, address_raw, width: int, value: int, *, endian: str = "little"):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         if width not in (1, 2, 4, 8):
             raise RuntimeError(f"width must be 1, 2, 4, or 8; got {width}")
-        def _do():
-            writer = bn.BinaryWriter(bv)
-            writer.seek(addr)
-            writer.endianness = bn.Endianness.LittleEndian if endian == "little" else bn.Endianness.BigEndian
-            if width == 1:
-                writer.write8(value)
-            elif width == 2:
-                writer.write16(value)
-            elif width == 4:
-                writer.write32(value)
-            else:
-                writer.write64(value)
-            return {"address": hex(addr), "width": width, "endian": endian, "value": value, "written": True}
-        return _do()
+        data = value.to_bytes(width, byteorder=endian, signed=False)
+        return {**self._write_bytes(bv, addr, data), "width": width, "endian": endian, "value": value, "written": True}
 
     # =========================================================================
     # Value analysis operations
     # =========================================================================
 
+    def _value_query(self, selector, params):
+        bv = self._resolve_view(selector)
+        fn = self._find_function(bv, params["function_start"])
+        index, address = params.get("instruction_index"), params.get("address")
+        if (index is None) == (address is None):
+            raise ValueError("Specify exactly one LLIL instruction_index or machine address")
+        if index is not None:
+            if not isinstance(index, int) or not 0 <= index < len(fn.llil):
+                raise ValueError("LLIL instruction index is out of range")
+            instruction = fn.llil[index]
+            requested_address = None
+        else:
+            requested_address = self._address(bv, address)
+            instruction = fn.get_low_level_il_at(requested_address)
+        if instruction is None:
+            raise AddressError("No LLIL instruction at this machine address; inspect analysis status and address coordinates")
+        kind = params["kind"]
+        methods = {"reg": "get_reg_value", "possible": "get_possible_reg_values",
+                   "stack": "get_stack_contents", "flags": "get_flag_value"}
+        if kind not in methods:
+            raise ValueError(f"Unknown value query: {kind}")
+        after = bool(params.get("after"))
+        method = getattr(instruction, methods[kind] + ("_after" if after else ""), None)
+        if method is None:
+            raise RuntimeError(f"Installed Binary Ninja does not support {methods[kind]}")
+        if kind == "stack":
+            size = int(params.get("size", 8))
+            if size not in (1, 2, 4, 8):
+                raise ValueError("Stack value size must be 1, 2, 4 or 8")
+            value = method(int(params["offset"]), size)
+        else:
+            operand = str(params["flag" if kind == "flags" else "register"])
+            try:
+                value = method(operand)
+            except KeyError as exc:
+                raise ValueError(f"Unknown {'flag' if kind == 'flags' else 'register'} {operand!r}; use names from `bn arch info`") from exc
+        return {"function": hex(fn.start), "address": hex(instruction.address if requested_address is None else requested_address),
+                "llil_address": hex(instruction.address),
+                "instruction_index": int(instruction.instr_index), "level": "llil", "after": after,
+                "kind": kind, "type": str(value.type), "value": str(value),
+                "query": {key: params[key] for key in ("register", "flag", "offset", "size") if key in params}}
+
     def _value_flags_at(self, selector, function_start_raw, address_raw):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
-        addr = _parse_address(address_raw)
+        fn_addr = self._address(bv, function_start_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             fn = bv.get_function_at(fn_addr)
             if fn is None:
@@ -4933,8 +5159,8 @@ class BinaryNinjaBridge:
 
     def _value_possible(self, selector, function_start_raw, address_raw, *, level: str = "hlil", ssa: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
-        addr = _parse_address(address_raw)
+        fn_addr = self._address(bv, function_start_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             fn = bv.get_function_at(fn_addr)
             if fn is None:
@@ -4963,8 +5189,8 @@ class BinaryNinjaBridge:
 
     def _value_reg(self, selector, function_start_raw, address_raw, register: str, *, after: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
-        addr = _parse_address(address_raw)
+        fn_addr = self._address(bv, function_start_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             fn = bv.get_function_at(fn_addr)
             if fn is None:
@@ -4985,8 +5211,8 @@ class BinaryNinjaBridge:
 
     def _value_stack(self, selector, function_start_raw, address_raw, stack_offset: int, size: int, *, after: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
-        addr = _parse_address(address_raw)
+        fn_addr = self._address(bv, function_start_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             fn = bv.get_function_at(fn_addr)
             if fn is None:
@@ -5013,8 +5239,8 @@ class BinaryNinjaBridge:
     def _search_bytes(self, selector, data_hex: str, *, start=None, end=None, limit=None):
         bv = self._resolve_view(selector)
         search_data = bytes.fromhex(data_hex)
-        s = _parse_address(start) if start is not None else bv.start
-        e = _parse_address(end) if end is not None else bv.end
+        s = self._address(bv, start) if start is not None else bv.start
+        e = self._address(bv, end, endpoint=True) if end is not None else bv.end
         max_results = int(limit) if limit else 1000
         def _do():
             results = []
@@ -5029,10 +5255,10 @@ class BinaryNinjaBridge:
             return {"pattern": data_hex, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
         return _do()
 
-    def _search_constant(self, selector, constant: int, *, start, end, limit=None):
+    def _search_constant(self, selector, constant: int, *, start=None, end=None, limit=None):
         bv = self._resolve_view(selector)
-        s = _parse_address(start)
-        e = _parse_address(end)
+        s = self._address(bv, start) if start is not None else bv.start
+        e = self._address(bv, end, endpoint=True) if end is not None else bv.end
         max_results = int(limit) if limit else 1000
         def _do():
             results = []
@@ -5047,25 +5273,49 @@ class BinaryNinjaBridge:
             return {"constant": constant, "constant_hex": hex(constant), "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
         return _do()
 
-    def _search_text(self, selector, query: str, *, start=None, end=None, regex: bool = False, limit=None):
+    def _search_text(self, selector, query: str, *, start=None, end=None, regex: bool = False, limit=None, il_type="hlil"):
         bv = self._resolve_view(selector)
-        s = _parse_address(start) if start is not None else bv.start
-        e = _parse_address(end) if end is not None else bv.end
+        s = self._address(bv, start) if start is not None else bv.start
+        e = self._address(bv, end, endpoint=True) if end is not None else bv.end
         max_results = int(limit) if limit else 1000
+        graph_names = {"hlil": "HighLevelILFunctionGraph", "mlil": "MediumLevelILFunctionGraph",
+                       "llil": "LowLevelILFunctionGraph", "disasm": "NormalFunctionGraph"}
+        if il_type not in graph_names:
+            raise ValueError(f"Unknown IL type: {il_type}")
         def _do():
             results = []
+            if regex:
+                pattern = re.compile(query)
+                seen = set()
+                for fn in bv.functions:
+                    self._check_job_cancelled()
+                    if il_type == "disasm":
+                        lines = ((address, "".join(str(t) for t in tokens)) for tokens, address in fn.instructions)
+                    else:
+                        il = getattr(fn, il_type)
+                        if il is None:
+                            continue
+                        lines = ((instruction.address, str(instruction)) for block in il for instruction in block)
+                    for address, text in lines:
+                        self._check_job_cancelled()
+                        if s <= address < e and address not in seen and pattern.search(text):
+                            results.append(hex(address))
+                            seen.add(address)
+                            if len(results) >= max_results:
+                                break
+                    if len(results) >= max_results:
+                        break
+                return {"query": query, "regex": True, "il_type": il_type, "start": hex(s), "end": hex(e),
+                        "matches": results, "count": len(results), "scope": "individual instruction text"}
             offset = s
             while offset < e and len(results) < max_results:
                 self._check_job_cancelled()
-                if regex:
-                    found = bv.find_next_text(offset, query, flags=bn.FindFlag.FindCaseSensitive)
-                else:
-                    found = bv.find_next_text(offset, query)
+                found = bv.find_next_text(offset, query, graph_type=getattr(bn.FunctionGraphType, graph_names[il_type]))
                 if found is None or found >= e:
                     break
                 results.append(hex(found))
                 offset = found + 1
-            return {"query": query, "regex": regex, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
+            return {"query": query, "regex": regex, "il_type": il_type, "start": hex(s), "end": hex(e), "matches": results, "count": len(results)}
         return _do()
 
     # =========================================================================
@@ -5084,13 +5334,14 @@ class BinaryNinjaBridge:
                 "max_instr_length": arch.max_instr_length if arch else None,
                 "endianness": str(arch.endianness) if arch else None,
                 "registers": list(arch.regs.keys()) if arch else [],
+                "flags": list(arch.flags) if arch else [],
                 "platform": str(platform) if platform else None,
             }
         return _do()
 
     def _arch_assemble(self, selector, asm_text: str, *, address=None, arch_name=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address) if address is not None else 0
+        addr = self._address(bv, address) if address is not None else 0
         def _do():
             arch = bv.arch
             if arch_name:
@@ -5107,10 +5358,12 @@ class BinaryNinjaBridge:
             return {"asm": asm_text, "address": hex(addr), "bytes_hex": encoded.hex(), "length": len(encoded)}
         return _do()
 
-    def _arch_disasm_bytes(self, selector, data_hex: str, *, address=None, arch_name=None):
+    def _arch_disasm_bytes(self, selector, data_hex: str, *, address=None, arch_name=None, count=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address) if address is not None else 0
+        addr = self._address(bv, address) if address is not None else 0
         data = bytes.fromhex(data_hex)
+        if count is not None and int(count) < 0:
+            raise ValueError("--count must be nonnegative")
         def _do():
             arch = bv.arch
             if arch_name:
@@ -5121,12 +5374,14 @@ class BinaryNinjaBridge:
                 raise RuntimeError("No architecture available")
             instructions = []
             offset = 0
-            while offset < len(data):
+            while offset < len(data) and (count is None or len(instructions) < int(count)):
                 info = arch.get_instruction_info(data[offset:], addr + offset)
                 text_result = arch.get_instruction_text(data[offset:], addr + offset)
                 if info is None or text_result is None:
                     break
                 tokens, length = text_result
+                if length <= 0:
+                    raise RuntimeError("Architecture returned a zero-length instruction")
                 text = "".join(str(t) for t in tokens)
                 instructions.append({
                     "address": hex(addr + offset),
@@ -5198,7 +5453,7 @@ class BinaryNinjaBridge:
 
     def _disasm_linear(self, selector, address_raw, *, count: int = 20):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         def _do():
             lines = []
             settings = bn.DisassemblySettings()
@@ -5223,8 +5478,8 @@ class BinaryNinjaBridge:
 
     def _disasm_range(self, selector, start_raw, end_raw):
         bv = self._resolve_view(selector)
-        s = _parse_address(start_raw)
-        e = _parse_address(end_raw)
+        s = self._address(bv, start_raw)
+        e = self._address(bv, end_raw, endpoint=True)
         def _do():
             lines = []
             arch = bv.arch
@@ -5253,7 +5508,7 @@ class BinaryNinjaBridge:
 
     def _function_containing(self, selector, address_raw):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address_raw)
+        addr = self._address(bv, address_raw)
         containing = self._functions_containing(bv, addr)
         if not containing:
             raise RuntimeError(self._function_not_found_hint(bv, hex(addr), addr))
@@ -5442,7 +5697,7 @@ class BinaryNinjaBridge:
     def _function_var_refs_from(self, selector, identifier, *, address, il_level: str = "hlil"):
         bv = self._resolve_view(selector)
         fn = self._find_function(bv, identifier)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             if il_level == "hlil":
                 refs = fn.get_hlil_var_refs_from(addr)
@@ -5777,7 +6032,7 @@ class BinaryNinjaBridge:
 
     def _annotation_add_tag(self, selector, address, tag_type: str, data: str):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             tt = bv.create_tag_type(tag_type, "⭐") if bv.get_tag_type(tag_type) is None else bv.get_tag_type(tag_type)
             tag = bv.create_tag(tt, data)
@@ -5791,7 +6046,7 @@ class BinaryNinjaBridge:
 
     def _annotation_get_tags(self, selector, address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             tags = []
             fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
@@ -5806,7 +6061,7 @@ class BinaryNinjaBridge:
 
     def _annotation_define_data_var(self, selector, address, *, type_name=None, name=None, width=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             if type_name:
                 t = bv.parse_type_string(type_name)
@@ -5825,7 +6080,7 @@ class BinaryNinjaBridge:
 
     def _annotation_undefine_data_var(self, selector, address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             bv.undefine_user_data_var(addr)
             return {"address": hex(addr), "undefined": True}
@@ -5833,7 +6088,7 @@ class BinaryNinjaBridge:
 
     def _annotation_define_symbol(self, selector, address, name: str, *, symbol_type=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             st = bn.SymbolType.DataSymbol
             if symbol_type:
@@ -5851,7 +6106,7 @@ class BinaryNinjaBridge:
 
     def _annotation_undefine_symbol(self, selector, address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             sym = bv.get_symbol_at(addr)
             if sym is None:
@@ -5862,7 +6117,7 @@ class BinaryNinjaBridge:
 
     def _annotation_rename_data_var(self, selector, address, new_name: str):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             sym = bv.get_symbol_at(addr)
             if sym:
@@ -5917,10 +6172,10 @@ class BinaryNinjaBridge:
 
     def _uidf_set(self, selector, params):
         bv = self._resolve_view(selector)
-        fn_start = _parse_address(params["function_start"])
-        address = _parse_address(params["address"])
+        fn_start = self._address(bv, params["function_start"])
+        address = self._address(bv, params["address"])
         var_name = str(params["var_name"])
-        def_site_addr = _parse_address(params.get("def_site_address", address))
+        def_site_addr = self._address(bv, params.get("def_site_address", address))
         value_raw = params["value"]
         state_raw = params.get("state", "ConstantValue")
         def _do():
@@ -5952,8 +6207,8 @@ class BinaryNinjaBridge:
 
     def _uidf_clear(self, selector, params):
         bv = self._resolve_view(selector)
-        fn_start = _parse_address(params["function_start"])
-        address = _parse_address(params["address"])
+        fn_start = self._address(bv, params["function_start"])
+        address = self._address(bv, params["address"])
         var_name = str(params["var_name"])
         def _do():
             fn = bv.get_function_at(fn_start)
@@ -5979,7 +6234,7 @@ class BinaryNinjaBridge:
 
     def _uidf_list(self, selector, function_start):
         bv = self._resolve_view(selector)
-        fn_start = _parse_address(function_start)
+        fn_start = self._address(bv, function_start)
         def _do():
             fn = bv.get_function_at(fn_start)
             if fn is None:
@@ -6045,16 +6300,36 @@ class BinaryNinjaBridge:
         return _do()
 
     def _loader_rebase(self, selector, address, *, force: bool = False):
+        if self.mode != "headless":
+            raise RuntimeError("CLI rebase requires a headless target; GUI views must be rebased through Binary Ninja")
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
-        def _do():
-            if hasattr(bv, "rebase"):
-                bv.rebase(addr)
-            else:
-                raise RuntimeError("BinaryView does not support rebase")
-            bv.update_analysis_and_wait()
-            return {"new_base": hex(addr), "rebased": True}
-        return _do()
+        addr = self._address(bv, address)
+        if not hasattr(bv, "rebase"):
+            raise RuntimeError("BinaryView does not support rebase")
+        old_id = self.targets.target_id_for(bv)
+        old_view_id = self.targets.view_id_for(bv)
+        self._check_job_cancelled()
+        new_view = bv.rebase(addr, force=force)
+        if new_view is None:
+            raise RuntimeError("BinaryView.rebase failed; no replacement target was registered")
+        # The native API returns a new view sharing the same FileMetadata. Closing
+        # the old file here would also close the replacement view.
+        new_view.update_analysis_and_wait()
+        if new_view.start != addr:
+            raise RuntimeError(f"Rebase returned unexpected view start {hex(new_view.start)} instead of {hex(addr)}")
+        with self.targets._lock:
+            was_active = self.targets._active_view_id == old_view_id
+            record = self.targets.register(new_view)
+            self.targets.unregister(old_view_id)
+            if was_active:
+                self.targets.set_active(record.view_id)
+        removed_maps = list(self._address_spaces.pop(old_id, {}))
+        job = getattr(self._job_local, "record", None)
+        if job is not None:
+            job.bv = new_view
+        return {"rebased": True, "new_base": hex(new_view.image_base), "new_start": hex(new_view.start),
+                "previous_target_id": old_id, "target_id": record.target_id(),
+                "removed_address_maps": removed_maps, "target": self._target_info(record.target_id())}
 
     # =========================================================================
     # External library/location operations
@@ -6094,7 +6369,7 @@ class BinaryNinjaBridge:
 
     def _external_location_add(self, selector, params):
         bv = self._resolve_view(selector)
-        source_addr = _parse_address(params["source_address"])
+        source_addr = self._address(bv, params["source_address"])
         library_name = params.get("library_name")
         target_symbol = params.get("target_symbol")
         target_address = params.get("target_address")
@@ -6114,7 +6389,7 @@ class BinaryNinjaBridge:
 
     def _external_location_get(self, selector, source_address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(source_address)
+        addr = self._address(bv, source_address)
         def _do():
             if hasattr(bv, "get_external_location_at"):
                 loc = bv.get_external_location_at(addr)
@@ -6132,7 +6407,7 @@ class BinaryNinjaBridge:
 
     def _external_location_remove(self, selector, source_address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(source_address)
+        addr = self._address(bv, source_address)
         def _do():
             if hasattr(bv, "remove_external_location"):
                 bv.remove_external_location(addr)
@@ -6245,7 +6520,7 @@ class BinaryNinjaBridge:
 
     def _data_typed_at(self, selector, address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             dv = bv.get_data_var_at(addr)
             if dv is None:
@@ -6265,7 +6540,7 @@ class BinaryNinjaBridge:
 
     def _xref_code_refs_from(self, selector, address, *, length=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             if length:
                 refs = bv.get_code_refs_from(addr, int(length))
@@ -6281,7 +6556,7 @@ class BinaryNinjaBridge:
 
     def _xref_code_refs_to(self, selector, address, *, limit: int = 100):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             refs = list(bv.get_code_refs(addr))[:limit]
             return [
@@ -6295,7 +6570,7 @@ class BinaryNinjaBridge:
 
     def _xref_data_refs_from(self, selector, address, *, length=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             if length:
                 refs = bv.get_data_refs_from(addr, int(length))
@@ -6306,7 +6581,7 @@ class BinaryNinjaBridge:
 
     def _xref_data_refs_to(self, selector, address, *, limit: int = 100):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             refs = list(bv.get_data_refs(addr))[:limit]
             return [{"address": hex(ref)} for ref in refs]
@@ -6318,8 +6593,8 @@ class BinaryNinjaBridge:
 
     def _il_address_to_index(self, selector, function_start, address, *, level: str = "hlil"):
         bv = self._resolve_view(selector)
-        fn_start = _parse_address(function_start)
-        addr = _parse_address(address)
+        fn_start = self._address(bv, function_start)
+        addr = self._address(bv, address)
         def _do():
             fn = bv.get_function_at(fn_start)
             if fn is None:
@@ -6339,7 +6614,7 @@ class BinaryNinjaBridge:
 
     def _il_index_to_address(self, selector, function_start, index: int, *, level: str = "hlil"):
         bv = self._resolve_view(selector)
-        fn_start = _parse_address(function_start)
+        fn_start = self._address(bv, function_start)
         def _do():
             fn = bv.get_function_at(fn_start)
             if fn is None:
@@ -6358,8 +6633,8 @@ class BinaryNinjaBridge:
 
     def _il_instruction_by_addr(self, selector, function_start, address, *, level: str = "hlil"):
         bv = self._resolve_view(selector)
-        fn_start = _parse_address(function_start)
-        addr = _parse_address(address)
+        fn_start = self._address(bv, function_start)
+        addr = self._address(bv, address)
         def _do():
             fn = bv.get_function_at(fn_start)
             if fn is None:
@@ -6390,7 +6665,7 @@ class BinaryNinjaBridge:
     def _section_add_user(self, selector, params):
         bv = self._resolve_view(selector)
         name = str(params["name"])
-        start = _parse_address(params["start"])
+        start = self._address(bv, params["start"])
         length = int(params["length"])
         def _do():
             bv.add_user_section(name, start, length)
@@ -6406,7 +6681,7 @@ class BinaryNinjaBridge:
 
     def _segment_add_user(self, selector, params):
         bv = self._resolve_view(selector)
-        start = _parse_address(params["start"])
+        start = self._address(bv, params["start"])
         length = int(params["length"])
         data_offset = int(params.get("data_offset", 0))
         data_length = int(params.get("data_length", length))
@@ -6418,7 +6693,7 @@ class BinaryNinjaBridge:
 
     def _segment_remove_user(self, selector, start, *, length=None):
         bv = self._resolve_view(selector)
-        s = _parse_address(start)
+        s = self._address(bv, start)
         def _do():
             if length:
                 bv.remove_user_segment(s, int(length))
@@ -6493,7 +6768,7 @@ class BinaryNinjaBridge:
 
     def _binary_basic_blocks_at(self, selector, address):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
+        addr = self._address(bv, address)
         def _do():
             bbs = bv.get_basic_blocks_at(addr)
             return [

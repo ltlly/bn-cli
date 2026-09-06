@@ -10,7 +10,96 @@
 - 在 Binary Ninja 进程内执行 Python，无需维护单独的 headless 工作流
 - 使用 `--preview` 应用变更，捕获反编译 diff，并在报告成功前验证实际状态
 - 输出结构化 `json` / `ndjson`，大结果自动 spill 到文件，返回 token 计数帮助 Agent 管理上下文预算
-- 完整的 Binary Ninja API 覆盖：60+ 命令，涵盖分析、注释、数据库、调试信息、IL 导航、类型扩展、元数据、撤销/重做、加载器、外部库、插件命令等
+- 多类 Binary Ninja API 命令，涵盖分析、注释、数据库、调试信息、IL 导航、类型扩展、元数据、撤销/重做、加载器、外部库、插件命令等
+
+## 0.16：无头工作流与跨工具地址
+
+无需打开 GUI。`bn --daemon headless ...` 只为本次调用选择 daemon，不修改共享选择；提交、等待和取结果固定使用同一个连接。多个客户端并行时，使用 `target load/list` 返回的具体 `--target`。`active` 由 `bn target use` 管理，与 GUI 焦点和加载先后无关。
+
+仅显示基址不能解决地址混用。现在现有查询和修改命令接受显式坐标：
+
+| 写法 | 含义 |
+|---|---|
+| `va:0x401010`，裸 `0x401010` | BN 虚拟地址；裸十进制保持原有规则 |
+| `rva:0x1010` | 相对 **当前 `BinaryView.image_base`**，不是 `start` 或原始首选基址 |
+| `file:0x210` | 按段和 BN API 转换的 backing-data 偏移，不是简单加基址 |
+| `map:frida-123:0x7100001010` | 已注册外部地址空间中的地址 |
+| `expr:main+0x10` | 显式调用 BN 原生表达式解析；注意 shell 引号 |
+
+所有 target job 携带具体目标和地址上下文，CLI 默认在 stderr 显示提示。加 `--with-context --format json` 可将上下文一起放入结果和导出文件；原有默认结果形状保持兼容。BN 原生 `expr:` 的裸数字规则与普通 CLI 不同，通常按十六进制解析。IL 索引、栈偏移、整数宽度及其他外部库中的地址属于不同数值域。工具不会偷偷清除 Thumb 位、PAC 或指针标签。
+
+```bash
+bn --daemon headless target load /path/to/libexample.so
+bn address context
+bn address resolve rva:0x1010 file:0x210
+bn inspect rva:0x1010
+```
+
+在已有 Frida 会话中取得实际模块快照，保存输出 JSON 为 `module.json`：
+
+```javascript
+const m = Process.getModuleByName('libexample.so');
+console.log(JSON.stringify({name: m.name, path: m.path, base: m.base.toString(), size: m.size}));
+```
+
+```bash
+bn address map import frida-123 module.json --kind frida-module --source pid:123/session:1
+bn inspect map:frida-123:0x7100001010
+bn address verify map:frida-123:0x7100001010 --bytes '554889e5'
+bn decompile map:frida-123:0x7100001010 --with-context --format json
+```
+
+示例地址和字节须替换成实际观测。导入将 Frida `base` 对应到 BN 当前 `image_base`，并以模块 `size` 限定范围；如果 BN 的 `image_base != start`，必须用 `--bn-base` 明确指定与 Frida `Module.base` 对应的 BN 地址。也可手动使用 `address map add NAME --base EXTERNAL --size SIZE --bn-base va:BN_ADDRESS --source SESSION` 注册锚点。空洞继续保持未映射，范围外的 BN synthetic 区域不会被换算成运行时地址。
+
+Unicorn 分段搬运应记录每段实际对应关系，例如 `unicorn-map.json`：
+
+```json
+{"regions": [
+  {"bn_start": "0x401000", "external_start": "0x10000", "length": "0x100"},
+  {"bn_start": "0x408000", "external_start": "0x90000000", "length": "0x1000"}
+]}
+```
+
+```bash
+bn address map import uc-run1 unicorn-map.json --source unicorn:run1
+bn memory read map:uc-run1:0x10010 --length 16 --with-context --format json
+bn address resolve map:uc-run1:0x10010
+bn address map export uc-run1 --out /tmp/uc-run1.json
+bn address map list
+bn address map remove uc-run1
+```
+
+映射按目标和会话隔离；注册检查完整范围、空洞、溢出及双向重叠，重名需先显式删除。BN 基址或段布局变化后映射失效。外部进程重启或模拟器重新映射无法由 bn-cli 自动感知，必须重新登记。映射是用户声明，布局指纹也不是样本身份认证。`address verify` 用实际外部字节核对 BN 内容，不一致返回退出码 3；重定位、运行时补丁和不同构建也可能造成差异。
+
+BSS 的文件偏移可能为 `null`。一个文件偏移对应多个 VA 时拒绝自动选择。容器或切片视图的偏移可能相对其 backing data，不一定相对最外层文件；Raw 视图按原始字节偏移处理。注册映射不会 rebase BN，也不修改字节。
+
+新增的连续操作入口：
+
+```bash
+bn value reg main 0 rax                     # LLIL 索引 0
+bn value reg main rax --address rva:0x1010 --after
+bn value possible main 0 rax                # 原生 possible-register-values 查询
+bn job watch JOB_ID                         # 仅输出变化的进度，最终返回原结果
+bn job wait JOB_ID --with-context --out /tmp/job.json
+bn result list
+bn result show /tmp/job.json --key result --limit 20
+bn result diff /tmp/before.json /tmp/after.json
+bn schema address map import               # 从实际 parser 生成，无需 daemon
+```
+
+`value` 的 IL 索引与 `--address` 互斥；寄存器、栈、可能值和标志值直接使用 LLIL 指令原生 API。结果同时给出机器地址、映射后的 LLIL 地址及索引。`loader rebase` 会注册 BN 返回的新视图、返回新的 target id，并清除旧地址映射；后续命令须使用新 target。该操作不可取消。标志名按 `bn arch info` 输出，例如 x86 的 `z`。`memory reader --width` 读取整数，`memory read --length` 读取字节。`search text --il-type` 对字面查询选择原生图类型，正则查询匹配该表示中的单条指令文本；字节搜索目前要求精确十六进制字节。
+
+新 bridge 使用服务端等待，旧 bridge 仍兼容轮询。超时和 Ctrl+C 只停止等待，已完成写入的结果不会被晚到的取消覆盖。自动落盘使用唯一文件名和原子写入。`result show` 对 NDJSON/文本分段读取；JSON 选择及 diff 会加载输入，diff 仅是结构/文本比较。NDJSON 输出格式本身不代表服务端流式传输。
+
+修复了汇编、NOP 长度、reader、value、常量查询等参数未接通的问题。`patch assemble` 使用指令架构的 `Architecture.assemble`，字节写入在 undo group 中检查完整写入量并读回核对。NOP 范围必须在完整指令处结束，省略长度时处理一条指令。元数据应用异常会回滚，Workflow 预览必须确认恢复成功。上述检查验证具体编辑，不是全程序等价证明，也不覆盖任意 `py exec`。
+
+新版 API 调研与可复现实测详见 [英文说明](README.md#bn-6x-api-review-and-validation)。自动化测试 **294 项通过**。本机验证版本为 BN **6.1.10530-dev**、Unicorn **2.1.4**、Frida **17.17.0**，包含真实 socket/CLI 和临时 `/bin/sleep` 进程的 ASLR 地址与字节核对。其他 loader、架构和版本仍需各自测试：
+
+```bash
+uv run pytest
+PYTHONPATH=/path/to/binaryninja/python BN_DISABLE_USER_PLUGINS=1 \
+  uv run --with unicorn --with frida python tools/smoke_headless.py --external
+```
 
 ## 设计理念
 
@@ -22,7 +111,7 @@ MCP 方案中 Agent 每次调用前都要查询 session ID（140 次无意义调
 
 **2. 地址归一化**
 
-MCP 方案中 Agent 混淆文件偏移和内存地址导致 55.2% 错误率。bn-cli 的 `_parse_address` 统一接受 `0x...` 格式和十进制整数，bridge 侧做归一化处理。
+文件偏移、RVA、BN VA 和外部进程地址属于不同坐标系。bn-cli 通过显式地址前缀、目标隔离映射、自动上下文和外部字节核对处理，具体边界见上文。
 
 **3. 输出控制防止上下文爆炸**
 
@@ -38,7 +127,7 @@ MCP 方案中 `binja.eval` 的 23.1% 错误率主要因未获取 BinaryView。bn
 
 **6. 变更验证而非静默成功**
 
-所有 mutation 命令在应用后会读回实际状态进行验证，不匹配则自动回滚并报告 `verification_failed`。Agent 不再需要额外调用来确认变更是否生效。
+元数据 mutation 会验证请求的实际状态；字节写入另行检查完整写入量与读回结果。任意 Python 和其他底层 API 包装不自动继承这些保证。
 
 ## 架构概览
 
@@ -242,15 +331,15 @@ bn daemon stop                        # 通过认证协议优雅停止守护进�
 - 完整 `target_id`
 - BinaryView 文件名
 - view id
-- `active`（GUI 当前标签 / headless 最近加载的目标）
+- `active`（`bn target use` 显式选中的目标，或唯一已加载目标）
 
-单目标时可省略 `--target`。多目标时必须指定，否则 CLI 报错并提示。
+单目标或存在显式 active 时可省略 `--target`；多目标且未选择 active 时必须指定。
 
 ## 守护进程模式选择
 
 GUI 和 headless 可同时运行。CLI 路由规则：
 
-1. `bn daemon use <mode>` 设定的 sticky 优先
+1. 本次调用的 `--daemon MODE` 优先，其次为 `bn daemon use <mode>` 的 sticky 选择
 2. 只有一个 daemon 运行时自动选择
 3. 多个运行且无 sticky 时报错并提示
 
