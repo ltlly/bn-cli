@@ -123,6 +123,12 @@ def api_docs_index_path() -> Path:
     return cache_home() / "api_docs_index.json"
 
 
+def tokenizer_cache_dir() -> Path:
+    # Where tiktoken may cache a BPE table it had to download. The tables that ship with
+    # `bn` live in the package itself, so this only matters for the network fallback.
+    return cache_home() / "tiktoken"
+
+
 def spill_root() -> Path:
     root = Path(tempfile.gettempdir()) / "bn-spills"
     root.mkdir(parents=True, exist_ok=True)

@@ -46,6 +46,7 @@ On Windows, both modes default to authenticated fixed local Named Pipes: `\\.\pi
 
 3. Output modes (AI-first defaults):
 - Read commands default to compact `text` — one item per line, no repeated JSON keys.
+- `decompile` renders structured HLIL with nested branch bodies and indentation.
 - Disassembly commands (`disasm`, `disasm-linear`, `disasm-range`, `arch disasm-bytes`) output `address  instruction` per line.
 - List commands output one record per line:
   - `segments` → `start-end rwx len=N`

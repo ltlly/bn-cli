@@ -1290,6 +1290,25 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     output = capsys.readouterr().out
     assert f"pid=123 plugin={bn.cli.VERSION} status=ok" in output
     assert "status=error" not in output
+    assert "tokenizer: o200k_base" in output
+
+
+def test_doctor_json_reports_tokenizer_source(monkeypatch, tmp_path, capsys):
+    install_dir = tmp_path / "install"
+    source_dir = tmp_path / "source"
+    install_dir.mkdir()
+    source_dir.mkdir()
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+
+    rc = bn.cli.main(["doctor", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tokenizer"]["tokenizer"] == "o200k_base"
+    assert payload["tokenizer"]["source"] in {"embedded", "tiktoken"}
 
 
 def test_doctor_reports_codex_sandbox_socket_denial(monkeypatch, tmp_path, capsys):
@@ -2830,3 +2849,342 @@ def test_target_use_text_render(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "active target cleared" in out
+
+
+# =========================================================================
+# Documented command surface (SKILL.md) — aliases and extended verbs
+# =========================================================================
+
+
+def _patch_bridge(monkeypatch, results):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        calls.append({"op": op, "params": params, "target": target})
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "1", "selector": "a.bndb", "active": True}],
+            }
+        if op in results:
+            return {"ok": True, "result": results[op]}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    return calls
+
+
+def test_il_nav_alias_maps_to_addr_to_index(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch, {"il_address_to_index": {"address": "0x401004", "index": 2, "level": "hlil"}}
+    )
+
+    rc = bn.cli.main(["il-nav", "get-index-for-addr", "0x401000", "0x401004"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "il_address_to_index"
+    assert calls[-1]["params"] == {
+        "function_start": "0x401000",
+        "address": "0x401004",
+        "level": "hlil",
+    }
+
+
+def test_section_user_create_alias_maps_to_add(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"section_add_user": {"created": True}})
+
+    rc = bn.cli.main(["section-user", "create", ".mytext", "0x1000", "256"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "section_add_user"
+    assert calls[-1]["params"] == {"name": ".mytext", "start": "0x1000", "length": 256}
+
+
+def test_plugin_cmd_run_alias_executes_command(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"plugin_execute": {"executed": True}})
+
+    rc = bn.cli.main(["plugin-cmd", "run", "My Plugin Command"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "plugin_execute"
+    assert calls[-1]["params"] == {"name": "My Plugin Command"}
+
+
+def test_loader_settings_defaults_type_name_to_bridge(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch, {"loader_load_settings_get": {"type_name": "ELF", "settings": {}}}
+    )
+
+    rc = bn.cli.main(["loader", "settings"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "loader_load_settings_get"
+    assert calls[-1]["params"] == {}
+
+
+def test_annotation_create_tag_wires_tag_type_and_icon(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch, {"annotation_create_tag_type": {"tag_type": "Important", "created": True}}
+    )
+
+    rc = bn.cli.main(["annotation", "create-tag", "Important", "star"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "annotation_create_tag_type"
+    assert calls[-1]["params"] == {"tag_type": "Important", "icon": "star"}
+
+
+def test_annotation_list_tag_types_renders_compact_text(monkeypatch, capsys):
+    _patch_bridge(
+        monkeypatch,
+        {
+            "annotation_list_tag_types": [
+                {"name": "Important", "icon": "star", "visible": True},
+                {"name": "Hidden", "icon": "", "visible": False},
+            ]
+        },
+    )
+
+    rc = bn.cli.main(["annotation", "list-tag-types"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "Important  star\nHidden   hidden\n"
+
+
+def test_annotation_remove_tag_passes_scope(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch, {"annotation_remove_tag": {"tag_type": "Important", "removed": 1}}
+    )
+
+    rc = bn.cli.main(["annotation", "remove-tag", "--function", "sub_401000", "Important"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "annotation_remove_tag"
+    assert calls[-1]["params"] == {"tag_type": "Important", "function": "sub_401000"}
+
+
+def test_metadata_keys_renders_one_key_per_line(monkeypatch, capsys):
+    _patch_bridge(monkeypatch, {"metadata_keys": ["alpha", "zeta"]})
+
+    rc = bn.cli.main(["metadata", "keys"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "alpha\nzeta\n"
+
+
+def test_external_location_list_renders_compact_text(monkeypatch, capsys):
+    _patch_bridge(
+        monkeypatch,
+        {
+            "external_location_list": [
+                {
+                    "source_address": "0x401000",
+                    "library": None,
+                    "symbol": None,
+                    "target_address": None,
+                },
+                {
+                    "source_address": "0x402000",
+                    "library": "libc.so.6",
+                    "symbol": "malloc",
+                    "target_address": "0x500000",
+                },
+            ]
+        },
+    )
+
+    rc = bn.cli.main(["external", "location-list"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == (
+        "0x401000  -  -\n0x402000  libc.so.6  malloc  -> 0x500000\n"
+    )
+
+
+def test_xref_ext_type_refs_renders_compact_text(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch,
+        {
+            "xref_type_refs": [
+                {"type": "Player", "offset": "0x8", "reference_type": "direct"},
+                {"type": "Enemy", "offset": "0x10", "reference_type": "indirect"},
+            ]
+        },
+    )
+
+    rc = bn.cli.main(["xref-ext", "type-refs", "TrackRowCell"])
+
+    assert rc == 0
+    assert calls[-1]["params"] == {"name": "TrackRowCell", "limit": 100}
+    assert capsys.readouterr().out == "Player  0x8  direct\nEnemy  0x10  indirect\n"
+
+
+def test_uidf_from_address_renders_definition_sites(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch,
+        {
+            "uidf_from_address": {
+                "address": "0x401000",
+                "function": "sub_401000",
+                "function_start": "0x401000",
+                "variables": [
+                    {
+                        "var": "x",
+                        "definitions": [
+                            {"address": "0x401000", "arch": "x86_64", "value": "constant 0x0"},
+                            {"address": "0x401010", "arch": "x86_64", "value": "constant 0x10"},
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+
+    rc = bn.cli.main(["uidf", "from-address", "0x401000"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "uidf_from_address"
+    assert calls[-1]["params"] == {"address": "0x401000"}
+    assert capsys.readouterr().out == (
+        "0x401000  x  constant 0x0\n0x401010  x  constant 0x10\n"
+    )
+
+
+def test_help_full_does_not_repeat_aliased_subcommands(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        bn.cli.main(["il-nav", "--help-full"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert output.count("usage: bn il-nav addr-to-index") == 1
+
+
+def test_annotation_add_tag_function_scope_wires_op(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"annotation_add_tag": {"added": True}})
+
+    rc = bn.cli.main(
+        ["annotation", "add-tag", "--function", "sub_401000", "Important", "review needed"]
+    )
+
+    assert rc == 0
+    assert calls[-1]["op"] == "annotation_add_tag"
+    assert calls[-1]["params"] == {
+        "tag_type": "Important",
+        "data": "review needed",
+        "function": "sub_401000",
+    }
+
+
+def test_annotation_add_tag_positional_address_still_works(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"annotation_add_tag": {"added": True}})
+
+    rc = bn.cli.main(["annotation", "add-tag", "0x401000", "Important", "note"])
+
+    assert rc == 0
+    assert calls[-1]["params"] == {
+        "tag_type": "Important",
+        "data": "note",
+        "address": "0x401000",
+    }
+
+
+def test_annotation_get_tags_function_scope_wires_op(monkeypatch, capsys):
+    calls = _patch_bridge(
+        monkeypatch,
+        {"annotation_get_tags": [{"type": "Important", "data": "x", "scope": "function"}]},
+    )
+
+    rc = bn.cli.main(["annotation", "get-tags", "--function", "sub_401000"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "annotation_get_tags"
+    assert calls[-1]["params"] == {"function": "sub_401000"}
+
+
+def test_search_bytes_shorthand_uses_search_bytes(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"search_bytes": ["0x401000"]})
+
+    rc = bn.cli.main(["search", "--bytes", "48 89 5c 24"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "search_bytes"
+    assert calls[-1]["params"] == {"data_hex": "48 89 5c 24", "limit": 100}
+
+
+def test_search_text_shorthand_uses_search_text(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"search_text": ["0x401000"]})
+
+    rc = bn.cli.main(["search", "--text", "error"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "search_text"
+    assert calls[-1]["params"] == {"query": "error", "il_type": "hlil", "limit": 50}
+
+
+def test_value_shorthand_register_uses_address_only(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"value_reg": {"value": "0x10"}})
+
+    rc = bn.cli.main(["value", "--address", "0x401000", "--reg", "rax"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "value_reg"
+    assert calls[-1]["params"] == {"address": "0x401000", "register": "rax", "after": False}
+
+
+def test_value_reg_subcommand_passes_function_and_address(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"value_reg": {"value": "0x10"}})
+
+    rc = bn.cli.main(["value", "reg", "sub_401000", "0x401004", "rax", "--after"])
+
+    assert rc == 0
+    assert calls[-1]["params"] == {
+        "address": "0x401004",
+        "function_start": "sub_401000",
+        "register": "rax",
+        "after": True,
+    }
+
+
+def test_value_shorthand_stack_offset(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"value_stack": {"value": "0x20"}})
+
+    rc = bn.cli.main(["value", "--address", "0x401000", "--stack", "-8"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "value_stack"
+    assert calls[-1]["params"] == {
+        "address": "0x401000",
+        "stack_offset": -8,
+        "size": 8,
+        "after": False,
+    }
+
+
+def test_patch_shorthand_hex_writes_memory(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"memory_write": {"written": True}})
+
+    rc = bn.cli.main(["patch", "--address", "0x401000", "--hex", "90"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "memory_write"
+    assert calls[-1]["params"] == {"address": "0x401000", "data_hex": "90"}
+
+
+def test_patch_shorthand_asm_assembles(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"patch_assemble": {"patched": True}})
+
+    rc = bn.cli.main(["patch", "--address", "0x401000", "--asm", "nop"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "patch_assemble"
+    assert calls[-1]["params"] == {"address": "0x401000", "asm": "nop"}
+
+
+def test_patch_assemble_subcommand_uses_positional_assembly(monkeypatch, capsys):
+    calls = _patch_bridge(monkeypatch, {"patch_assemble": {"patched": True}})
+
+    rc = bn.cli.main(["patch", "assemble", "0x401000", "nop"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "patch_assemble"
+    assert calls[-1]["params"] == {"address": "0x401000", "asm": "nop"}

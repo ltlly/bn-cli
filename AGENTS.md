@@ -42,6 +42,17 @@ bn daemon list                # mode + pid + endpoint + target count per running
 PYTHONPATH=/path/to/binaryninja/python bn daemon start --foreground
 ```
 
+### Symlinked installs and the uv cache
+
+If `UV_LINK_MODE=symlink`, every file in `.venv` and in the `uv tool` install is a link into `uv cache dir` (`archive-v0/...`). Running `uv cache clean` / `uv cache prune`, or deleting the cache directory, silently turns those links into broken stubs — `bn` then dies with `ModuleNotFoundError: No module named 'bn'` (or `AttributeError` from a half-imported dependency). Recovery is a reinstall, not a repair:
+
+```bash
+uv sync --reinstall
+uv tool install --force -e .
+```
+
+Keep the cache on a stable path (`UV_CACHE_DIR=<dir>` or `cache-dir` in `uv.toml`) that is never cleaned, or use `UV_LINK_MODE=copy` for a self-contained install.
+
 Tests do **not** require Binary Ninja. `tests/test_bridge.py` constructs a fake `binaryninja` module (and `binaryninja.mainthread` / `binaryninja.plugin`), then `importlib.util.spec_from_file_location`s `plugin/bn_agent_bridge/bridge.py` under a synthetic package name (`bn_test_bridge`). When editing the bridge, keep that stubbing pattern in mind — direct attribute access on `bn.foo` outside hot paths must still be stubable from the test scaffolding.
 
 ## Architecture
@@ -109,6 +120,8 @@ So every mutation lane has four possible result statuses — `verified`, `previe
 - If `--out` is set, writes there and prints a compact JSON envelope (`artifact_path`, `bytes`, `tokens`, `tokenizer`, `sha256`, `summary`).
 - Otherwise, if the rendered output exceeds `DEFAULT_SPILL_TOKEN_LIMIT` (10,000 tokens), auto-spills into `paths.spill_root()` and prints the spill metadata as plain text **on stderr**, leaving stdout empty. Don't break this contract — agents rely on it to keep large lists out of context.
 
+Token counting must work with no network and no working `tiktoken` install: `output.py` loads the BPE table shipped at `src/bn/_data/o200k_base.tiktoken` (sha256 pinned in `TOKENIZER_DATA_SHA256`; ranks are handed to `tiktoken.Encoding` together with the vendored `o200k_base` pattern and special tokens), falls back to tiktoken's own cache under `paths.tokenizer_cache_dir()`, and finally to a byte-based estimate reported as `o200k_base+estimate`. `tiktoken` is imported defensively, and payloads at or below the byte-level threshold skip tokenization entirely. `bn doctor` surfaces the active source through `output.tokenizer_status()`. Keep the vendored table in the wheel — it is package data, not a test fixture.
+
 `bn bundle function` is the one place where the bridge writes the artifact itself (because it composes a large structured object). The CLI threads `bridge_writes_output=True` so it doesn't double-write.
 
 ### `paths.py` is the single source of truth for filesystem layout
@@ -126,6 +139,7 @@ So every mutation lane has four possible result statuses — `verified`, `previe
 ## Conventions
 
 - **Argparse style:** `BnArgumentParser` (in `cli.py`) is a thin subclass that adds `--help-full` (recursively dumps every subparser). New subcommands should use it via `subparsers.add_parser(...)`, get a handler attached via `set_defaults(handler=_my_handler)`, and call `_common_io_options(parser)` to inherit `--format` / `--out`. Use `_target_option(parser, required=False)` for target-scoped verbs.
+- **README + `skills/bn/SKILL.md` are the agent-facing contract:** every verb and flag they document must work. When the documented spelling differs from the preferred implementation (`il-nav get-index-for-addr` vs `addr-to-index`, `section-user create` vs `add`, `plugin-cmd run` vs `execute`), register the documented name with `add_parser(..., aliases=[...])` — `--help-full` dedupes aliased parsers. Group-level shorthands (`_search_shorthand`, `_patch_shorthand`, `_value_shorthand`) cover documented flag forms such as `bn value --address 0x401000 --reg rax`. After changing the command surface, re-check both docs by running every `bn ...` snippet they contain.
 - **Text renderers are optional:** the JSON shape is the source of truth; text output is a render of the JSON via `text_renderer=` passed into `_call`. If the renderer isn't provided, `_render_fallback_text` pretty-prints JSON.
 - **Address parsing:** use `_parse_address` (bridge side) — it accepts both `0x...` strings and ints. Don't reinvent.
 - **Read vs write scheduling:** new target op names *must* be added to `READ_LOCKED_OPS` or `WRITE_LOCKED_OPS`. Read/read jobs may overlap; any conflict involving a write returns `TargetBusyError` with blocker job metadata.

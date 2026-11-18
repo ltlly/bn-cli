@@ -112,7 +112,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 | `bn function list` | List all functions (supports `--min-address`, `--max-address`) |
 | `bn function search` | Search functions by name (substring or `--regex`) |
 | `bn function info` | Detailed function info (locals, params, local_ids) |
-| `bn decompile` | Render HLIL-style decompile text |
+| `bn decompile` | Render structured HLIL text with nested control flow |
 | `bn il` | Dump IL for a function (HLIL/MLIL/LLIL variants) |
 | `bn disasm` | Disassemble a function |
 | `bn disasm-linear` | Disassemble linearly from an address |
@@ -333,6 +333,8 @@ If `--out` is set, the command writes the rendered result to that path and print
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
 `bn function list` and `bn function search` return the full matching set for the selected target or address range. Large results auto-spill to an artifact instead of forcing manual pagination. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout stays empty and stderr carries the spill metadata as plain text, including the artifact path and size counts.
+
+Token counting works fully offline: the `o200k_base` BPE table ships inside the package (`bn/_data/o200k_base.tiktoken`, pinned by sha256), so no first-run download is needed. If that table is ever missing, `bn` tries tiktoken's own cache (`$BN_CACHE_DIR/tiktoken`) and finally falls back to a byte-based estimate, so commands never fail because of the tokenizer. `bn doctor` reports which source is active. Payloads smaller than the spill threshold skip tokenization entirely, which keeps short commands fast.
 
 ## Extraction Commands
 

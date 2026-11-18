@@ -278,20 +278,24 @@ READ_LOCKED_OPS = {
     "type_archive_get",
     # --- annotation ---
     "annotation_get_tags",
+    "annotation_list_tag_types",
     # --- uidf ---
     "uidf_list_user_var_values",
     "uidf_parse_possible_value",
+    "uidf_from_address",
     # --- loader ---
     "loader_load_settings_get",
     "loader_load_settings_types",
     # --- external ---
     "external_library_list",
     "external_location_get",
+    "external_location_list",
     # --- analysis ---
     "analysis_status",
     "analysis_progress",
     # --- metadata (view-level) ---
     "metadata_query",
+    "metadata_keys",
     # --- data ---
     "data_typed_at",
     # --- xref extended ---
@@ -299,6 +303,7 @@ READ_LOCKED_OPS = {
     "xref_code_refs_to",
     "xref_data_refs_from",
     "xref_data_refs_to",
+    "xref_type_refs",
     # --- il extended ---
     "il_address_to_index",
     "il_index_to_address",
@@ -375,6 +380,8 @@ WRITE_LOCKED_OPS = {
     "type_archive_push",
     # --- annotation (write) ---
     "annotation_add_tag",
+    "annotation_create_tag_type",
+    "annotation_remove_tag",
     "annotation_define_data_var",
     "annotation_undefine_data_var",
     "annotation_define_symbol",
@@ -491,6 +498,14 @@ def _parse_address(value: Any) -> int:
     if text.lower().startswith("0x"):
         return int(text, 16)
     return int(text, 10)
+
+
+def _value_text(value: Any, limit: int = 200) -> str:
+    """Compact, bounded text for API objects echoed back to the CLI."""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def _artifact_summary(value: Any) -> dict[str, Any]:
@@ -1800,21 +1815,23 @@ class BinaryNinjaBridge:
 
         # --- value ops ---
         if op == "value_flags_at":
-            return self._value_flags_at(target, params["function_start"], params["address"])
+            return self._value_flags_at(
+                target, params.get("function_start"), params["address"]
+            )
         if op == "value_possible":
             return self._value_possible(
-                target, params["function_start"], params["address"],
+                target, params.get("function_start"), params["address"],
                 level=str(params.get("level", "hlil")),
                 ssa=bool(params.get("ssa", False)),
             )
         if op == "value_reg":
             return self._value_reg(
-                target, params["function_start"], params["address"],
+                target, params.get("function_start"), params["address"],
                 str(params["register"]), after=bool(params.get("after", False)),
             )
         if op == "value_stack":
             return self._value_stack(
-                target, params["function_start"], params["address"],
+                target, params.get("function_start"), params["address"],
                 int(params["stack_offset"]), int(params["size"]),
                 after=bool(params.get("after", False)),
             )
@@ -1966,9 +1983,30 @@ class BinaryNinjaBridge:
 
         # --- annotation ---
         if op == "annotation_add_tag":
-            return self._annotation_add_tag(target, params["address"], str(params["tag_type"]), str(params["data"]))
+            return self._annotation_add_tag(
+                target,
+                params.get("address"),
+                str(params["tag_type"]),
+                str(params["data"]),
+                function=params.get("function"),
+            )
         if op == "annotation_get_tags":
-            return self._annotation_get_tags(target, params["address"])
+            return self._annotation_get_tags(
+                target, params.get("address"), function=params.get("function")
+            )
+        if op == "annotation_create_tag_type":
+            return self._annotation_create_tag_type(
+                target, str(params["tag_type"]), params.get("icon")
+            )
+        if op == "annotation_list_tag_types":
+            return self._annotation_list_tag_types(target)
+        if op == "annotation_remove_tag":
+            return self._annotation_remove_tag(
+                target,
+                str(params["tag_type"]),
+                function=params.get("function"),
+                address=params.get("address"),
+            )
         if op == "annotation_define_data_var":
             return self._annotation_define_data_var(target, params["address"], type_name=params.get("type_name"), name=params.get("name"), width=params.get("width"))
         if op == "annotation_undefine_data_var":
@@ -2001,10 +2039,15 @@ class BinaryNinjaBridge:
             return self._uidf_list(target, params["function_start"])
         if op == "uidf_parse_possible_value":
             return self._uidf_parse(target, str(params["value"]), str(params["state"]))
+        if op == "uidf_from_address":
+            return self._uidf_from_address(target, params["address"])
 
         # --- loader ---
         if op == "loader_load_settings_get":
-            return self._loader_settings_get(target, str(params["type_name"]))
+            type_name = params.get("type_name")
+            return self._loader_settings_get(
+                target, str(type_name) if type_name else None
+            )
         if op == "loader_load_settings_set":
             return self._loader_settings_set(target, str(params["type_name"]), str(params["key"]), params["value"])
         if op == "loader_load_settings_types":
@@ -2025,6 +2068,8 @@ class BinaryNinjaBridge:
             return self._external_location_get(target, params["source_address"])
         if op == "external_location_remove":
             return self._external_location_remove(target, params["source_address"])
+        if op == "external_location_list":
+            return self._external_location_list(target)
 
         # --- analysis ---
         if op == "analysis_status":
@@ -2047,6 +2092,8 @@ class BinaryNinjaBridge:
             return self._metadata_store(target, str(params["key"]), params["value"])
         if op == "metadata_remove":
             return self._metadata_remove(target, str(params["key"]))
+        if op == "metadata_keys":
+            return self._metadata_keys(target)
 
         # --- data ---
         if op == "data_typed_at":
@@ -2061,6 +2108,10 @@ class BinaryNinjaBridge:
             return self._xref_data_refs_from(target, params["address"], length=params.get("length"))
         if op == "xref_data_refs_to":
             return self._xref_data_refs_to(target, params["address"], limit=int(params.get("limit", 100)))
+        if op == "xref_type_refs":
+            return self._xref_type_refs(
+                target, str(params["name"]), limit=params.get("limit")
+            )
 
         # --- il extended ---
         if op == "il_address_to_index":
@@ -2983,13 +3034,23 @@ class BinaryNinjaBridge:
                 raise AttributeError(f"{il_name} is None")
             if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
                 il = il.ssa_form
+            if il_name == "hlil" and not ssa:
+                # Basic-block instructions omit nested bodies; render the whole HLIL AST instead.
+                root = il.root
+                items = root.lines if root is not None else ()
+            else:
+                items = il.instructions
             lines = []
-            for ins in il.instructions:
-                address = getattr(ins, "address", func.start)
-                lines.append(f"{int(address):08x}        {ins}")
+            for item in items:
+                self._check_job_cancelled()
+                address = getattr(item, "address", func.start)
+                prefix = f"{int(address):08x}" if address is not None else " " * 8
+                lines.append(f"{prefix}        {item}")
             if lines:
                 return "\n".join(lines)
-            # IL object exists but produced no instructions — might still be generating
+            # IL object exists but produced no lines — might still be generating
+        except JobCancelled:
+            raise
         except Exception:
             pass
         # IL not available — figure out why
@@ -5087,14 +5148,29 @@ class BinaryNinjaBridge:
     # Value analysis operations
     # =========================================================================
 
+    def _resolve_value_function(self, bv, function_start_raw, addr: int):
+        """Resolve the function for a value query; the address alone is enough."""
+        fn = None
+        if function_start_raw not in (None, ""):
+            fn = bv.get_function_at(_parse_address(function_start_raw))
+        if fn is None:
+            fn = bv.get_function_at(addr)
+        if fn is None:
+            containing = (
+                bv.get_functions_containing(addr)
+                if hasattr(bv, "get_functions_containing")
+                else []
+            )
+            fn = containing[0] if containing else None
+        if fn is None:
+            raise RuntimeError(f"No function containing {hex(addr)}")
+        return fn
+
     def _value_flags_at(self, selector, function_start_raw, address_raw):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
         addr = _parse_address(address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             llil = fn.llil
             flags_read = []
             flags_written = []
@@ -5105,17 +5181,14 @@ class BinaryNinjaBridge:
                             token_text = str(token)
                             if token_text in [str(f) for f in fn.arch.flags]:
                                 flags_read.append(token_text)
-            return {"function": hex(fn_addr), "address": hex(addr), "flags_read": flags_read, "flags_written": flags_written}
+            return {"function": hex(fn.start), "address": hex(addr), "flags_read": flags_read, "flags_written": flags_written}
         return _do()
 
     def _value_possible(self, selector, function_start_raw, address_raw, *, level: str = "hlil", ssa: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
         addr = _parse_address(address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             if level == "llil":
                 il_func = fn.llil if not ssa else fn.llil.ssa_form
             elif level == "mlil":
@@ -5128,30 +5201,27 @@ class BinaryNinjaBridge:
                     if instr.address == addr:
                         pv = instr.possible_values
                         return {
-                            "function": hex(fn_addr),
+                            "function": hex(fn.start),
                             "address": hex(addr),
                             "level": level,
                             "ssa": ssa,
                             "type": str(pv.type) if hasattr(pv, "type") else str(type(pv).__name__),
                             "value": str(pv),
                         }
-            return {"function": hex(fn_addr), "address": hex(addr), "level": level, "ssa": ssa, "type": "not_found", "value": None}
+            return {"function": hex(fn.start), "address": hex(addr), "level": level, "ssa": ssa, "type": "not_found", "value": None}
         return _do()
 
     def _value_reg(self, selector, function_start_raw, address_raw, register: str, *, after: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
         addr = _parse_address(address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             if after:
                 val = fn.get_reg_value_after(addr, register)
             else:
                 val = fn.get_reg_value_at(addr, register)
             return {
-                "function": hex(fn_addr),
+                "function": hex(fn.start),
                 "address": hex(addr),
                 "register": register,
                 "after": after,
@@ -5162,18 +5232,15 @@ class BinaryNinjaBridge:
 
     def _value_stack(self, selector, function_start_raw, address_raw, stack_offset: int, size: int, *, after: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = _parse_address(function_start_raw)
         addr = _parse_address(address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             if after:
                 val = fn.get_stack_contents_after(addr, stack_offset, size)
             else:
                 val = fn.get_stack_contents_at(addr, stack_offset, size)
             return {
-                "function": hex(fn_addr),
+                "function": hex(fn.start),
                 "address": hex(addr),
                 "stack_offset": stack_offset,
                 "size": size,
@@ -5949,33 +6016,157 @@ class BinaryNinjaBridge:
     # Annotation operations
     # =========================================================================
 
-    def _annotation_add_tag(self, selector, address, tag_type: str, data: str):
+    def _annotation_add_tag(self, selector, address, tag_type: str, data: str, *, function=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
         def _do():
-            tt = bv.create_tag_type(tag_type, "⭐") if bv.get_tag_type(tag_type) is None else bv.get_tag_type(tag_type)
-            tag = bv.create_tag(tt, data)
-            fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
-            if fn:
+            tag_type_obj = bv.get_tag_type(tag_type) if hasattr(bv, "get_tag_type") else None
+            if tag_type_obj is None:
+                if not hasattr(bv, "create_tag_type"):
+                    raise RuntimeError("create_tag_type not available")
+                tag_type_obj = bv.create_tag_type(tag_type, "⭐")
+            if hasattr(bv, "create_tag"):
+                bv.create_tag(tag_type_obj, data)
+
+            if function is not None:
+                fn = self._find_function(bv, function)
+                if address:
+                    addr = _parse_address(address)
+                    fn.add_tag(tag_type, data, addr)
+                    return {
+                        "address": hex(addr),
+                        "function": fn.name,
+                        "function_start": hex(fn.start),
+                        "tag_type": tag_type,
+                        "data": data,
+                        "added": True,
+                    }
+                fn.add_tag(tag_type, data)
+                return {
+                    "function": fn.name,
+                    "function_start": hex(fn.start),
+                    "tag_type": tag_type,
+                    "data": data,
+                    "added": True,
+                }
+
+            if not address:
+                raise RuntimeError("add-tag requires an address or --function <id>")
+            addr = _parse_address(address)
+            fn = bv.get_function_at(addr)
+            if fn is None:
+                containing = bv.get_functions_containing(addr) if hasattr(bv, "get_functions_containing") else []
+                fn = containing[0] if containing else None
+            if fn is not None:
                 fn.add_tag(tag_type, data, addr)
             else:
                 bv.add_tag(addr, tag_type, data)
             return {"address": hex(addr), "tag_type": tag_type, "data": data, "added": True}
         return _do()
 
-    def _annotation_get_tags(self, selector, address):
+    def _annotation_get_tags(self, selector, address, *, function=None):
         bv = self._resolve_view(selector)
-        addr = _parse_address(address)
         def _do():
             tags = []
-            fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
-            if fn:
-                for tag in fn.get_tags_at(addr):
-                    tags.append({"type": tag.type.name, "data": tag.data})
+            if function is not None:
+                fn = self._find_function(bv, function)
+                entries = fn.get_function_tags() if hasattr(fn, "get_function_tags") else []
+                for tag in entries or []:
+                    tags.append({"type": tag.type.name, "data": tag.data, "scope": "function"})
+                return tags
+
+            if not address:
+                raise RuntimeError("get-tags requires an address or --function <id>")
+            addr = _parse_address(address)
+            fn = bv.get_function_at(addr)
+            if fn is None:
+                containing = bv.get_functions_containing(addr) if hasattr(bv, "get_functions_containing") else []
+                fn = containing[0] if containing else None
+            if fn is not None and hasattr(fn, "get_tags_at"):
+                for tag in fn.get_tags_at(addr) or []:
+                    tags.append({"type": tag.type.name, "data": tag.data, "scope": "address"})
             addr_tags = bv.get_tags_at(addr) if hasattr(bv, "get_tags_at") else []
-            for tag in addr_tags:
-                tags.append({"type": tag.type.name, "data": tag.data})
+            for tag in addr_tags or []:
+                tags.append({"type": tag.type.name, "data": tag.data, "scope": "address"})
             return tags
+        return _do()
+
+    def _annotation_create_tag_type(self, selector, tag_type: str, icon=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            resolved_icon = str(icon) if icon else "⭐"
+            existing = bv.get_tag_type(tag_type) if hasattr(bv, "get_tag_type") else None
+            if existing is not None:
+                return {
+                    "tag_type": getattr(existing, "name", tag_type),
+                    "icon": getattr(existing, "icon", None),
+                    "created": False,
+                }
+            if not hasattr(bv, "create_tag_type"):
+                raise RuntimeError("create_tag_type not available")
+            created = bv.create_tag_type(tag_type, resolved_icon)
+            return {
+                "tag_type": getattr(created, "name", tag_type),
+                "icon": getattr(created, "icon", resolved_icon),
+                "created": True,
+            }
+        return _do()
+
+    def _annotation_list_tag_types(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            raw = getattr(bv, "tag_types", None) or {}
+            pairs = raw.items() if hasattr(raw, "items") else []
+            entries = []
+            for name, value in pairs:
+                candidates = value if isinstance(value, (list, tuple)) else [value]
+                for tag_type in candidates:
+                    entries.append(
+                        {
+                            "name": getattr(tag_type, "name", name),
+                            "icon": getattr(tag_type, "icon", None),
+                            "visible": getattr(tag_type, "visible", None),
+                        }
+                    )
+            entries.sort(key=lambda entry: str(entry["name"]))
+            return entries
+        return _do()
+
+    def _annotation_remove_tag(self, selector, tag_type: str, *, function=None, address=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            if not function and not address:
+                raise RuntimeError(
+                    "remove-tag requires a scope: pass --function <id> or --address <addr>"
+                )
+            fn = self._find_function(bv, function) if function else None
+            addr = _parse_address(address) if address else (fn.start if fn is not None else None)
+            if fn is None and addr is not None:
+                containing = bv.get_functions_containing(addr) if hasattr(bv, "get_functions_containing") else []
+                fn = containing[0] if containing else None
+
+            removed = 0
+            if fn is not None:
+                for tag in list(fn.get_function_tags(auto=False, tag_type=tag_type) or []):
+                    fn.remove_user_function_tag(tag)
+                    removed += 1
+                if addr is not None and hasattr(fn, "get_tags_at"):
+                    for tag in list(fn.get_tags_at(addr, auto=False) or []):
+                        if getattr(getattr(tag, "type", None), "name", None) != tag_type:
+                            continue
+                        fn.remove_user_address_tag(addr, tag)
+                        removed += 1
+            elif addr is not None:
+                for tag in list(bv.get_tags_at(addr, auto=False) or []):
+                    if getattr(getattr(tag, "type", None), "name", None) != tag_type:
+                        continue
+                    bv.remove_user_data_tag(addr, tag)
+                    removed += 1
+            return {
+                "tag_type": tag_type,
+                "function": fn.name if fn is not None else None,
+                "address": hex(addr) if addr is not None else None,
+                "removed": removed,
+            }
         return _do()
 
     def _annotation_define_data_var(self, selector, address, *, type_name=None, name=None, width=None):
@@ -6184,19 +6375,75 @@ class BinaryNinjaBridge:
             return {"value": value, "state": state, "valid": True, "parsed_value": int(value, 0) if isinstance(value, str) else value}
         return _do()
 
+    def _uidf_from_address(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        def _do():
+            fn = bv.get_function_at(addr)
+            if fn is None:
+                containing = (
+                    bv.get_functions_containing(addr)
+                    if hasattr(bv, "get_functions_containing")
+                    else []
+                )
+                fn = containing[0] if containing else None
+            if fn is None:
+                raise RuntimeError(f"No function containing {hex(addr)}")
+            values = {}
+            if hasattr(fn, "get_all_user_var_values"):
+                try:
+                    values = fn.get_all_user_var_values() or {}
+                except Exception:
+                    values = {}
+            if not values and hasattr(fn, "user_var_values"):
+                values = fn.user_var_values or {}
+            variables = []
+            for var, def_sites in (values.items() if hasattr(values, "items") else []):
+                definitions = []
+                for site, value in (def_sites.items() if hasattr(def_sites, "items") else []):
+                    site_address = getattr(site, "address", None)
+                    definitions.append(
+                        {
+                            "address": hex(site_address) if isinstance(site_address, int) else None,
+                            "arch": str(getattr(site, "arch", "") or "") or None,
+                            "value": _value_text(value),
+                            "at_address": site_address == addr,
+                        }
+                    )
+                definitions.sort(key=lambda item: item["address"] or "")
+                variables.append(
+                    {
+                        "var": str(getattr(var, "name", var)),
+                        "definitions": definitions,
+                    }
+                )
+            variables.sort(key=lambda item: item["var"])
+            return {
+                "address": hex(addr),
+                "function": fn.name,
+                "function_start": hex(fn.start),
+                "variables": variables,
+            }
+        return _do()
+
     # =========================================================================
     # Loader operations
     # =========================================================================
 
-    def _loader_settings_get(self, selector, type_name: str):
+    def _loader_settings_get(self, selector, type_name: str | None = None):
         bv = self._resolve_view(selector)
         def _do():
-            settings = bn.Settings(f"loader.{type_name}")
+            resolved = type_name or str(getattr(bv, "view_type", "") or "")
+            if not resolved:
+                raise RuntimeError(
+                    "type_name is required: pass a view type (e.g. ELF) explicitly"
+                )
+            settings = bn.Settings(f"loader.{resolved}")
             keys = settings.keys() if hasattr(settings, "keys") else []
             result = {}
             for key in keys:
                 result[key] = settings.get_string(key) if hasattr(settings, "get_string") else None
-            return {"type_name": type_name, "settings": result}
+            return {"type_name": resolved, "settings": result}
         return _do()
 
     def _loader_settings_set(self, selector, type_name: str, key: str, value):
@@ -6304,6 +6551,28 @@ class BinaryNinjaBridge:
             raise RuntimeError("get_external_location_at not available")
         return _do()
 
+    def _external_location_list(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            if not hasattr(bv, "get_external_locations"):
+                raise RuntimeError("get_external_locations not available")
+            entries = []
+            for location in bv.get_external_locations() or []:
+                source = getattr(location, "source", None)
+                target = getattr(location, "target_address", None)
+                library = getattr(location, "library", None)
+                entries.append(
+                    {
+                        "source_address": hex(source) if isinstance(source, int) else None,
+                        "library": getattr(library, "name", None) if library is not None else None,
+                        "symbol": getattr(location, "symbol", None),
+                        "target_address": hex(target) if isinstance(target, int) and target else None,
+                    }
+                )
+            entries.sort(key=lambda entry: entry["source_address"] or "")
+            return entries
+        return _do()
+
     def _external_location_remove(self, selector, source_address):
         bv = self._resolve_view(selector)
         addr = _parse_address(source_address)
@@ -6403,6 +6672,20 @@ class BinaryNinjaBridge:
             return {"key": key, "stored": True}
         return _do()
 
+    def _metadata_keys(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            metadata = getattr(bv, "metadata", None)
+            if metadata is None:
+                return []
+            if hasattr(metadata, "get_dict"):
+                data = metadata.get_dict() or {}
+            else:
+                data = metadata
+            keys = list(data.keys()) if hasattr(data, "keys") else []
+            return sorted(str(key) for key in keys)
+        return _do()
+
     def _metadata_remove(self, selector, key: str):
         bv = self._resolve_view(selector)
         def _do():
@@ -6484,6 +6767,27 @@ class BinaryNinjaBridge:
         def _do():
             refs = list(bv.get_data_refs(addr))[:limit]
             return [{"address": hex(ref)} for ref in refs]
+        return _do()
+
+    def _xref_type_refs(self, selector, name: str, *, limit=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            if not hasattr(bv, "get_type_refs_for_type"):
+                raise RuntimeError("get_type_refs_for_type not available")
+            refs = bv.get_type_refs_for_type(name, int(limit) if limit else None)
+            entries = []
+            for ref in refs or []:
+                ref_name = getattr(ref, "name", None)
+                offset = getattr(ref, "offset", None)
+                ref_type = getattr(ref, "ref_type", None)
+                entries.append(
+                    {
+                        "type": str(ref_name) if ref_name is not None else str(ref),
+                        "offset": hex(offset) if isinstance(offset, int) else None,
+                        "reference_type": str(ref_type) if ref_type is not None else None,
+                    }
+                )
+            return entries
         return _do()
 
     # =========================================================================

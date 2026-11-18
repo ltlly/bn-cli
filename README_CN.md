@@ -135,7 +135,7 @@ bn daemon stop                        # 通过认证协议优雅停止守护进�
 | `bn function list` | 列出所有函数（支持 `--min-address`、`--max-address`） |
 | `bn function search` | 按名称搜索函数（子串匹配或 `--regex`） |
 | `bn function info` | 函数详细信息（局部变量、参数、local_id） |
-| `bn decompile` | HLIL 风格反编译输出 |
+| `bn decompile` | 输出保留嵌套控制流的结构化 HLIL 文本 |
 | `bn il` | 导出函数 IL（HLIL/MLIL/LLIL） |
 | `bn disasm` | 反汇编函数 |
 | `bn disasm-linear` | 从指定地址线性反汇编 |
@@ -267,6 +267,8 @@ bn daemon use --clear         # 清除固定，自动选择
 读取命令默认 `text`，变更命令默认 `json`。使用 `--out` 时输出写入文件，stdout 打印元数据信封（路径、大小、token 数、hash）。
 
 大输出自动 spill：超过 10,000 tokens 时自动写入临时文件，stdout 为空，stderr 打印 spill 元数据。Agent 据此决定是否读取完整内容。
+
+token 计数完全支持离线：`o200k_base` BPE 表随包分发（`bn/_data/o200k_base.tiktoken`，以 sha256 固定），首次运行无需联网下载。若该表缺失，`bn` 会退回 tiktoken 自身缓存（`$BN_CACHE_DIR/tiktoken`），最后退回按字节估算，因此命令不会因为分词器而失败。`bn doctor` 会显示当前使用的来源。小于 spill 阈值的输出会跳过分词，保持短命令的响应速度。
 
 ## 批量变更
 

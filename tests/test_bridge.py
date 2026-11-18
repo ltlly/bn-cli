@@ -882,6 +882,49 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
         instance._search_functions("active", "(", regex=True)
 
 
+def test_decompile_preserves_nested_hlil_branches(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "choose")
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    class Line:
+        def __init__(self, address, text):
+            self.address = address
+            self.text = text
+
+        def __str__(self):
+            return self.text
+
+    fn.hlil = types.SimpleNamespace(
+        instructions=[Line(0x401000, "if (x) then 1 else 2"), Line(0x401010, "return 3")],
+        root=types.SimpleNamespace(lines=iter([
+            Line(0x401000, "if (x)"),
+            Line(0x401004, "    if (y)"),
+            Line(0x401008, "        return 1"),
+            Line(None, "    else"),
+            Line(0x40100C, "        return 2"),
+            Line(None, "else"),
+            Line(0x401010, "    return 3"),
+        ])),
+    )
+
+    assert instance._decompile("active", "choose") == {
+        "function": {"address": "0x401000", "name": "choose"},
+        "warnings": [],
+        "text": "\n".join([
+            "00401000        if (x)",
+            "00401004            if (y)",
+            "00401008                return 1",
+            "                    else",
+            "0040100c                return 2",
+            "                else",
+            "00401010            return 3",
+        ]),
+    }
+
+
 def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -3192,3 +3235,289 @@ def test_completed_job_history_is_bounded(monkeypatch, tmp_path):
     jobs = instance.jobs.list()
     assert len(jobs) == bridge.COMPLETED_JOBS_LIMIT
     assert jobs[0]["job_id"] == newest["job_id"]
+
+# =========================================================================
+# Tag / metadata / external-location / type-ref / uidf operations
+# =========================================================================
+
+
+class _FakeTagType:
+    def __init__(self, name: str, icon: str = "star", visible: bool = True):
+        self.name = name
+        self.icon = icon
+        self.visible = visible
+
+
+class _FakeTag:
+    def __init__(self, tag_type: _FakeTagType, data: str = ""):
+        self.type = tag_type
+        self.data = data
+
+
+class _FakeDefSite:
+    """Hashable stand-in for ``binaryninja.ArchAndAddr``."""
+
+    def __init__(self, address: int, arch: str = "x86_64"):
+        self.address = address
+        self.arch = arch
+
+
+class _FakeTaggedFunction(_FakeFunction):
+    def __init__(self, start: int, name: str, *, tags=None, address_tags=None):
+        super().__init__(start, name)
+        self.tags = list(tags or [])
+        self.address_tags = {int(k): list(v) for k, v in (address_tags or {}).items()}
+        self.removed_function_tags: list[_FakeTag] = []
+        self.removed_address_tags: list[_FakeTag] = []
+
+    def add_tag(self, tag_type, data, addr=None):
+        tag = _FakeTag(_FakeTagType(tag_type), data)
+        if addr is None:
+            self.tags.append(tag)
+        else:
+            self.address_tags.setdefault(int(addr), []).append(tag)
+        return tag
+
+    def get_function_tags(self, auto=None, tag_type=None):
+        if tag_type is None:
+            return list(self.tags)
+        return [tag for tag in self.tags if tag.type.name == tag_type]
+
+    def remove_user_function_tag(self, tag):
+        self.removed_function_tags.append(tag)
+        if tag in self.tags:
+            self.tags.remove(tag)
+
+    def get_tags_at(self, addr: int, arch=None, auto=None):
+        return list(self.address_tags.get(int(addr), []))
+
+    def remove_user_address_tag(self, addr: int, tag, arch=None):
+        self.removed_address_tags.append(tag)
+        self.address_tags.setdefault(int(addr), []).remove(tag)
+
+
+class _FakeTagBV(_FakeBV):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tag_type_map: dict[str, _FakeTagType] = {}
+
+    def get_tag_type(self, name: str):
+        return self.tag_type_map.get(str(name))
+
+    def create_tag_type(self, name: str, icon: str):
+        tag_type = _FakeTagType(name, icon)
+        self.tag_type_map[name] = tag_type
+        return tag_type
+
+    @property
+    def tag_types(self):
+        return dict(self.tag_type_map)
+
+
+def test_annotation_create_tag_type_creates_then_reuses(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeTagBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    created = instance._annotation_create_tag_type("active", "Important", "star")
+    again = instance._annotation_create_tag_type("active", "Important", "star")
+
+    assert created["created"] is True
+    assert created["tag_type"] == "Important"
+    assert created["icon"] == "star"
+    assert again["created"] is False
+    assert len(bv.tag_type_map) == 1
+
+
+def test_annotation_list_tag_types_flattens_duplicate_names(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeTagBV()
+    bv.tag_type_map["Auto"] = [_FakeTagType("Auto"), _FakeTagType("Auto")]
+    bv.tag_type_map["User"] = _FakeTagType("User", icon="u", visible=False)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    entries = instance._annotation_list_tag_types("active")
+
+    assert [entry["name"] for entry in entries] == ["Auto", "Auto", "User"]
+    assert entries[-1]["visible"] is False
+
+
+def test_annotation_remove_tag_removes_function_and_address_tags(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    important = _FakeTagType("Important")
+    other = _FakeTagType("Other")
+    fn = _FakeTaggedFunction(
+        0x401000,
+        "sub_401000",
+        tags=[_FakeTag(important), _FakeTag(other)],
+        address_tags={0x401000: [_FakeTag(important), _FakeTag(other)]},
+    )
+    bv = _FakeTagBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._annotation_remove_tag("active", "Important", function="0x401000")
+
+    assert result["removed"] == 2
+    assert [tag.type.name for tag in fn.tags] == ["Other"]
+    assert [tag.type.name for tag in fn.address_tags[0x401000]] == ["Other"]
+
+
+def test_annotation_remove_tag_requires_a_scope(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeTagBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="requires a scope"):
+        instance._annotation_remove_tag("active", "Important")
+
+
+def test_metadata_keys_returns_sorted_keys(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.metadata = types.SimpleNamespace(get_dict=lambda: {"zeta": 1, "alpha": 2})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    assert instance._metadata_keys("active") == ["alpha", "zeta"]
+
+
+def test_external_location_list_formats_entries(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.get_external_locations = lambda: [
+        types.SimpleNamespace(
+            source=0x402000,
+            library=types.SimpleNamespace(name="libc.so.6"),
+            symbol="malloc",
+            target_address=0x500000,
+        ),
+        types.SimpleNamespace(source=0x401000, library=None, symbol=None, target_address=None),
+    ]
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    entries = instance._external_location_list("active")
+
+    assert entries[0] == {
+        "source_address": "0x401000",
+        "library": None,
+        "symbol": None,
+        "target_address": None,
+    }
+    assert entries[1]["library"] == "libc.so.6"
+    assert entries[1]["symbol"] == "malloc"
+    assert entries[1]["target_address"] == "0x500000"
+
+
+def test_xref_type_refs_reports_referring_types(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.get_type_refs_for_type = lambda name, limit=None: [
+        types.SimpleNamespace(name="Player", offset=0x8, ref_type="direct"),
+        types.SimpleNamespace(name="Enemy", offset=0x10, ref_type="indirect"),
+    ]
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    entries = instance._xref_type_refs("active", "TrackRowCell")
+
+    assert [entry["type"] for entry in entries] == ["Player", "Enemy"]
+    assert entries[0]["offset"] == "0x8"
+    assert entries[1]["reference_type"] == "indirect"
+
+
+def test_uidf_from_address_collects_definition_sites(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    variable = _FakeVariable(name="x", storage=0, var_type="int32_t", identifier=1)
+    sites = {
+        _FakeDefSite(0x401010, "x86_64"): "constant 0x10",
+        _FakeDefSite(0x401000, "x86_64"): "constant 0x0",
+    }
+    fn = _FakeFunction(0x401000, "sub_401000")
+    fn.get_all_user_var_values = lambda: {variable: sites}
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._uidf_from_address("active", "0x401000")
+
+    assert result["function"] == "sub_401000"
+    assert result["function_start"] == "0x401000"
+    definitions = result["variables"][0]["definitions"]
+    assert [entry["address"] for entry in definitions] == ["0x401000", "0x401010"]
+    assert definitions[1]["value"] == "constant 0x10"
+
+
+def test_loader_settings_get_defaults_to_view_type(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.view_type = "ELF"
+    bv.available_view_types = ["ELF", "MACHO"]
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.bn,
+        "Settings",
+        lambda path: types.SimpleNamespace(
+            keys=lambda: ["loader.ELF.foo"], get_string=lambda key: "bar"
+        ),
+        raising=False,
+    )
+
+    result = instance._loader_settings_get("active")
+
+    assert result == {"type_name": "ELF", "settings": {"loader.ELF.foo": "bar"}}
+
+def test_annotation_add_tag_function_scope_adds_function_tag(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeTaggedFunction(0x401000, "sub_401000")
+    bv = _FakeTagBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._annotation_add_tag(
+        "active", None, "Important", "review needed", function="0x401000"
+    )
+
+    assert result["added"] is True
+    assert result["function"] == "sub_401000"
+    assert [tag.type.name for tag in fn.tags] == ["Important"]
+    assert fn.tags[0].data == "review needed"
+
+
+def test_annotation_get_tags_function_scope_lists_function_tags(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    important = _FakeTagType("Important")
+    fn = _FakeTaggedFunction(0x401000, "sub_401000", tags=[_FakeTag(important, "review")])
+    bv = _FakeTagBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    tags = instance._annotation_get_tags("active", None, function="0x401000")
+
+    assert tags == [{"type": "Important", "data": "review", "scope": "function"}]
+
+def test_value_reg_resolves_function_from_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "sub_401000")
+    seen = {}
+
+    def get_reg_value_at(address, register):
+        seen["address"] = address
+        seen["register"] = register
+        return types.SimpleNamespace(type="ConstantValue", value=0x10)
+
+    fn.get_reg_value_at = get_reg_value_at
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._value_reg("active", None, "0x401000", "rax")
+
+    assert seen == {"address": 0x401000, "register": "rax"}
+    assert result["function"] == "0x401000"
+    assert result["value"] == 0x10
