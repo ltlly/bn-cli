@@ -285,39 +285,49 @@ def _send_request_to_instance(
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
 
     chunks: list[bytes] = []
-    last_error: OSError | None = None
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def set_remaining_timeout(sock):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("bridge request deadline expired")
+            sock.settimeout(remaining)
+
     for attempt in range(connect_retries):
+        connected = False
         try:
             family, address = _socket_args(instance)
             with socket.socket(family, socket.SOCK_STREAM) as sock:
-                if timeout is not None:
-                    sock.settimeout(timeout)
+                set_remaining_timeout(sock)
                 sock.connect(address)
+                connected = True
+                set_remaining_timeout(sock)
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
                 while True:
+                    set_remaining_timeout(sock)
                     chunk = sock.recv(65536)
                     if not chunk:
                         break
                     chunks.append(chunk)
             break
-        except OSError as exc:
-            last_error = exc
-            if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
-                break
-            time.sleep(0.05 * (attempt + 1))
-
-    if last_error is not None and not chunks:
-        if isinstance(last_error, TimeoutError):
-            timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
+        except TimeoutError as exc:
+            status = "Execution may still be in progress." if connected else "The request was not sent."
             raise BridgeError(
-                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.endpoint}"
-                f"{timeout_suffix}"
-            ) from last_error
-        raise BridgeError(
-            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.endpoint}: {last_error}"
-        ) from last_error
+                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.endpoint}. {status}"
+            ) from exc
+        except OSError as exc:
+            if not connected and exc.errno in TRANSIENT_SOCKET_ERRNOS and attempt + 1 < connect_retries:
+                delay = 0.05 * (attempt + 1)
+                if deadline is not None:
+                    delay = min(delay, max(0.0, deadline - time.monotonic()))
+                time.sleep(delay)
+                continue
+            raise BridgeError(
+                f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.endpoint}: {exc}"
+            ) from exc
 
     if not chunks:
         raise BridgeError("Binary Ninja bridge returned an empty response")

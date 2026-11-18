@@ -642,3 +642,19 @@ def test_sticky_mode_ignores_invalid_value(tmp_path, monkeypatch):
     sticky.write_text("nonsense", encoding="utf-8")
 
     assert read_current_daemon_mode() is None
+
+
+def test_socket_partial_response_with_read_error_is_not_success(tmp_path, monkeypatch):
+    """Even a syntactically complete prefix can't authenticate transport completion."""
+    import contextlib
+    from unittest.mock import MagicMock
+    from bn.transport import BridgeError, BridgeInstance, _send_request_to_instance
+
+    instance = BridgeInstance(1, tmp_path / "x.sock", tmp_path / "x.json", "bridge", "test", None, {})
+    sock = MagicMock()
+    sock.recv.side_effect = [b'{"ok":true}', ConnectionResetError()]
+    monkeypatch.setattr("bn.transport._socket_args", lambda _: (socket.AF_INET, ("127.0.0.1", 1)))
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *_: contextlib.nullcontext(sock))
+    with pytest.raises(BridgeError, match="Failed to contact"):
+        _send_request_to_instance(instance, "doctor", timeout=1)
+    assert sock.sendall.call_count == 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import operator
 import re
 
@@ -56,10 +57,13 @@ def query_rows(rows, dataset, *, filters=(), fields=None, sort=None, offset=0, l
     matched = (row for row in rows if all(test(row) for test in predicates))
     if count:
         return {"count": sum(1 for _ in matched)}
-    matches = list(matched)
-    for field, descending in reversed(order):
-        if field in NUMERIC:
-            matches.sort(key=lambda row: _number(row[field]), reverse=descending)
-        else:
-            matches.sort(key=operator.itemgetter(field), reverse=descending)
-    return [{key: row[key] for key in columns} for row in matches[offset:offset + limit if limit else None]]
+    if order:
+        matches = list(matched)
+        for field, descending in reversed(order):
+            if field in NUMERIC:
+                matches.sort(key=lambda row: _number(row[field]), reverse=descending)
+            else:
+                matches.sort(key=operator.itemgetter(field), reverse=descending)
+        matched = iter(matches)
+    page = itertools.islice(matched, offset, offset + limit if limit else None)
+    return [{key: row[key] for key in columns} for row in page]
