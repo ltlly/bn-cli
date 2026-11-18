@@ -4,11 +4,13 @@ import functools
 import hashlib
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .artifacts import atomic_write
 from .paths import spill_root, tokenizer_cache_dir
 
 try:  # pragma: no cover - the fallback path is covered by tests that unload tiktoken
@@ -92,7 +94,7 @@ def _spill_path(stem: str, suffix: str) -> Path:
     now = datetime.now(timezone.utc)
     directory = spill_root() / now.strftime("%Y%m%d")
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
+    return directory / f"{stem}-{now.strftime('%H%M%S')}-{uuid.uuid4().hex}{suffix}"
 
 
 def tokenizer_data_path() -> Path:
@@ -220,7 +222,7 @@ def write_output_result(
     if out_path is not None:
         token_count, tokenizer = count_tokens(rendered)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(encoded)
+        atomic_write(out_path, encoded)
         artifact = _artifact_payload(
             artifact_path=out_path,
             fmt=fmt,
@@ -247,7 +249,7 @@ def write_output_result(
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     spill_path = _spill_path(stem, suffix)
-    spill_path.write_bytes(encoded)
+    atomic_write(spill_path, encoded)
     artifact = _artifact_payload(
         artifact_path=spill_path,
         fmt=fmt,

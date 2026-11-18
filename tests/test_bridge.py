@@ -6,6 +6,7 @@ import io
 import json
 import multiprocessing.connection
 import os
+import platform
 import socket
 import sys
 import threading
@@ -2712,7 +2713,7 @@ def test_gui_transport_setting_is_used_in_auto_mode(monkeypatch):
     monkeypatch.delenv("BN_BRIDGE_TRANSPORT", raising=False)
     monkeypatch.setattr(bridge, "ui", object())
     monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
-    monkeypatch.setattr(bridge.os, "name", "nt")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
     bridge._register_gui_settings()
 
     settings.values[bridge.GUI_TRANSPORT_SETTING] = "tcp"
@@ -2725,6 +2726,7 @@ def test_explicit_transport_environment_overrides_gui_setting(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     settings = _FakePluginSettings()
     monkeypatch.setenv("BN_BRIDGE_TRANSPORT", "pipe")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
     monkeypatch.setattr(bridge, "ui", object())
     monkeypatch.setattr(bridge.bn, "Settings", lambda: settings, raising=False)
     bridge._register_gui_settings()
@@ -2925,6 +2927,25 @@ def test_gui_bridge_rejects_shutdown(monkeypatch):
     assert "only available in headless mode" in response["error"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions")
+def test_tcp_registry_replaces_legacy_permissions_before_publishing_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(mode="headless")
+    instance.transport = "tcp"
+    instance.host, instance.port, instance.auth_token = "127.0.0.1", 26766, "new-token"
+    path = instance.registry_path
+    path.parent.mkdir()
+    path.write_text("legacy registry", encoding="utf-8")
+    path.chmod(0o644)
+
+    with path.open(encoding="utf-8") as previous:
+        instance._write_registry()
+        assert previous.read() == "legacy registry"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8"))["auth_token"] == "new-token"
+
+
 def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     bridge = _load_bridge(monkeypatch)
@@ -2980,6 +3001,91 @@ def test_tcp_bridge_requires_registry_auth_token(monkeypatch, tmp_path):
         assert instance.shutdown_event.wait(timeout=1)
     finally:
         instance.stop()
+
+
+def test_named_pipe_slot_is_released_before_authenticated_dispatch(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge.multiprocessing.connection, "Listener", lambda *a, **kw: object())
+    monkeypatch.setattr(bridge.ThreadedNamedPipeServer, "max_pending_requests", 1)
+    target = types.SimpleNamespace(auth_token="test")
+    server = bridge.ThreadedNamedPipeServer("test", target)
+    responses = []
+
+    def dispatch(payload):
+        # A second client can enter while this authenticated job is still executing.
+        assert server._pending.acquire(blocking=False)
+        server._pending.release()
+        return {"ok": True, "result": payload["id"]}
+
+    target.dispatch = dispatch
+    class Connection:
+        def poll(self, timeout):
+            return True
+
+        def recv_bytes(self):
+            return b'{"op":"doctor","auth":"test","id":"a"}'
+
+        def send_bytes(self, data):
+            responses.append(data)
+
+        def close(self):
+            pass
+
+    connection = Connection()
+    assert server._pending.acquire(blocking=False)
+    server._handle_connection(connection)
+    assert json.loads(responses[0]) == {"ok": True, "result": "a"}
+
+
+def test_named_pipe_shutdown_and_read_deadline_with_saturated_admission(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    waiting = threading.Event()
+    finish_poll = threading.Event()
+    closed = threading.Event()
+    timeouts = []
+
+    class IdleConnection:
+        def poll(self, timeout):
+            timeouts.append(timeout)
+            waiting.set()
+            finish_poll.wait(timeout)
+            return False
+
+        def close(self):
+            closed.set()
+
+    accepted = []
+    def accept():
+        conn = IdleConnection()
+        accepted.append(conn)
+        return conn
+
+    monkeypatch.setattr(bridge.multiprocessing.connection, "Listener",
+                        lambda *a, **kw: types.SimpleNamespace(accept=accept, close=lambda: None))
+    monkeypatch.setattr(bridge.ThreadedNamedPipeServer, "max_pending_requests", 1)
+    # A busy Windows pipe rejects an immediate open. Shutdown must still complete.
+    def busy(*args):
+        raise OSError("pipe busy")
+
+    monkeypatch.setitem(sys.modules, "_winapi", types.SimpleNamespace(
+        CreateFile=busy, GENERIC_READ=1, GENERIC_WRITE=2, NULL=0,
+        OPEN_EXISTING=3, FILE_FLAG_OVERLAPPED=4,
+    ))
+    server = bridge.ThreadedNamedPipeServer("test", None)
+    listener = threading.Thread(target=server.serve_forever, daemon=True)
+    listener.start()
+    try:
+        assert waiting.wait(1)
+        assert not server._pending.acquire(blocking=False)
+        server.shutdown()
+        listener.join(1)
+        assert not listener.is_alive()
+        assert len(accepted) == 1
+    finally:
+        finish_poll.set()
+        server.server_close()
+    assert closed.wait(1)
+    assert timeouts == [server.first_message_timeout]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Named Pipes are unavailable")
@@ -3039,6 +3145,7 @@ def test_binary_view_reads_do_not_marshal_to_ui_thread(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge(mode="headless")
     bv = _FakeHeadlessBV(filename="/tmp/x.so", session_id="sess-x")
+    bv.segments = [types.SimpleNamespace(start=0x1000, end=0x2000, data_offset=0, data_length=0x1000)]
     instance.targets.register(bv)
 
     def fail_main_thread(_func):
@@ -3258,7 +3365,7 @@ class _FakeDefSite:
     """Hashable stand-in for ``binaryninja.ArchAndAddr``."""
 
     def __init__(self, address: int, arch: str = "x86_64"):
-        self.address = address
+        self.addr = address
         self.arch = arch
 
 
@@ -3344,7 +3451,15 @@ def test_annotation_list_tag_types_flattens_duplicate_names(monkeypatch):
     assert entries[-1]["visible"] is False
 
 
-def test_annotation_remove_tag_removes_function_and_address_tags(monkeypatch):
+@pytest.mark.parametrize(
+    ("function", "address", "expected"),
+    [
+        ("0x401000", None, (0, 1, 1)),
+        (None, "va:0x401010", (1, 0, 0)),
+        ("0x401000", "va:0x401010", (1, 0, 1)),
+    ],
+)
+def test_annotation_remove_tag_respects_scope(monkeypatch, function, address, expected):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     important = _FakeTagType("Important")
@@ -3353,16 +3468,20 @@ def test_annotation_remove_tag_removes_function_and_address_tags(monkeypatch):
         0x401000,
         "sub_401000",
         tags=[_FakeTag(important), _FakeTag(other)],
-        address_tags={0x401000: [_FakeTag(important), _FakeTag(other)]},
+        address_tags={0x401010: [_FakeTag(important), _FakeTag(other)]},
     )
     bv = _FakeTagBV(functions=[fn])
+    data_tags = [_FakeTag(important), _FakeTag(other)]
+    bv.get_functions_containing = lambda addr: [fn] if addr == 0x401010 else []
+    bv.get_tags_at = lambda addr, auto: list(data_tags)
+    bv.remove_user_data_tag = lambda addr, tag: data_tags.remove(tag)
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    result = instance._annotation_remove_tag("active", "Important", function="0x401000")
-
-    assert result["removed"] == 2
-    assert [tag.type.name for tag in fn.tags] == ["Other"]
-    assert [tag.type.name for tag in fn.address_tags[0x401000]] == ["Other"]
+    result = instance._annotation_remove_tag("active", "Important", function=function, address=address)
+    groups = (fn.tags, fn.address_tags[0x401010], data_tags)
+    assert [sum(tag.type is important for tag in group) for group in groups] == list(expected)
+    assert all(any(tag.type is other for tag in group) for group in groups)
+    assert result["removed"] == 3 - sum(expected)
 
 
 def test_annotation_remove_tag_requires_a_scope(monkeypatch):
@@ -3371,7 +3490,7 @@ def test_annotation_remove_tag_requires_a_scope(monkeypatch):
     bv = _FakeTagBV()
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    with pytest.raises(RuntimeError, match="requires a scope"):
+    with pytest.raises(ValueError, match="requires a scope"):
         instance._annotation_remove_tag("active", "Important")
 
 
@@ -3391,12 +3510,12 @@ def test_external_location_list_formats_entries(monkeypatch):
     bv = _FakeBV()
     bv.get_external_locations = lambda: [
         types.SimpleNamespace(
-            source=0x402000,
+            source_symbol=types.SimpleNamespace(address=0x402000),
             library=types.SimpleNamespace(name="libc.so.6"),
-            symbol="malloc",
-            target_address=0x500000,
+            target_symbol="malloc",
+            target_address=0,
         ),
-        types.SimpleNamespace(source=0x401000, library=None, symbol=None, target_address=None),
+        types.SimpleNamespace(source_symbol=types.SimpleNamespace(address=0x401000), library=None, target_symbol=None, target_address=None),
     ]
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
@@ -3410,7 +3529,7 @@ def test_external_location_list_formats_entries(monkeypatch):
     }
     assert entries[1]["library"] == "libc.so.6"
     assert entries[1]["symbol"] == "malloc"
-    assert entries[1]["target_address"] == "0x500000"
+    assert entries[1]["target_address"] == "0x0"
 
 
 def test_xref_type_refs_reports_referring_types(monkeypatch):
@@ -3443,12 +3562,13 @@ def test_uidf_from_address_collects_definition_sites(monkeypatch):
     bv = _FakeBV(functions=[fn])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    result = instance._uidf_from_address("active", "0x401000")
+    result = instance._uidf_from_address("active", "va:0x401000")
 
     assert result["function"] == "sub_401000"
     assert result["function_start"] == "0x401000"
     definitions = result["variables"][0]["definitions"]
     assert [entry["address"] for entry in definitions] == ["0x401000", "0x401010"]
+    assert [entry["at_address"] for entry in definitions] == [True, False]
     assert definitions[1]["value"] == "constant 0x10"
 
 

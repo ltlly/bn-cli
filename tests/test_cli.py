@@ -239,14 +239,13 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
 
 
-def test_function_commands_do_not_accept_paging_flags():
+def test_function_commands_accept_opt_in_paging_and_default_to_all():
     parser = bn.cli.build_parser()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["function", "list", "--limit", "10"])
-
-    with pytest.raises(SystemExit):
-        parser.parse_args(["function", "search", "--offset", "10", "attach"])
+    assert parser.parse_args(["function", "list", "--limit", "10"]).limit == 10
+    assert parser.parse_args(["function", "search", "--offset", "10", "attach"]).offset == 10
+    assert parser.parse_args(["function", "list"]).limit == -1
+    assert parser.parse_args(["function", "search", "attach"]).limit == -1
 
 
 def test_callsites_requires_exactly_one_scope_flag():
@@ -1157,7 +1156,7 @@ def test_help_full_prints_recursive_root_help(capsys):
 
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn\n" in stdout
+    assert "usage: bn [--daemon {gui,headless}]" in stdout
     assert "usage: bn struct {show,field} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "-h, --help" not in stdout
@@ -3132,14 +3131,17 @@ def test_value_shorthand_register_uses_address_only(monkeypatch, capsys):
 
 
 def test_value_reg_subcommand_passes_function_and_address(monkeypatch, capsys):
-    calls = _patch_bridge(monkeypatch, {"value_reg": {"value": "0x10"}})
+    calls = _patch_bridge(monkeypatch, {"value_query": {"value": "0x10"}})
 
-    rc = bn.cli.main(["value", "reg", "sub_401000", "0x401004", "rax", "--after"])
+    rc = bn.cli.main(["value", "reg", "sub_401000", "rax", "--address", "rva:0x4", "--after"])
 
     assert rc == 0
+    assert calls[-1]["op"] == "value_query"
     assert calls[-1]["params"] == {
-        "address": "0x401004",
+        "address": "rva:0x4",
         "function_start": "sub_401000",
+        "instruction_index": None,
+        "kind": "reg",
         "register": "rax",
         "after": True,
     }
@@ -3188,3 +3190,36 @@ def test_patch_assemble_subcommand_uses_positional_assembly(monkeypatch, capsys)
     assert rc == 0
     assert calls[-1]["op"] == "patch_assemble"
     assert calls[-1]["params"] == {"address": "0x401000", "asm": "nop"}
+
+@pytest.mark.parametrize(
+    ("group", "arguments"),
+    [
+        ("patch", ["nop", "rva:0x20"]),
+        ("search", ["bytes", "90"]),
+        ("value", ["reg", "entry", "0", "rax"]),
+    ],
+)
+def test_common_options_before_and_after_subcommand_match(group, arguments, tmp_path):
+    parser = bn.cli.build_parser()
+    options = [
+        "--target", "second.bndb", "--format", "ndjson", "--out", str(tmp_path / "result"),
+        "--with-context", "--async", "--wait-timeout", "17",
+    ]
+    assert parser.parse_args([group, *options, *arguments]) == parser.parse_args(
+        [group, *arguments, *options]
+    )
+
+
+def test_patch_uses_explicit_target_before_subcommand(monkeypatch):
+    calls = _patch_bridge(monkeypatch, {"patch_nop": {"patched": True}})
+    assert bn.cli.main(["patch", "--target", "second.bndb", "nop", "rva:0x20"]) == 0
+    assert calls == [{
+        "op": "patch_nop", "target": "second.bndb",
+        "params": {"address": "rva:0x20", "length": None},
+    }]
+
+
+def test_search_constant_shorthand(monkeypatch):
+    calls = _patch_bridge(monkeypatch, {"search_constant": []})
+    assert bn.cli.main(["search", "--constant", "0x42"]) == 0
+    assert calls[-1]["params"] == {"constant": "0x42", "start": None, "end": None, "limit": 100}

@@ -57,6 +57,55 @@ Tests do **not** require Binary Ninja. `tests/test_bridge.py` constructs a fake 
 
 ## Architecture
 
+### Headless address contract (0.16)
+
+`plugin/bn_agent_bridge/addressing.py` owns address semantics and imports no BN module.
+Use `self._address(bv, value)` for addresses in the current BinaryView. Keep
+`_parse_address` for scalar offsets/constants or addresses belonging to another
+external library; those are not target coordinates. Bare decimal/0x inputs remain
+BN VA. Typed forms are `va:`, `rva:`, `file:`, `map:NAME:`, and explicit native
+`expr:`. Never guess an external base or treat IL indices as addresses.
+
+RVA origin is `BinaryView.image_base`, with no fallback to `start` or the deprecated
+`original_base`. File offsets use complete segment candidates plus BN's mapping API;
+the API's first match alone cannot establish uniqueness. BSS has no file offset.
+Raw views use raw backing-data offsets. Container/slice offset domains must be stated
+explicitly. Address ranges are half-open; range ends use `endpoint=True`.
+
+External maps are per concrete target id, kept only in the bridge session, and
+removed when the target closes. A map records a source/session label and exact
+nonoverlapping regions in both coordinate spaces. Module slides require observed
+size bounds. Frida imports require an explicit anchor when `image_base != start`.
+The layout fingerprint detects BN base/segment changes, not binary/process identity;
+external remaps and restarts require re-registration. Native `loader_rebase` registers the returned replacement BinaryView, preserves explicit active selection, and removes the old target/maps; it must not close the shared FileMetadata. `address verify` compares
+externally observed bytes without claiming program equivalence.
+
+Job records retain target/address context. Default CLI result shapes are unchanged;
+context is printed on stderr and `--with-context` opts into an exportable envelope.
+`inspect`, `address context/resolve/verify`, target info and function bundles expose
+context directly. `--daemon MODE` and `transport.request_session` pin one lazily
+selected connection for all requests of an invocation, without changing sticky state.
+
+`value_query` uses native LLIL instruction value/possible-value/flag/stack APIs.
+Results preserve both the requested machine address and mapped LLIL address/index. The positional index is explicitly LLIL; the alternative `--address` is a machine
+address, and they are mutually exclusive. Do not approximate flags using token text.
+
+`bn schema` derives help from the actual argparse tree. Update bundled Skill and both
+READMEs when command semantics change. `src/bn/artifacts.py` (symlinked into the
+bridge) handles atomic artifact writes and local result inspection. Preserve all
+shared symlinks. Bridge build ids include helper modules so doctor detects stale
+helper code, too.
+
+Optional real integration gate (isolated cache, scratch edits, no saved input):
+
+```bash
+PYTHONPATH=/path/to/binaryninja/python BN_DISABLE_USER_PLUGINS=1 \
+  uv run python tools/smoke_headless.py --sample /bin/true
+# Linux: also spawns/cleans up its own /bin/sleep under Frida and uses Unicorn memory.
+PYTHONPATH=/path/to/binaryninja/python BN_DISABLE_USER_PLUGINS=1 \
+  uv run --with unicorn --with frida python tools/smoke_headless.py --external
+```
+
 ### Wire path
 
 1. A bridge is running: GUI auto-starts when Binary Ninja loads the plugin; headless is started by `bn daemon start`.
@@ -70,11 +119,14 @@ When adding a new operation: add the dispatch branch in `_execute_operation`, ad
 
 ### Background jobs and thread model
 
-The CLI submits target-scoped bridge operations through `job_submit`. It waits up to 30 seconds by default, then returns exit code 124 plus a job id while the operation continues. `--async` returns immediately and `--danger-always-wait` preserves unlimited waiting. Job control is available through `bn job list/status/result/cancel` and the lock-free `job_*` wire operations.
+The CLI submits target-scoped bridge operations through `job_submit`. It waits up to 30 seconds by default, then returns exit code 124 plus a job id while the operation continues. `--async` returns immediately and `--danger-always-wait` preserves unlimited waiting. Job control is available through `bn job list/status/result/cancel/wait/watch` and the lock-free `job_*` wire operations. New bridges advertise bounded `job_wait`; old bridges retain polling compatibility.
 
 Only Binary Ninja **UI** APIs belong on the UI main thread: `_collect_open_views`, dialogs/settings, and arbitrary third-party `PluginCommand` callbacks use `_run_on_main_thread`. Core `BinaryView`, function, IL, type, analysis, and database work runs on ordinary Python background threads. In particular, Binary Ninja documents that `update_analysis_and_wait()` must not run on the UI thread or a Binary Ninja worker-queue thread.
 
-Cancellation is cooperative. Long loops must call `_check_job_cancelled()` and may update `_set_job_progress(...)`; analysis-backed jobs use `abort_analysis()`. Never kill a Python thread. `py_exec` and third-party plugin commands are explicitly not safely cancellable.
+Cancellation is cooperative. Long loops must call `_check_job_cancelled()` and may update `_set_job_progress(...)`; analysis-backed jobs use `abort_analysis()`. Never kill a Python thread. `py_exec`, third-party plugin commands, and native `loader_rebase` are explicitly not safely cancellable.
+
+Check cancellation before a write commits. Once an operation returns successfully,
+the job manager must preserve its outcome even if a late cancellation arrives.
 
 ### Daemon mode selection
 
@@ -99,7 +151,7 @@ Don't add commands that silently default to a fixed selector. Always plumb selec
 
 ### Mutations and verification
 
-`bridge.py:_mutation` is the single funnel for every write op (`rename_symbol`, `set_prototype`, `local_rename`, `struct_field_*`, `types_declare`, `batch_apply`, …). It always:
+`bridge.py:_mutation` is the verified metadata-edit funnel (`rename_symbol`, `set_prototype`, `local_rename`, `struct_field_*`, `types_declare`, `batch_apply`, …). It always:
 
 1. Snapshots affected functions and types.
 2. Opens an undo group with `bv.begin_undo_actions()`.
@@ -107,9 +159,9 @@ Don't add commands that silently default to a fixed selector. Always plumb selec
 4. `update_analysis_and_wait()`, then re-snapshots and runs per-op `_verify_*` to compare requested vs observed state.
 5. If `--preview`, OR any op failed verification, it `revert_undo_actions`. Otherwise `commit_undo_actions`.
 
-So every mutation lane has four possible result statuses — `verified`, `previewed`, `noop`, `unsupported`, `verification_failed`. The CLI maps the failing two (`FAILED_MUTATION_STATUSES` in `cli.py`) to exit code 3 via `_mutation_exit_code`. If you add a new mutation op, the verifier is required, not optional — without one the post-state check will fall through and the verb will silently report `verified` when it didn't actually land.
+This metadata lane has five possible result statuses — `verified`, `previewed`, `noop`, `unsupported`, `verification_failed`. The CLI maps the failing two (`FAILED_MUTATION_STATUSES` in `cli.py`) to exit code 3 via `_mutation_exit_code`. If you add a new mutation op, the verifier is required, not optional — without one the post-state check will fall through and the verb will silently report `verified` when it didn't actually land.
 
-`bn workflow override set/clear` is the exception: WorkflowMachine state is *not* in BN's undo system, so `_workflow_override_apply` implements its own snapshot+restore preview lane that still produces the same `status` vocabulary.
+`_write_bytes` separately verifies exact byte counts/readback in an undo group for assemble/NOP/memory write/writer; it is not a metadata or whole-program verifier. Other low-level API wrappers and arbitrary Python do not inherit `_mutation` guarantees. `bn workflow override set/clear` is another separate lane: WorkflowMachine state is *not* in BN's undo system, so `_workflow_override_apply` implements its own snapshot+restore preview lane that still produces the same `status` vocabulary.
 
 ### Output and spilling
 
@@ -141,7 +193,7 @@ Token counting must work with no network and no working `tiktoken` install: `out
 - **Argparse style:** `BnArgumentParser` (in `cli.py`) is a thin subclass that adds `--help-full` (recursively dumps every subparser). New subcommands should use it via `subparsers.add_parser(...)`, get a handler attached via `set_defaults(handler=_my_handler)`, and call `_common_io_options(parser)` to inherit `--format` / `--out`. Use `_target_option(parser, required=False)` for target-scoped verbs.
 - **README + `skills/bn/SKILL.md` are the agent-facing contract:** every verb and flag they document must work. When the documented spelling differs from the preferred implementation (`il-nav get-index-for-addr` vs `addr-to-index`, `section-user create` vs `add`, `plugin-cmd run` vs `execute`), register the documented name with `add_parser(..., aliases=[...])` — `--help-full` dedupes aliased parsers. Group-level shorthands (`_search_shorthand`, `_patch_shorthand`, `_value_shorthand`) cover documented flag forms such as `bn value --address 0x401000 --reg rax`. After changing the command surface, re-check both docs by running every `bn ...` snippet they contain.
 - **Text renderers are optional:** the JSON shape is the source of truth; text output is a render of the JSON via `text_renderer=` passed into `_call`. If the renderer isn't provided, `_render_fallback_text` pretty-prints JSON.
-- **Address parsing:** use `_parse_address` (bridge side) — it accepts both `0x...` strings and ints. Don't reinvent.
+- **Address parsing:** use `self._address(bv, value)` for current-view addresses; see the headless address contract above. Scalar offsets/constants remain separate.
 - **Read vs write scheduling:** new target op names *must* be added to `READ_LOCKED_OPS` or `WRITE_LOCKED_OPS`. Read/read jobs may overlap; any conflict involving a write returns `TargetBusyError` with blocker job metadata.
 - **Main thread:** use `_run_on_main_thread(...)` only for `binaryninjaui`, dialogs/settings, or third-party plugin callbacks that may touch UI state. Normal `BinaryView` work must stay on the bridge/job background thread so the GUI remains responsive.
 

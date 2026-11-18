@@ -9,9 +9,11 @@ import socketserver
 import threading
 import uuid
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
+from bn import transport
 from bn.paths import (
     bridge_pipe_name,
     bridge_registry_path,
@@ -144,6 +146,55 @@ def test_list_instances_reads_pipe_registry(monkeypatch, tmp_path):
     assert instances[0].auth_token == "secret"
 
 
+@pytest.mark.parametrize("winerror, retained", [(121, True), (231, True), (5, True), (2, False)])
+def test_pipe_discovery_only_removes_missing_endpoints(monkeypatch, tmp_path, winerror, retained):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    path = bridge_registry_path("gui")
+    path.parent.mkdir()
+    path.write_text(json.dumps({
+        "pid": 123, "transport": "pipe", "pipe_name": bridge_pipe_name("gui"), "auth_token": "test",
+    }))
+    error = OSError("probe failed")
+    error.winerror = winerror
+    monkeypatch.setattr(transport, "_wait_named_pipe", Mock(side_effect=error))
+
+    assert bool(list_instances()) is retained
+    assert path.exists() is retained
+
+
+def test_pipe_connect_uses_one_bounded_wait(monkeypatch):
+    api = Mock(GENERIC_READ=1, GENERIC_WRITE=2, FILE_FLAG_OVERLAPPED=0x40000000)
+    monkeypatch.setattr(transport, "_winapi", api)
+    monkeypatch.setattr(transport, "_pipe_server_pid", lambda _handle: 123)
+    connection = Mock()
+    monkeypatch.setattr(multiprocessing.connection, "PipeConnection", connection, raising=False)
+    pipe_name = bridge_pipe_name("gui")
+
+    with pytest.raises(TimeoutError):
+        transport._pipe_connect(pipe_name, 0, 123)
+    api.WaitNamedPipe.assert_not_called()
+    assert transport._pipe_connect(pipe_name, 0.0001, 123) is connection.return_value
+    api.WaitNamedPipe.assert_called_once_with(pipe_name, 1)
+    api.CreateFile.assert_called_once()
+    assert api.CreateFile.call_args.args[5] == (api.FILE_FLAG_OVERLAPPED | 0x00100000)
+    connection.assert_called_once_with(api.CreateFile.return_value)
+
+
+def test_registry_pid_mismatch_closes_pipe_before_sending_credentials(monkeypatch, tmp_path):
+    api = Mock(GENERIC_READ=1, GENERIC_WRITE=2, FILE_FLAG_OVERLAPPED=0x40000000)
+    monkeypatch.setattr(transport, "_winapi", api)
+    monkeypatch.setattr(transport, "_pipe_server_pid", lambda _handle: 555)
+    send = Mock()
+    monkeypatch.setattr(transport, "_send_pipe_bytes", send)
+
+    with pytest.raises(BridgeError, match="server PID does not match"):
+        _send_request_to_instance(_pipe_instance(tmp_path), "doctor", timeout=1)
+
+    send.assert_not_called()
+    api.CreateFile.assert_called_once()
+    api.CloseHandle.assert_called_once_with(api.CreateFile.return_value)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Named Pipes are unavailable")
 def test_send_request_over_real_windows_named_pipe(tmp_path):
     pipe_name = rf"\\.\pipe\bn-agent-bridge-test-{os.getpid()}-{uuid.uuid4().hex}"
@@ -162,6 +213,7 @@ def test_send_request_over_real_windows_named_pipe(tmp_path):
                         "result": {
                             "op": payload["op"],
                             "auth": payload["auth"],
+                            "text": payload["params"]["text"],
                         },
                     }
                 ).encode("utf-8")
@@ -185,9 +237,11 @@ def test_send_request_over_real_windows_named_pipe(tmp_path):
         auth_token="test-token",
     )
 
-    response = _send_request_to_instance(instance, "doctor", timeout=2.0)
+    # Exercise a message larger than the OS pipe buffer in both directions.
+    text = "instruction listing\n" * 8000
+    response = _send_request_to_instance(instance, "doctor", params={"text": text}, timeout=2.0)
 
-    assert response["result"] == {"op": "doctor", "auth": "test-token"}
+    assert response["result"] == {"op": "doctor", "auth": "test-token", "text": text}
     thread.join(timeout=2)
     assert not thread.is_alive()
 
@@ -220,7 +274,7 @@ def test_pipe_request_retries_busy_endpoint(monkeypatch, tmp_path):
 
     attempts = []
 
-    def connect(_pipe_name, _timeout):
+    def connect(_pipe_name, _timeout, _expected_pid):
         attempts.append(True)
         if len(attempts) == 1:
             error = OSError(231, "All pipe instances are busy")
@@ -237,23 +291,50 @@ def test_pipe_request_retries_busy_endpoint(monkeypatch, tmp_path):
     assert response["result"]["auth"] == "secret"
 
 
+def test_pipe_connect_retry_stops_at_deadline(monkeypatch, tmp_path):
+    now = [0.0]
+    monkeypatch.setattr(transport.time, "monotonic", lambda: now[0])
+    def advance(delay):
+        now[0] += delay
+    monkeypatch.setattr(transport.time, "sleep", advance)
+    busy = OSError("pipe busy")
+    busy.winerror = 231
+    connect = Mock(side_effect=busy)
+    monkeypatch.setattr(transport, "_pipe_connect", connect)
+
+    with pytest.raises(BridgeError, match="Timed out"):
+        _send_request_to_instance(_pipe_instance(tmp_path), "doctor", timeout=0.01)
+    connect.assert_called_once()
+    assert now[0] == 0.01
+
+
+def test_pipe_request_cancels_stalled_write_without_retry(monkeypatch, tmp_path):
+    connection = Mock()
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr(transport, "_pipe_connect", connect)
+    write = Mock()
+    api = Mock(ERROR_IO_PENDING=997, WAIT_TIMEOUT=258)
+    api.WriteFile.return_value = (write, api.ERROR_IO_PENDING)
+    api.WaitForSingleObject.return_value = api.WAIT_TIMEOUT
+    monkeypatch.setattr(transport, "_winapi", api)
+
+    with pytest.raises(BridgeError, match="Timed out"):
+        _send_request_to_instance(_pipe_instance(tmp_path), "doctor", timeout=1)
+    write.cancel.assert_called_once_with()
+    write.GetOverlappedResult.assert_called_once_with(True)
+    connection.close.assert_called_once_with()
+    connect.assert_called_once()
+
+
 def test_pipe_request_reports_response_timeout(monkeypatch, tmp_path):
-    class _Connection:
-        def send_bytes(self, _payload):
-            pass
-
-        def poll(self, _timeout):
-            return False
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(
-        "bn.transport._pipe_connect", lambda _pipe_name, _timeout: _Connection()
-    )
+    connection = Mock()
+    connection.poll.return_value = False
+    monkeypatch.setattr(transport, "_pipe_connect", Mock(return_value=connection))
+    monkeypatch.setattr(transport, "_send_pipe_bytes", Mock())
 
     with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999"):
         _send_request_to_instance(_pipe_instance(tmp_path), "doctor", timeout=0.01)
+    connection.recv_bytes.assert_not_called()
 
 
 def test_pipe_request_wraps_early_eof(monkeypatch, tmp_path):
@@ -268,7 +349,7 @@ def test_pipe_request_wraps_early_eof(monkeypatch, tmp_path):
             pass
 
     monkeypatch.setattr(
-        "bn.transport._pipe_connect", lambda _pipe_name, _timeout: _Connection()
+        "bn.transport._pipe_connect", lambda _pipe_name, _timeout, _expected_pid: _Connection()
     )
 
     with pytest.raises(BridgeError, match="Failed to contact Binary Ninja bridge pid 999"):

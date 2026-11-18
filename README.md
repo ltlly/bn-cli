@@ -2,7 +2,7 @@
 
 English | [中文](README_CN.md)
 
-`bn` is a coding agent-first CLI for Binary Ninja. It gives a shell session or tool-calling agent stable commands, structured output, and access to the same live Binary Ninja database you already have open in the GUI — or running headlessly in a daemon.
+`bn` is an agent-first CLI for Binary Ninja with a persistent headless daemon, explicit address coordinates, structured queries, and verified metadata edits. A GUI bridge remains available; the workflows below work without opening the GUI.
 
 ## Headline Features
 
@@ -10,7 +10,110 @@ English | [中文](README_CN.md)
 - Execute Python inside the Binary Ninja process instead of maintaining a separate headless workflow.
 - Apply mutations with `--preview`, capture decompile diffs, and verify the live post-state before reporting success.
 - Emit structured `json` or `ndjson` output, auto-spill large results to files, and return token counts so agents can budget context intelligently.
-- Full Binary Ninja API coverage: 60+ commands spanning analysis, annotation, database, debugging info, IL navigation, type extensions, metadata, undo/redo, loader, external libraries, plugin commands, and more.
+- Commands spanning analysis, annotation, database, debugging info, IL navigation, type extensions, metadata, undo/redo, loader, external libraries, and plugins. `bn schema <command...>` describes the actual installed command grammar offline.
+
+## Headless address workflows (0.16)
+
+Addresses are coordinates in a particular view or process, not interchangeable integers. Every target job carries its concrete target and address context. The CLI prints a compact context line on stderr; use `--with-context --format json` to include that context in the result or an exported file while preserving the default output shape for existing scripts. This context also remains available through `job status`, `job result --with-context`, and `job wait --with-context`.
+
+| Input | Meaning |
+|---|---|
+| `0x401010`, `4198416`, `va:0x401010` | BN virtual address; bare decimal retains the existing CLI convention |
+| `rva:0x1010` | Offset from **`BinaryView.image_base`**, not `view.start` or the original preferred base |
+| `file:0x210` | BN backing-data offset translated through segment/API mappings; never `base + offset` |
+| `map:frida-123:0x7100001010` | External address in the registered, target-scoped `frida-123` map |
+| `expr:main+0x10` | Explicit native `BinaryView.parse_expression` syntax; quote shell metacharacters |
+
+Native expression numbers use BN's conventions (including hexadecimal by default); ordinary CLI numbers remain decimal unless prefixed by `0x`. Integer widths, stack offsets, IL indices, and addresses in another external library are separate numeric domains. Pointer tags/PAC and Thumb bits are never silently removed.
+
+```bash
+bn --daemon headless target load /path/to/libexample.so
+bn --daemon headless address context
+bn --daemon headless address resolve rva:0x1010 file:0x210
+bn --daemon headless inspect rva:0x1010
+```
+
+`--daemon headless` is a per-invocation choice; it does not change the shared sticky selection. The selected connection is pinned across discovery, job submission, waiting, and result retrieval. For parallel clients, also pass a concrete `--target` returned by `target load/list`. Active selection is CLI-managed by `target use`, independent of GUI focus and load order.
+
+### Frida module snapshots
+
+Capture the actual module in your existing Frida session (this code does not attach to anything):
+
+```javascript
+const m = Process.getModuleByName('libexample.so');
+console.log(JSON.stringify({name: m.name, path: m.path, base: m.base.toString(), size: m.size}));
+```
+
+Save that JSON as `module.json`, then:
+
+```bash
+bn address map import frida-123 module.json --kind frida-module --source pid:123/session:1
+bn inspect map:frida-123:0x7100001010
+bn address verify map:frida-123:0x7100001010 --bytes '554889e5'
+bn decompile map:frida-123:0x7100001010 --with-context --format json
+```
+
+The sample addresses/bytes above must be replaced with actual observations. A Frida import maps its `base` to BN's current `image_base` and bounds the mapping by the observed `size`. If BN's image base and lowest mapped address differ, import requires an explicit `--bn-base` identifying the BN address corresponding to Frida's `Module.base`. For an explicitly chosen anchor, `address map add NAME --base EXTERNAL --size SIZE --bn-base va:BN_ADDRESS --source SESSION` provides the same bounded slide. Sparse holes remain unmapped; BN synthetic regions outside the supplied module span are excluded.
+
+### Unicorn and piecewise layouts
+
+For independently placed memory regions, write exact pairs instead of supplying one global base. For example, `unicorn-map.json`:
+
+```json
+{"regions": [
+  {"bn_start": "0x401000", "external_start": "0x10000", "length": "0x100"},
+  {"bn_start": "0x408000", "external_start": "0x90000000", "length": "0x1000"}
+]}
+```
+
+```bash
+bn address map import uc-run1 unicorn-map.json --source unicorn:run1
+bn memory read map:uc-run1:0x10010 --length 16 --with-context --format json
+bn address resolve map:uc-run1:0x10010
+bn address map export uc-run1 --out /tmp/uc-run1.json
+bn address map list
+bn address map remove uc-run1
+```
+
+Map registration checks bounds, mapped BN spans, and overlapping coordinates in both directions. It does not rebase BN or change bytes. Maps are session-scoped and target-isolated; duplicate names require explicit removal. A changed BN base/segment layout invalidates the map. Re-register after an external process restart or emulator remap: bn-cli cannot detect those external events. Exported maps carry a layout fingerprint, which validates layout only, not binary identity.
+
+Mappings are **user-declared**, not proof of matching processes/builds. `address verify` compares observed external bytes with BN bytes and returns exit 3 on mismatch; runtime relocations, patches, or a different build may also explain a mismatch. BSS can have no file offset (`null`). Multiple VA mappings of one file offset are rejected rather than choosing the first; container/slice views may use offsets relative to their backing data rather than the outer file. Raw views use raw byte offsets.
+
+### Continuous queries, tasks, and result reuse
+
+```bash
+bn inspect main                             # coordinates, bytes, containing functions, xrefs, decompile
+bn value reg main 0 rax                     # LLIL index 0, before the instruction
+bn value reg main rax --address rva:0x1010 --after
+bn value possible main 0 rax                # native LLIL possible-register-values query
+bn job watch JOB_ID                         # changed progress on stderr; original result on stdout
+bn job wait JOB_ID --with-context --out /tmp/job.json
+bn result list
+bn result show /tmp/job.json --key result --limit 20
+bn result show /tmp/functions.json --offset 20 --limit 20 --fields address,name
+bn result diff /tmp/before.json /tmp/after.json
+bn schema address map import
+```
+
+IL indices are explicitly distinct from machine addresses; `--address` is mutually exclusive with the positional LLIL index. `value reg/stack/possible/flags` use native instruction APIs, and `--after` selects the post-instruction query. Results distinguish the requested machine `address`, mapped `llil_address`, and `instruction_index`, since native source mappings may not preserve identical addresses. `memory reader --width {1,2,4,8}` reads an integer; `memory read --length N` reads bytes. `search text --il-type` selects the native graph type for literal searches; `--regex` matches individual instruction text in that representation. Exact byte searches do not accept wildcard bytes.
+
+Jobs use bounded server waits on new bridges, with compatibility polling for older bridges. Wait timeout and Ctrl+C stop waiting without cancelling work. A completed write keeps its result even if cancellation arrives after completion. Automatic spill files use unique names and atomic writes. `result show` pages NDJSON/text without loading the entire file; JSON selection and structural/text diffs load their input, and do not claim program equivalence. NDJSON output formatting itself is not server streaming.
+
+`patch assemble` now uses the architecture at the instruction and `Architecture.assemble`; writes check the complete byte count and read back bytes within an undo group. `patch nop --length N` covers an exact instruction-aligned range; omitting length affects one instruction. Metadata transactions roll back unexpected application errors, and Workflow preview success requires verified restoration. These checks cover the requested edit, not whole-program equivalence, and do not make arbitrary `py exec` code transactional.
+
+### BN 6.x API review and validation
+
+Reviewed the [BN 6.0 release](https://binary.ninja/2026/09/03/binary-ninja-6.0-krypton.html), [current BinaryView API](https://dev-api.binary.ninja/binaryninja.binaryview-module.html), [Frida JavaScript API](https://frida.re/docs/javascript-api/), and [Unicorn tutorial](https://www.unicorn-engine.org/docs/tutorial.html). BN 6.0 includes MCP, changes to calling conventions/structure values, and bundled Python 3.13. Compatibility follows installed API capabilities rather than assuming all 6.x builds match; `doctor` reports the actual BN version and selected capabilities. `image_base` and `original_image_base` have different meanings; the deprecated `original_base` alias is not used. Headless load uses `bn.load(..., update_analysis=False)` followed by explicit analysis on an ordinary thread; `rebase()` creates a new BinaryView and is not an address-conversion shortcut. `bn loader rebase` is headless-only and not cancellable: it analyzes/registers the returned view, returns a replacement target id, and discards old external maps. Subsequent commands must use that new target.
+
+The automated suite passes **294 tests**. Real smoke coverage on BN **6.1.10530-dev** includes the actual socket/CLI, nonzero BN load base, scratch byte edits, and independent coordinates in **Unicorn 2.1.4** and **Frida 17.17.0** (a spawned local `/bin/sleep` under ASLR). These tests do not imply compatibility with every loader, architecture, or BN release. Reproduce without opening a GUI:
+
+```bash
+uv run pytest
+PYTHONPATH=/path/to/binaryninja/python BN_DISABLE_USER_PLUGINS=1 \
+  uv run python tools/smoke_headless.py --sample /bin/true
+PYTHONPATH=/path/to/binaryninja/python BN_DISABLE_USER_PLUGINS=1 \
+  uv run --with unicorn --with frida python tools/smoke_headless.py --external
+```
 
 ## Install
 
@@ -88,7 +191,7 @@ bn target close
 bn daemon stop
 ```
 
-If exactly one BinaryView is loaded, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or rely on the implicit fallback to the "active" target — the GUI-focused tab in GUI mode, or the most recently loaded BV in headless mode.
+If exactly one BinaryView is loaded, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or rely on the implicit fallback to the "active" target — the explicit selection made with `bn target use`.
 
 ## Command Reference
 
@@ -128,7 +231,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 | `bn data-vars` | List data variables |
 | `bn data-typed-at` | Get typed data variable at address |
 | `bn binary-bbs-at` | Get basic blocks at address (binary-wide) |
-| `bn il-nav` | IL navigation (get-index-for-addr, get-addr-for-index) |
+| `bn il-nav` | IL navigation (addr-to-index, index-to-addr) |
 | `bn proto get` | Inspect a function prototype |
 | `bn local list` | List locals and parameters of a function |
 | `bn comment get` | Get comment at address |
@@ -188,7 +291,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 | `bn metadata store` | Store metadata key-value |
 | `bn metadata query` | Query metadata by key |
 | `bn metadata remove` | Remove metadata by key |
-| `bn metadata keys` | List all metadata keys |
+| `bn schema metadata` | List all metadata keys |
 
 ### Advanced Operations
 
@@ -226,7 +329,7 @@ Targets can be selected with:
 - the BinaryView basename
 - the full filename
 - the view id
-- `active` — the GUI-focused tab in GUI mode, or the most recently loaded target in headless mode
+- `active` — the explicit CLI-managed selection, or the sole loaded target
 
 In normal use, prefer the `selector` field. For a single open database, this is usually just the `.bndb` basename:
 
@@ -234,7 +337,7 @@ In normal use, prefer the `selector` field. For a single open database, this is 
 bn decompile update_player_movement_flags --target SnailMail_unwrapped.exe.bndb
 ```
 
-Omitting `--target` works when exactly one target is open, or when exactly one target reports `active: true` (one focused GUI tab, or one most-recently-loaded headless target). With multiple targets and no clear "active" pick, the CLI rejects the command.
+Omitting `--target` works when exactly one target is open, or when exactly one target reports `active: true` (the explicit selection made with `bn target use`). With multiple targets and no clear "active" pick, the CLI rejects the command.
 
 ## Daemon Mode Selection
 
@@ -332,7 +435,7 @@ If `--out` is set, the command writes the rendered result to that path and print
 
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
-`bn function list` and `bn function search` return the full matching set for the selected target or address range. Large results auto-spill to an artifact instead of forcing manual pagination. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout stays empty and stderr carries the spill metadata as plain text, including the artifact path and size counts.
+`bn function list` and `bn function search` support `--offset` and `--limit` (default `--limit -1` returns all for compatibility) for the selected target or address range. Large results auto-spill to an artifact. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout stays empty and stderr carries the spill metadata as plain text, including the artifact path and size counts.
 
 Token counting works fully offline: the `o200k_base` BPE table ships inside the package (`bn/_data/o200k_base.tiktoken`, pinned by sha256), so no first-run download is needed. If that table is ever missing, `bn` tries tiktoken's own cache (`$BN_CACHE_DIR/tiktoken`) and finally falls back to a byte-based estimate, so commands never fail because of the tokenizer. `bn doctor` reports which source is active. Payloads smaller than the spill threshold skip tokenization entirely, which keeps short commands fast.
 
@@ -371,8 +474,8 @@ bn imports
 
 bn xref-ext code-refs-to 0x401000
 bn xref-ext data-refs-from 0x401000
-bn annotation get-tags --function sub_401000
-bn metadata keys
+bn annotation get-tags 0x401000
+bn schema metadata
 bn analysis status
 bn database info
 ```
@@ -552,7 +655,7 @@ prefix_rule(pattern=["bn"], decision="allow")
 Restart Codex or reload rules after editing the file. This is only needed for Codex
 sandboxed runs; normal shells can use `bn` without that rule.
 
-If multiple targets are open, omitted `--target` is rejected. Pass `--target <selector>` from `bn target list`, or use `--target active` only when you intentionally want the GUI-selected target.
+If multiple targets are open, select one with `bn target use` or pass a concrete `--target <selector>` from `bn target list`. Parallel clients should prefer explicit targets.
 
 If decompile text still looks stale after a type change, run:
 
