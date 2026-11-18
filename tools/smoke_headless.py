@@ -77,6 +77,11 @@ def main():
         try:
             target = cli("target", "load", args.sample, "--format", "json")
             selector = target["target_id"]
+            rows = cli("query", "functions", "--fields", "address,name", "--sort=-address",
+                       "--filter", "address>=0", "--limit", "2", "--target", selector)
+            assert rows and set(rows[0]) == {"address", "name"}
+            assert cli("query", "functions", "--count", "--target", selector)["count"] >= len(rows)
+            report["checks"].append("targeted function query and count")
             context = cli("address", "context", "--target", selector)
             entry = int(target["entry_point"], 16)
             rva = entry - int(context["image_base"], 16)

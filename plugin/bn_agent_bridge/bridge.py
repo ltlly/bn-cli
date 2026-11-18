@@ -38,6 +38,7 @@ from .paths import (
     bridge_transport,
 )
 from .version import VERSION, bridge_build_id
+from .query import query_rows
 from .addressing import AddressResolver, AddressError
 from .artifacts import atomic_write
 
@@ -212,6 +213,7 @@ READ_LOCKED_OPS = {
     "function_info",
     "get_prototype",
     "address_context", "address_resolve", "address_verify", "address_map_list", "address_map_export", "inspect", "value_query",
+    "query",
     "list_functions",
     "list_locals",
     "search_functions",
@@ -1656,6 +1658,17 @@ class BinaryNinjaBridge:
         if op == "refresh":
             return self._refresh(target)
 
+        if op == "query":
+            dataset = params["dataset"]
+            if dataset == "functions":
+                rows = self._list_functions(target)
+            elif dataset == "strings":
+                rows = self._strings(target, query=None)
+            elif dataset == "imports":
+                rows = self._imports(target)
+            else:
+                raise ValueError(f"Unknown query dataset: {dataset!r}")
+            return query_rows(rows, **params)
         if op == "list_functions":
             return self._list_functions(
                 target,
