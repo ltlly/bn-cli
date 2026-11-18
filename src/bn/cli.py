@@ -3966,6 +3966,11 @@ def _inspect(args: argparse.Namespace) -> int:
                  allow_implicit_target=True, stem="inspect")
 
 
+def _query(args: argparse.Namespace) -> int:
+    params = {key: getattr(args, key) for key in ("dataset", "filters", "fields", "sort", "offset", "limit", "count")}
+    return _call(args, "query", params, require_target=True, allow_implicit_target=True, stem="query")
+
+
 def _schema(args: argparse.Namespace) -> int:
     result = command_schema(build_parser(), args.path)
     _render_result(result, fmt=args.format, out_path=args.out, stem="command-schema")
@@ -3993,6 +3998,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(handler=None)
 
     subparsers = parser.add_subparsers(dest="command")
+
+    query = subparsers.add_parser("query", help="Filter, sort, count and select analysis rows")
+    _common_io_options(query, default_format="json")
+    _target_option(query, required=False)
+    query.add_argument("dataset", choices=("functions", "strings", "imports"))
+    query.add_argument("-f", "--filter", dest="filters", action="append", default=[],
+                       help="FIELD OP VALUE; use = != > >= < <= or ~ (contains). Repeat for AND.")
+    query.add_argument("--fields", help="Comma-separated output fields")
+    query.add_argument("--sort", help="Comma-separated fields; use --sort=-field for descending order")
+    query.add_argument("--offset", type=int, default=0)
+    query.add_argument("--limit", type=int, default=1000, help="Maximum rows, 0 for all")
+    query.add_argument("--count", action="store_true", help="Count all matching rows before pagination")
+    query.set_defaults(handler=_query)
 
     schema = subparsers.add_parser("schema", help="Machine-readable command help from the live parser; no daemon required")
     _common_io_options(schema, default_format="json")

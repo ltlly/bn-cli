@@ -4,6 +4,23 @@
 
 `bn` 是一个面向 AI Agent 设计的 Binary Ninja 命令行工具。它为 shell 会话或 Agent 工具调用提供稳定的命令接口、结构化输出，以及对 Binary Ninja 实时数据库的完整访问能力——无论是 GUI 模式还是 headless 守护进程模式。
 
+
+## 筛选、排序和统计
+
+`bn query` 在 bridge 内筛选数据，只返回选定的字段和分页。可查询
+`functions`（address、name、raw_name）、`strings`（address、length、type、value）
+和 `imports`（address、name、library）。重复传入 `--filter` 表示同时满足各条件。
+`~` 表示忽略大小写的包含匹配，支持 `=`、`!=`、`<`、`<=`、`>`、`>=`。
+地址和长度按数值比较，`--sort=-length,address` 按长度降序、地址升序排列。
+
+```sh
+bn query strings --filter 'length>=12' --sort=-length,address --fields address,value --limit 10
+bn query imports --filter 'name~open' --count
+```
+
+每页默认最多 1,000 行，`--offset` 指定跳过的行数，`--limit 0` 返回全部匹配行。
+`--count` 返回分页前的匹配总数。
+
 ## 核心特性
 
 - 从 shell 查询 Binary Ninja 实时状态：目标文件、函数、调用点、反编译文本、IL、反汇编、交叉引用、类型、字符串、导入表等

@@ -10,6 +10,23 @@ Use this skill when the user wants reverse-engineering work driven by the local 
 - **GUI bridge** — connects to a running Binary Ninja GUI; the user opens files in the GUI.
 - **Headless daemon** — long-running process that loads files explicitly via the CLI; used in Docker / container / agent-driver scenarios.
 
+
+## Query analysis rows
+
+`bn query` filters rows inside the bridge before returning a page. Query `functions`
+(`address,name,raw_name`), `strings` (`address,length,type,value`), or `imports`
+(`address,name,library`). Repeated filters are combined with AND. Use `~` for
+case-insensitive containment or `=`, `!=`, `<`, `<=`, `>`, `>=` for comparisons.
+Addresses and lengths compare numerically. Sort on multiple fields with a comma.
+
+```sh
+bn query strings --filter 'length>=12' --sort=-length,address --fields address,value --limit 10
+bn query imports --filter 'name~open' --count
+```
+
+The default page contains up to 1,000 rows. Use `--offset` to page, `--limit 0`
+for all rows, or `--count` for the total matches before pagination.
+
 ## Setup
 
 ```bash

@@ -3043,3 +3043,44 @@ def test_completed_job_history_is_bounded(monkeypatch, tmp_path):
     jobs = instance.jobs.list()
     assert len(jobs) == bridge.COMPLETED_JOBS_LIMIT
     assert jobs[0]["job_id"] == newest["job_id"]
+
+
+def test_query_filters_then_sorts_and_pages_numeric_addresses(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    rows = [{"address": hex(n), "name": label, "raw_name": label}
+            for n, label in [(15, "Common"), (16, "Common"), (1, "Other")]]
+    monkeypatch.setattr(instance, "_list_functions", lambda target: rows)
+    params = dict(dataset="functions", filters=["name~comm", "address>=0xf"],
+                  fields="address", sort="-address,name", offset=1, limit=1)
+    assert instance._execute_operation("query", params, "test") == [{"address": "0xf"}]
+    assert instance._execute_operation("query", {**params, "count": True}, "test") == {"count": 2}
+    with pytest.raises(ValueError, match="Unknown field"):
+        bridge.query_rows([], "strings", sort="nonexistent")
+
+
+@pytest.mark.parametrize("preview", [True, False])
+def test_mutation_reverts_whole_batch_on_unexpected_apply_error(monkeypatch, preview):
+    module = _load_bridge(monkeypatch)
+    bridge = module.BinaryNinjaBridge()
+    view = _FakeFunctionCreationBV()
+    monkeypatch.setattr(bridge, "_resolve_view", lambda _: view)
+    operations = [
+        {"op": "create_function", "address": 0x401000},
+        {"op": "create_function", "address": 0x402000},
+    ]
+    apply = bridge._apply_operation
+
+    def fail_after_second_write(bv, operation):
+        result = apply(bv, operation)
+        if operation == operations[1]:
+            raise RuntimeError("Unexpected SDK error")
+        return result
+
+    monkeypatch.setattr(bridge, "_apply_operation", fail_after_second_write)
+    with pytest.raises(RuntimeError, match="Unexpected SDK error"):
+        bridge._mutation(None, preview, operations)
+
+    assert view.create_calls == [0x401000, 0x402000]
+    assert view.functions == []
+    assert view.events == ["begin", ("revert", "state")]
