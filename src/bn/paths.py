@@ -48,10 +48,30 @@ def cache_home() -> Path:
 
 
 DAEMON_MODES: tuple[str, ...] = ("gui", "headless")
+BRIDGE_TRANSPORTS: tuple[str, ...] = ("auto", "pipe", "tcp", "unix")
 DEFAULT_BRIDGE_TCP_PORTS = {
     "gui": 26765,
     "headless": 26766,
 }
+
+
+def bridge_transport() -> str:
+    configured = os.environ.get("BN_BRIDGE_TRANSPORT", "auto").strip().lower()
+    if configured not in BRIDGE_TRANSPORTS:
+        expected = ", ".join(BRIDGE_TRANSPORTS)
+        raise ValueError(
+            f"BN_BRIDGE_TRANSPORT must be one of {expected}; got {configured!r}"
+        )
+
+    system = platform.system()
+    selected = "pipe" if configured == "auto" and system == "Windows" else configured
+    if selected == "auto":
+        selected = "unix"
+    if selected == "pipe" and system != "Windows":
+        raise ValueError("BN_BRIDGE_TRANSPORT=pipe is only supported on Windows")
+    if selected == "unix" and system == "Windows":
+        raise ValueError("BN_BRIDGE_TRANSPORT=unix is not supported on Windows")
+    return selected
 
 
 def _validate_mode(mode: str) -> str:
@@ -70,6 +90,10 @@ def bridge_registry_path(mode: str) -> Path:
 
 def bridge_socket_path(mode: str) -> Path:
     return cache_home() / f"{PLUGIN_NAME}.{_validate_mode(mode)}.sock"
+
+
+def bridge_pipe_name(mode: str) -> str:
+    return rf"\\.\pipe\bn-agent-bridge-{_validate_mode(mode)}"
 
 
 def bridge_job_root(mode: str) -> Path:
@@ -97,6 +121,12 @@ def current_daemon_mode_path() -> Path:
 
 def api_docs_index_path() -> Path:
     return cache_home() / "api_docs_index.json"
+
+
+def tokenizer_cache_dir() -> Path:
+    # Where tiktoken may cache a BPE table it had to download. The tables that ship with
+    # `bn` live in the package itself, so this only matters for the network fallback.
+    return cache_home() / "tiktoken"
 
 
 def spill_root() -> Path:

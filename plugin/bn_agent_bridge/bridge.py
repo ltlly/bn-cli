@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import json
+import multiprocessing.connection
 import os
 import re
 import secrets
@@ -31,8 +32,10 @@ from .paths import (
     PLUGIN_NAME,
     bridge_registry_path,
     bridge_job_root,
+    bridge_pipe_name,
     bridge_socket_path,
     bridge_tcp_port,
+    bridge_transport,
 )
 from .version import VERSION, bridge_build_id
 from .addressing import AddressResolver, AddressError
@@ -46,7 +49,9 @@ except Exception:  # pragma: no cover - headless raises UIPluginInHeadlessError;
 
 PLUGIN_BUILD_ID = bridge_build_id(Path(__file__).resolve())
 SETTINGS_GROUP = "bnAgentBridge"
+GUI_TRANSPORT_SETTING = f"{SETTINGS_GROUP}.guiTransport"
 GUI_PORT_SETTING = f"{SETTINGS_GROUP}.guiPort"
+GUI_TRANSPORTS = ("pipe", "tcp")
 
 
 def _default_tcp_port(mode: str) -> int:
@@ -64,6 +69,24 @@ def _register_gui_settings() -> None:
     settings = bn.Settings()
     settings.register_group(SETTINGS_GROUP, "BN Agent Bridge")
     settings.register_setting(
+        GUI_TRANSPORT_SETTING,
+        json.dumps(
+            {
+                "title": "GUI Transport",
+                "type": "string",
+                "default": "pipe",
+                "enum": list(GUI_TRANSPORTS),
+                "enumDescriptions": ["Named Pipe", "Loopback TCP"],
+                "description": (
+                    "Local transport used by the GUI bridge on Windows. Explicit "
+                    "BN_BRIDGE_TRANSPORT values override this setting."
+                ),
+                "requiresRestart": True,
+                "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
+            }
+        ),
+    )
+    settings.register_setting(
         GUI_PORT_SETTING,
         json.dumps(
             {
@@ -73,12 +96,36 @@ def _register_gui_settings() -> None:
                 "minValue": 1,
                 "maxValue": 65535,
                 "description": (
-                    "Authenticated loopback TCP port used by the bn CLI. "
+                    "Authenticated loopback TCP port used when GUI Transport is Loopback TCP. "
                     "Run 'BN Agent Bridge > Restart Bridge' after changing it."
                 ),
+                "requiresRestart": True,
+                "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
             }
         ),
     )
+
+
+def _configured_transport(mode: str) -> str:
+    selected = bridge_transport()
+    env_value = os.environ.get("BN_BRIDGE_TRANSPORT", "auto").strip().lower()
+    if (
+        mode != "gui"
+        or selected != "pipe"
+        or env_value != "auto"
+        or ui is None
+        or not hasattr(bn, "Settings")
+    ):
+        return selected
+
+    configured = str(bn.Settings().get_string(GUI_TRANSPORT_SETTING)).strip().lower()
+    if configured in GUI_TRANSPORTS:
+        return configured
+    bn.log_error(
+        f"BN Agent Bridge setting {GUI_TRANSPORT_SETTING} is invalid ({configured!r}); "
+        f"using {selected}"
+    )
+    return selected
 
 
 def _configured_tcp_port(mode: str) -> int:
@@ -234,20 +281,24 @@ READ_LOCKED_OPS = {
     "type_archive_get",
     # --- annotation ---
     "annotation_get_tags",
+    "annotation_list_tag_types",
     # --- uidf ---
     "uidf_list_user_var_values",
     "uidf_parse_possible_value",
+    "uidf_from_address",
     # --- loader ---
     "loader_load_settings_get",
     "loader_load_settings_types",
     # --- external ---
     "external_library_list",
     "external_location_get",
+    "external_location_list",
     # --- analysis ---
     "analysis_status",
     "analysis_progress",
     # --- metadata (view-level) ---
     "metadata_query",
+    "metadata_keys",
     # --- data ---
     "data_typed_at",
     # --- xref extended ---
@@ -255,6 +306,7 @@ READ_LOCKED_OPS = {
     "xref_code_refs_to",
     "xref_data_refs_from",
     "xref_data_refs_to",
+    "xref_type_refs",
     # --- il extended ---
     "il_address_to_index",
     "il_index_to_address",
@@ -332,6 +384,8 @@ WRITE_LOCKED_OPS = {
     "type_archive_push",
     # --- annotation (write) ---
     "annotation_add_tag",
+    "annotation_create_tag_type",
+    "annotation_remove_tag",
     "annotation_define_data_var",
     "annotation_undefine_data_var",
     "annotation_define_symbol",
@@ -448,6 +502,14 @@ def _parse_address(value: Any) -> int:
     if text.lower().startswith("0x"):
         return int(text, 16)
     return int(text, 10)
+
+
+def _value_text(value: Any, limit: int = 200) -> str:
+    """Compact, bounded text for API objects echoed back to the CLI."""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def _artifact_summary(value: Any) -> dict[str, Any]:
@@ -801,6 +863,45 @@ class TargetManager:
         raise RuntimeError(f"Unknown target selector: {selector}{hint}")
 
 
+def _process_bridge_request(bridge, raw: bytes, *, on_authenticated=None) -> tuple[bytes, str | None, str | None, bool]:
+    op = None
+    request_id = None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("request must be a JSON object")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        response = _json_response(ok=False, error="Invalid JSON request")
+    else:
+        op = payload.get("op")
+        request_id = payload.get("id")
+        expected_auth = bridge.auth_token
+        supplied_auth = payload.get("auth")
+        if expected_auth is not None and (
+            not isinstance(supplied_auth, str)
+            or not supplied_auth.isascii()
+            or not hmac.compare_digest(supplied_auth, expected_auth)
+        ):
+            response = _json_response(ok=False, error="Unauthorized bridge request")
+        else:
+            if on_authenticated is not None:
+                on_authenticated()
+            response = bridge.dispatch(payload)
+    encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+    should_shutdown = op == "shutdown" and bool(response.get("ok"))
+    return encoded, op, request_id, should_shutdown
+
+
+def _log_disconnected_client(op: str | None, request_id: str | None) -> None:
+    details = []
+    if op:
+        details.append(f"op={op}")
+    if request_id:
+        details.append(f"id={request_id}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
+
+
 class BridgeHandler(socketserver.StreamRequestHandler):
     def _write_response(
         self,
@@ -816,40 +917,18 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         except OSError as exc:
             if exc.errno not in {errno.EPIPE, errno.ECONNRESET}:
                 raise
-            details = []
-            if op:
-                details.append(f"op={op}")
-            if request_id:
-                details.append(f"id={request_id}")
-            suffix = f" ({', '.join(details)})" if details else ""
-            bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
+            _log_disconnected_client(op, request_id)
             return False
 
     def handle(self):  # pragma: no cover - exercised from CLI
         raw = self.rfile.readline()
         if not raw:
             return
-        op = None
-        request_id = None
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            response = _json_response(ok=False, error="Invalid JSON request")
-        else:
-            op = payload.get("op")
-            request_id = payload.get("id")
-            expected_auth = self.server.bridge.auth_token
-            supplied_auth = payload.get("auth")
-            if expected_auth is not None and (
-                not isinstance(supplied_auth, str)
-                or not hmac.compare_digest(supplied_auth, expected_auth)
-            ):
-                response = _json_response(ok=False, error="Unauthorized bridge request")
-            else:
-                response = self.server.bridge.dispatch(payload)
-        encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+        encoded, op, request_id, should_shutdown = _process_bridge_request(
+            self.server.bridge, raw
+        )
         delivered = self._write_response(encoded, op=op, request_id=request_id)
-        if delivered and op == "shutdown" and response.get("ok"):
+        if delivered and should_shutdown:
             self.server.bridge.request_shutdown()
 
 
@@ -874,6 +953,115 @@ class ThreadedTcpServer(_ThreadedServerMixin, socketserver.TCPServer):
     def __init__(self, address: tuple[str, int], handler, bridge):
         self.bridge = bridge
         super().__init__(address, handler)
+
+
+class ThreadedNamedPipeServer:
+    max_pending_requests = 32
+    first_message_timeout = 2.0
+
+    def __init__(self, pipe_name: str, bridge):
+        self.pipe_name = pipe_name
+        self.bridge = bridge
+        self._listener = multiprocessing.connection.Listener(
+            pipe_name,
+            family="AF_PIPE",
+            backlog=64,
+            authkey=None,
+        )
+        self._stopping = threading.Event()
+        self._stopped = threading.Event()
+        self._pending = threading.BoundedSemaphore(self.max_pending_requests)
+        self._connections: set[Any] = set()
+        self._connections_lock = threading.Lock()
+
+    def serve_forever(self) -> None:
+        try:
+            while not self._stopping.is_set():
+                # Backpressure stays in the OS pipe queue until a reader is free.
+                if not self._pending.acquire(timeout=0.1):
+                    continue
+                if self._stopping.is_set():
+                    self._pending.release()
+                    return
+                try:
+                    connection = self._listener.accept()
+                except (EOFError, OSError) as exc:
+                    self._pending.release()
+                    if not self._stopping.is_set():
+                        bn.log_error(f"BN Agent Bridge Named Pipe accept failed: {exc}")
+                    return
+                if self._stopping.is_set():
+                    self._pending.release()
+                    connection.close()
+                    return
+                with self._connections_lock:
+                    self._connections.add(connection)
+                try:
+                    threading.Thread(
+                        target=self._handle_connection, args=(connection,), daemon=True,
+                    ).start()
+                except RuntimeError:
+                    self._pending.release()
+                    with self._connections_lock:
+                        self._connections.discard(connection)
+                    connection.close()
+                    raise
+        finally:
+            self._stopped.set()
+
+    def _handle_connection(self, connection) -> None:
+        op = None
+        request_id = None
+        try:
+            with contextlib.ExitStack() as pending:
+                pending.callback(self._pending.release)
+                try:
+                    if not connection.poll(self.first_message_timeout):
+                        return
+                    raw = connection.recv_bytes()
+                except (EOFError, OSError):
+                    return
+                # Once authenticated, a slow analysis occupies no admission slot.
+                encoded, op, request_id, should_shutdown = _process_bridge_request(
+                    self.bridge, raw, on_authenticated=pending.close
+                )
+            try:
+                connection.send_bytes(encoded)
+            except (BrokenPipeError, EOFError, OSError):
+                _log_disconnected_client(op, request_id)
+                return
+            if should_shutdown:
+                self.bridge.request_shutdown()
+        finally:
+            with self._connections_lock:
+                self._connections.discard(connection)
+            with contextlib.suppress(OSError):
+                connection.close()
+
+    def shutdown(self) -> None:
+        if self._stopping.is_set():
+            return
+        self._stopping.set()
+        # A busy listener already has a client to wake accept(). Client(AF_PIPE)
+        # would instead retry for 20 seconds if all kernel instances were busy.
+        import _winapi
+        with contextlib.suppress(OSError):
+            handle = _winapi.CreateFile(
+                self.pipe_name, _winapi.GENERIC_READ | _winapi.GENERIC_WRITE, 0,
+                _winapi.NULL, _winapi.OPEN_EXISTING, _winapi.FILE_FLAG_OVERLAPPED, _winapi.NULL,
+            )
+            _winapi.CloseHandle(handle)
+        self._stopped.wait(timeout=2.0)
+
+    def server_close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._listener.close()
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            with contextlib.suppress(OSError):
+                connection.close()
 
 
 LOAD_ATTEMPTS_LIMIT = 50
@@ -1182,11 +1370,12 @@ class BinaryNinjaBridge:
         self._address_spaces: dict[str, dict] = {}
         self.socket_path = bridge_socket_path(mode)
         self.registry_path = bridge_registry_path(mode)
-        self.transport = "unix" if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX") else "tcp"
+        self.transport = _configured_transport(mode)
         self.host: str | None = None
         self.port: int | None = None
+        self.pipe_name: str | None = None
         self.auth_token: str | None = None
-        self._server: socketserver.BaseServer | None = None
+        self._server: Any = None
         self._thread: threading.Thread | None = None
         self.shutdown_event = threading.Event()
         self._target_locks: dict[str, _ReadWriteLock] = {}
@@ -1251,12 +1440,29 @@ class BinaryNinjaBridge:
     def start(self) -> bool:  # pragma: no cover - requires GUI runtime
         self.shutdown_event.clear()
         if self.transport == "unix":
+            if ThreadedUnixServer is None or not hasattr(socket, "AF_UNIX"):
+                bn.log_error("BN Agent Bridge Unix-domain sockets are unavailable")
+                return False
             self.socket_path.parent.mkdir(parents=True, exist_ok=True)
             if self.socket_path.exists():
                 self.socket_path.unlink()
             assert ThreadedUnixServer is not None
             self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
-        else:
+        elif self.transport == "pipe":
+            self.auth_token = secrets.token_urlsafe(32)
+            self.pipe_name = bridge_pipe_name(self.mode)
+            try:
+                self._server = ThreadedNamedPipeServer(self.pipe_name, self)
+            except (OSError, ValueError) as exc:
+                self._server = None
+                self.auth_token = None
+                bn.log_error(
+                    f"BN Agent Bridge could not create Named Pipe {self.pipe_name}: {exc}. "
+                    "Check the current user's Named Pipe permissions or set "
+                    "BN_BRIDGE_TRANSPORT=tcp for explicit compatibility mode."
+                )
+                return False
+        elif self.transport == "tcp":
             self.auth_token = secrets.token_urlsafe(32)
             requested_port = _configured_tcp_port(self.mode)
             try:
@@ -1281,6 +1487,9 @@ class BinaryNinjaBridge:
                 )
                 return False
             self.host, self.port = self._server.server_address
+        else:
+            bn.log_error(f"BN Agent Bridge does not support transport {self.transport!r}")
+            return False
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         self._write_registry()
@@ -1294,6 +1503,8 @@ class BinaryNinjaBridge:
     def endpoint(self) -> str:
         if self.transport == "tcp":
             return f"tcp://{self.host}:{self.port}"
+        if self.transport == "pipe":
+            return f"pipe://{self.pipe_name}"
         return str(self.socket_path)
 
     def stop(self):  # pragma: no cover - requires GUI runtime
@@ -1329,8 +1540,15 @@ class BinaryNinjaBridge:
                     "auth_token": self.auth_token,
                 }
             )
-        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-        self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        elif self.transport == "pipe":
+            payload.update(
+                {
+                    "pipe_name": self.pipe_name,
+                    "auth_token": self.auth_token,
+                }
+            )
+        self.registry_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write(self.registry_path, json.dumps(payload, indent=2).encode("utf-8"))
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
         op = payload.get("op")
@@ -1653,21 +1871,23 @@ class BinaryNinjaBridge:
         if op == "value_query":
             return self._value_query(target, params)
         if op == "value_flags_at":
-            return self._value_flags_at(target, params["function_start"], params["address"])
+            return self._value_flags_at(
+                target, params.get("function_start"), params["address"]
+            )
         if op == "value_possible":
             return self._value_possible(
-                target, params["function_start"], params["address"],
+                target, params.get("function_start"), params["address"],
                 level=str(params.get("level", "hlil")),
                 ssa=bool(params.get("ssa", False)),
             )
         if op == "value_reg":
             return self._value_reg(
-                target, params["function_start"], params["address"],
+                target, params.get("function_start"), params["address"],
                 str(params["register"]), after=bool(params.get("after", False)),
             )
         if op == "value_stack":
             return self._value_stack(
-                target, params["function_start"], params["address"],
+                target, params.get("function_start"), params["address"],
                 int(params["stack_offset"]), int(params["size"]),
                 after=bool(params.get("after", False)),
             )
@@ -1821,9 +2041,30 @@ class BinaryNinjaBridge:
 
         # --- annotation ---
         if op == "annotation_add_tag":
-            return self._annotation_add_tag(target, params["address"], str(params["tag_type"]), str(params["data"]))
+            return self._annotation_add_tag(
+                target,
+                params.get("address"),
+                str(params["tag_type"]),
+                str(params["data"]),
+                function=params.get("function"),
+            )
         if op == "annotation_get_tags":
-            return self._annotation_get_tags(target, params["address"])
+            return self._annotation_get_tags(
+                target, params.get("address"), function=params.get("function")
+            )
+        if op == "annotation_create_tag_type":
+            return self._annotation_create_tag_type(
+                target, str(params["tag_type"]), params.get("icon")
+            )
+        if op == "annotation_list_tag_types":
+            return self._annotation_list_tag_types(target)
+        if op == "annotation_remove_tag":
+            return self._annotation_remove_tag(
+                target,
+                str(params["tag_type"]),
+                function=params.get("function"),
+                address=params.get("address"),
+            )
         if op == "annotation_define_data_var":
             return self._annotation_define_data_var(target, params["address"], type_name=params.get("type_name"), name=params.get("name"), width=params.get("width"))
         if op == "annotation_undefine_data_var":
@@ -1856,10 +2097,15 @@ class BinaryNinjaBridge:
             return self._uidf_list(target, params["function_start"])
         if op == "uidf_parse_possible_value":
             return self._uidf_parse(target, str(params["value"]), str(params["state"]))
+        if op == "uidf_from_address":
+            return self._uidf_from_address(target, params["address"])
 
         # --- loader ---
         if op == "loader_load_settings_get":
-            return self._loader_settings_get(target, str(params["type_name"]))
+            type_name = params.get("type_name")
+            return self._loader_settings_get(
+                target, str(type_name) if type_name else None
+            )
         if op == "loader_load_settings_set":
             return self._loader_settings_set(target, str(params["type_name"]), str(params["key"]), params["value"])
         if op == "loader_load_settings_types":
@@ -1880,6 +2126,8 @@ class BinaryNinjaBridge:
             return self._external_location_get(target, params["source_address"])
         if op == "external_location_remove":
             return self._external_location_remove(target, params["source_address"])
+        if op == "external_location_list":
+            return self._external_location_list(target)
 
         # --- analysis ---
         if op == "analysis_status":
@@ -1902,6 +2150,8 @@ class BinaryNinjaBridge:
             return self._metadata_store(target, str(params["key"]), params["value"])
         if op == "metadata_remove":
             return self._metadata_remove(target, str(params["key"]))
+        if op == "metadata_keys":
+            return self._metadata_keys(target)
 
         # --- data ---
         if op == "data_typed_at":
@@ -1916,6 +2166,10 @@ class BinaryNinjaBridge:
             return self._xref_data_refs_from(target, params["address"], length=params.get("length"))
         if op == "xref_data_refs_to":
             return self._xref_data_refs_to(target, params["address"], limit=int(params.get("limit", 100)))
+        if op == "xref_type_refs":
+            return self._xref_type_refs(
+                target, str(params["name"]), limit=params.get("limit")
+            )
 
         # --- il extended ---
         if op == "il_address_to_index":
@@ -1960,6 +2214,7 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "pid": os.getpid(),
             "socket_path": self.endpoint,
+            "endpoint": self.endpoint,
             "transport": self.transport,
             "mode": self.mode,
             "binaryninja_version": getattr(bn, "core_version", lambda: "unknown")(),
@@ -2939,13 +3194,23 @@ class BinaryNinjaBridge:
                 raise AttributeError(f"{il_name} is None")
             if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
                 il = il.ssa_form
+            if il_name == "hlil" and not ssa:
+                # Basic-block instructions omit nested bodies; render the whole HLIL AST instead.
+                root = il.root
+                items = root.lines if root is not None else ()
+            else:
+                items = il.instructions
             lines = []
-            for ins in il.instructions:
-                address = getattr(ins, "address", func.start)
-                lines.append(f"{int(address):08x}        {ins}")
+            for item in items:
+                self._check_job_cancelled()
+                address = getattr(item, "address", func.start)
+                prefix = f"{int(address):08x}" if address is not None else " " * 8
+                lines.append(f"{prefix}        {item}")
             if lines:
                 return "\n".join(lines)
-            # IL object exists but produced no instructions — might still be generating
+            # IL object exists but produced no lines — might still be generating
+        except JobCancelled:
+            raise
         except Exception:
             pass
         # IL not available — figure out why
@@ -5136,35 +5401,29 @@ class BinaryNinjaBridge:
                 "kind": kind, "type": str(value.type), "value": str(value),
                 "query": {key: params[key] for key in ("register", "flag", "offset", "size") if key in params}}
 
+    def _resolve_value_function(self, bv, function_start_raw, addr: int):
+        identifier = addr if function_start_raw is None else function_start_raw
+        return self._find_function(bv, identifier)
+
     def _value_flags_at(self, selector, function_start_raw, address_raw):
         bv = self._resolve_view(selector)
-        fn_addr = self._address(bv, function_start_raw)
         addr = self._address(bv, address_raw)
-        def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
-            llil = fn.llil
-            flags_read = []
-            flags_written = []
-            for block in llil:
-                for instr in block:
-                    if instr.address == addr:
-                        for token in instr.tokens:
-                            token_text = str(token)
-                            if token_text in [str(f) for f in fn.arch.flags]:
-                                flags_read.append(token_text)
-            return {"function": hex(fn_addr), "address": hex(addr), "flags_read": flags_read, "flags_written": flags_written}
-        return _do()
+        fn = self._resolve_value_function(bv, function_start_raw, addr)
+        flags_read, flags_written = set(), set()
+        for instruction in fn.get_lifted_ils_at(addr):
+            index = instruction.instr_index
+            flags_read.update(fn.get_flags_read_by_lifted_il_instruction(index))
+            flags_written.update(fn.get_flags_written_by_lifted_il_instruction(index))
+        return {
+            "function": hex(fn.start), "address": hex(addr),
+            "flags_read": sorted(flags_read), "flags_written": sorted(flags_written),
+        }
 
     def _value_possible(self, selector, function_start_raw, address_raw, *, level: str = "hlil", ssa: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = self._address(bv, function_start_raw)
         addr = self._address(bv, address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             if level == "llil":
                 il_func = fn.llil if not ssa else fn.llil.ssa_form
             elif level == "mlil":
@@ -5177,30 +5436,27 @@ class BinaryNinjaBridge:
                     if instr.address == addr:
                         pv = instr.possible_values
                         return {
-                            "function": hex(fn_addr),
+                            "function": hex(fn.start),
                             "address": hex(addr),
                             "level": level,
                             "ssa": ssa,
                             "type": str(pv.type) if hasattr(pv, "type") else str(type(pv).__name__),
                             "value": str(pv),
                         }
-            return {"function": hex(fn_addr), "address": hex(addr), "level": level, "ssa": ssa, "type": "not_found", "value": None}
+            return {"function": hex(fn.start), "address": hex(addr), "level": level, "ssa": ssa, "type": "not_found", "value": None}
         return _do()
 
     def _value_reg(self, selector, function_start_raw, address_raw, register: str, *, after: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = self._address(bv, function_start_raw)
         addr = self._address(bv, address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             if after:
                 val = fn.get_reg_value_after(addr, register)
             else:
                 val = fn.get_reg_value_at(addr, register)
             return {
-                "function": hex(fn_addr),
+                "function": hex(fn.start),
                 "address": hex(addr),
                 "register": register,
                 "after": after,
@@ -5211,18 +5467,15 @@ class BinaryNinjaBridge:
 
     def _value_stack(self, selector, function_start_raw, address_raw, stack_offset: int, size: int, *, after: bool = False):
         bv = self._resolve_view(selector)
-        fn_addr = self._address(bv, function_start_raw)
         addr = self._address(bv, address_raw)
         def _do():
-            fn = bv.get_function_at(fn_addr)
-            if fn is None:
-                raise RuntimeError(f"No function at {hex(fn_addr)}")
+            fn = self._resolve_value_function(bv, function_start_raw, addr)
             if after:
                 val = fn.get_stack_contents_after(addr, stack_offset, size)
             else:
                 val = fn.get_stack_contents_at(addr, stack_offset, size)
             return {
-                "function": hex(fn_addr),
+                "function": hex(fn.start),
                 "address": hex(addr),
                 "stack_offset": stack_offset,
                 "size": size,
@@ -6030,34 +6283,113 @@ class BinaryNinjaBridge:
     # Annotation operations
     # =========================================================================
 
-    def _annotation_add_tag(self, selector, address, tag_type: str, data: str):
+    def _tag_scope(self, bv, function, address):
+        if address is None and function is None:
+            raise ValueError("Tag operation requires a scope: pass --function <id> or --address <addr>")
+        addr = self._address(bv, address) if address is not None else None
+        if function is not None:
+            return addr, [self._find_function(bv, function)]
+        return addr, self._functions_containing(bv, addr)
+
+    def _annotation_add_tag(self, selector, address, tag_type: str, data: str, *, function=None):
         bv = self._resolve_view(selector)
-        addr = self._address(bv, address)
+        addr, functions = self._tag_scope(bv, function, address)
+        if len(functions) > 1:
+            raise ValueError("Multiple functions contain this address; select one with --function")
+        if bv.get_tag_type(tag_type) is None:
+            bv.create_tag_type(tag_type, "⭐")
+        result = {"tag_type": tag_type, "data": data, "added": True}
+        if addr is not None:
+            result["address"] = hex(addr)
+        if functions:
+            fn = functions[0]
+            fn.add_tag(tag_type, data, addr)
+            if function is not None:
+                result.update(function=fn.name, function_start=hex(fn.start))
+        else:
+            bv.add_tag(addr, tag_type, data)
+        return result
+
+    def _annotation_get_tags(self, selector, address, *, function=None):
+        bv = self._resolve_view(selector)
+        addr, functions = self._tag_scope(bv, function, address)
+        if addr is None:
+            tags = functions[0].get_function_tags()
+            scope = "function"
+        else:
+            tags = [tag for fn in functions for tag in fn.get_tags_at(addr)]
+            if function is None:
+                tags.extend(bv.get_tags_at(addr))
+            scope = "address"
+        return [{"type": tag.type.name, "data": tag.data, "scope": scope} for tag in tags]
+
+    def _annotation_create_tag_type(self, selector, tag_type: str, icon=None):
+        bv = self._resolve_view(selector)
         def _do():
-            tt = bv.create_tag_type(tag_type, "⭐") if bv.get_tag_type(tag_type) is None else bv.get_tag_type(tag_type)
-            tag = bv.create_tag(tt, data)
-            fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
-            if fn:
-                fn.add_tag(tag_type, data, addr)
-            else:
-                bv.add_tag(addr, tag_type, data)
-            return {"address": hex(addr), "tag_type": tag_type, "data": data, "added": True}
+            resolved_icon = str(icon) if icon else "⭐"
+            existing = bv.get_tag_type(tag_type) if hasattr(bv, "get_tag_type") else None
+            if existing is not None:
+                return {
+                    "tag_type": getattr(existing, "name", tag_type),
+                    "icon": getattr(existing, "icon", None),
+                    "created": False,
+                }
+            if not hasattr(bv, "create_tag_type"):
+                raise RuntimeError("create_tag_type not available")
+            created = bv.create_tag_type(tag_type, resolved_icon)
+            return {
+                "tag_type": getattr(created, "name", tag_type),
+                "icon": getattr(created, "icon", resolved_icon),
+                "created": True,
+            }
         return _do()
 
-    def _annotation_get_tags(self, selector, address):
+    def _annotation_list_tag_types(self, selector):
         bv = self._resolve_view(selector)
-        addr = self._address(bv, address)
         def _do():
-            tags = []
-            fn = bv.get_function_at(addr) or (bv.get_functions_containing(addr) or [None])[0]
-            if fn:
-                for tag in fn.get_tags_at(addr):
-                    tags.append({"type": tag.type.name, "data": tag.data})
-            addr_tags = bv.get_tags_at(addr) if hasattr(bv, "get_tags_at") else []
-            for tag in addr_tags:
-                tags.append({"type": tag.type.name, "data": tag.data})
-            return tags
+            raw = getattr(bv, "tag_types", None) or {}
+            pairs = raw.items() if hasattr(raw, "items") else []
+            entries = []
+            for name, value in pairs:
+                candidates = value if isinstance(value, (list, tuple)) else [value]
+                for tag_type in candidates:
+                    entries.append(
+                        {
+                            "name": getattr(tag_type, "name", name),
+                            "icon": getattr(tag_type, "icon", None),
+                            "visible": getattr(tag_type, "visible", None),
+                        }
+                    )
+            entries.sort(key=lambda entry: str(entry["name"]))
+            return entries
         return _do()
+
+    def _annotation_remove_tag(self, selector, tag_type: str, *, function=None, address=None):
+        bv = self._resolve_view(selector)
+        addr, functions = self._tag_scope(bv, function, address)
+        removed = 0
+        if addr is None:
+            fn = functions[0]
+            for tag in fn.get_function_tags(auto=False, tag_type=tag_type):
+                fn.remove_user_function_tag(tag)
+                removed += 1
+        else:
+            for fn in functions:
+                for tag in fn.get_tags_at(addr, auto=False):
+                    if tag.type.name == tag_type:
+                        fn.remove_user_address_tag(addr, tag)
+                        removed += 1
+            if function is None:
+                for tag in bv.get_tags_at(addr, auto=False):
+                    if tag.type.name == tag_type:
+                        bv.remove_user_data_tag(addr, tag)
+                        removed += 1
+        return {
+            "tag_type": tag_type,
+            "function": functions[0].name if len(functions) == 1 else None,
+            "address": hex(addr) if addr is not None else None,
+            "removed": removed,
+        }
 
     def _annotation_define_data_var(self, selector, address, *, type_name=None, name=None, width=None):
         bv = self._resolve_view(selector)
@@ -6265,19 +6597,66 @@ class BinaryNinjaBridge:
             return {"value": value, "state": state, "valid": True, "parsed_value": int(value, 0) if isinstance(value, str) else value}
         return _do()
 
+    def _uidf_from_address(self, selector, address):
+        bv = self._resolve_view(selector)
+        addr = self._address(bv, address)
+        def _do():
+            fn = self._find_function(bv, addr)
+            values = {}
+            if hasattr(fn, "get_all_user_var_values"):
+                try:
+                    values = fn.get_all_user_var_values() or {}
+                except Exception:
+                    values = {}
+            if not values and hasattr(fn, "user_var_values"):
+                values = fn.user_var_values or {}
+            variables = []
+            for var, def_sites in (values.items() if hasattr(values, "items") else []):
+                definitions = []
+                for site, value in (def_sites.items() if hasattr(def_sites, "items") else []):
+                    site_address = site.addr
+                    definitions.append(
+                        {
+                            "address": hex(site_address) if isinstance(site_address, int) else None,
+                            "arch": str(getattr(site, "arch", "") or "") or None,
+                            "value": _value_text(value),
+                            "at_address": site_address == addr,
+                        }
+                    )
+                definitions.sort(key=lambda item: item["address"] or "")
+                variables.append(
+                    {
+                        "var": str(getattr(var, "name", var)),
+                        "definitions": definitions,
+                    }
+                )
+            variables.sort(key=lambda item: item["var"])
+            return {
+                "address": hex(addr),
+                "function": fn.name,
+                "function_start": hex(fn.start),
+                "variables": variables,
+            }
+        return _do()
+
     # =========================================================================
     # Loader operations
     # =========================================================================
 
-    def _loader_settings_get(self, selector, type_name: str):
+    def _loader_settings_get(self, selector, type_name: str | None = None):
         bv = self._resolve_view(selector)
         def _do():
-            settings = bn.Settings(f"loader.{type_name}")
+            resolved = type_name or str(getattr(bv, "view_type", "") or "")
+            if not resolved:
+                raise RuntimeError(
+                    "type_name is required: pass a view type (e.g. ELF) explicitly"
+                )
+            settings = bn.Settings(f"loader.{resolved}")
             keys = settings.keys() if hasattr(settings, "keys") else []
             result = {}
             for key in keys:
                 result[key] = settings.get_string(key) if hasattr(settings, "get_string") else None
-            return {"type_name": type_name, "settings": result}
+            return {"type_name": resolved, "settings": result}
         return _do()
 
     def _loader_settings_set(self, selector, type_name: str, key: str, value):
@@ -6405,6 +6784,20 @@ class BinaryNinjaBridge:
             raise RuntimeError("get_external_location_at not available")
         return _do()
 
+    def _external_location_list(self, selector):
+        bv = self._resolve_view(selector)
+        entries = []
+        for location in sorted(bv.get_external_locations(), key=lambda loc: loc.source_symbol.address):
+            target = location.target_address
+            library = location.library
+            entries.append({
+                "source_address": hex(location.source_symbol.address),
+                "library": library.name if library is not None else None,
+                "symbol": location.target_symbol,
+                "target_address": hex(target) if target is not None else None,
+            })
+        return entries
+
     def _external_location_remove(self, selector, source_address):
         bv = self._resolve_view(selector)
         addr = self._address(bv, source_address)
@@ -6504,6 +6897,20 @@ class BinaryNinjaBridge:
             return {"key": key, "stored": True}
         return _do()
 
+    def _metadata_keys(self, selector):
+        bv = self._resolve_view(selector)
+        def _do():
+            metadata = getattr(bv, "metadata", None)
+            if metadata is None:
+                return []
+            if hasattr(metadata, "get_dict"):
+                data = metadata.get_dict() or {}
+            else:
+                data = metadata
+            keys = list(data.keys()) if hasattr(data, "keys") else []
+            return sorted(str(key) for key in keys)
+        return _do()
+
     def _metadata_remove(self, selector, key: str):
         bv = self._resolve_view(selector)
         def _do():
@@ -6585,6 +6992,27 @@ class BinaryNinjaBridge:
         def _do():
             refs = list(bv.get_data_refs(addr))[:limit]
             return [{"address": hex(ref)} for ref in refs]
+        return _do()
+
+    def _xref_type_refs(self, selector, name: str, *, limit=None):
+        bv = self._resolve_view(selector)
+        def _do():
+            if not hasattr(bv, "get_type_refs_for_type"):
+                raise RuntimeError("get_type_refs_for_type not available")
+            refs = bv.get_type_refs_for_type(name, int(limit) if limit else None)
+            entries = []
+            for ref in refs or []:
+                ref_name = getattr(ref, "name", None)
+                offset = getattr(ref, "offset", None)
+                ref_type = getattr(ref, "ref_type", None)
+                entries.append(
+                    {
+                        "type": str(ref_name) if ref_name is not None else str(ref),
+                        "offset": hex(offset) if isinstance(offset, int) else None,
+                        "reference_type": str(ref_type) if ref_type is not None else None,
+                    }
+                )
+            return entries
         return _do()
 
     # =========================================================================
@@ -6803,43 +7231,67 @@ def _set_gui_port_setting(port: int) -> bool:
     return bool(settings.set_integer(GUI_PORT_SETTING, port, scope=scope))
 
 
-def _restart_gui_bridge(previous_port: int | None) -> tuple[BinaryNinjaBridge | None, bool]:
+def _set_gui_transport_setting(transport: str) -> bool:
+    if transport not in GUI_TRANSPORTS:
+        raise ValueError(f"Unsupported GUI transport: {transport!r}")
+    settings = bn.Settings()
+    scope = getattr(getattr(bn, "SettingsScope", None), "SettingsUserScope", None)
+    if scope is None:
+        return bool(settings.set_string(GUI_TRANSPORT_SETTING, transport))
+    return bool(settings.set_string(GUI_TRANSPORT_SETTING, transport, scope=scope))
+
+
+def _restart_gui_bridge(
+    previous_transport: str | None,
+    previous_port: int | None,
+) -> tuple[BinaryNinjaBridge | None, bool]:
+    desired_transport = _configured_transport("gui")
     desired_port = _configured_tcp_port("gui")
     _stop_bridge()
     restarted = start_bridge(mode="gui")
     if restarted is not None:
         return restarted, False
 
-    if previous_port is None or previous_port == desired_port:
+    restored_setting = False
+    if previous_transport is not None and previous_transport != desired_transport:
+        restored_setting = _set_gui_transport_setting(previous_transport)
+    elif (
+        desired_transport == "tcp"
+        and previous_port is not None
+        and previous_port != desired_port
+    ):
+        restored_setting = _set_gui_port_setting(previous_port)
+
+    if not restored_setting:
         return None, False
 
-    _set_gui_port_setting(previous_port)
     restored = start_bridge(mode="gui")
     return restored, restored is not None
 
 
 def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
-    if ThreadedUnixServer is not None and hasattr(socket, "AF_UNIX"):
-        _stop_bridge()
-        restarted = start_bridge(mode="gui")
-        if restarted is not None:
-            _show_gui_message(f"Bridge is listening on {restarted.endpoint}.")
-        else:
-            _show_gui_message("Could not restart the bridge. See the Binary Ninja log for details.")
+    try:
+        selected_transport = _configured_transport("gui")
+    except ValueError as exc:
+        _show_gui_message(f"Transport configuration is invalid: {exc}")
         return
-
-    previous_port = _bridge.port if _bridge is not None and _bridge.transport == "tcp" else None
-    desired_port = _configured_tcp_port("gui")
-    restarted, restored = _restart_gui_bridge(previous_port)
+    previous_transport = _bridge.transport if _bridge is not None else None
+    previous_port = (
+        int(_bridge.port)
+        if _bridge is not None and _bridge.transport == "tcp" and _bridge.port is not None
+        else None
+    )
+    restarted, restored = _restart_gui_bridge(previous_transport, previous_port)
     if restarted is not None and not restored:
         _show_gui_message(f"Bridge is listening on {restarted.endpoint}.")
     elif restored:
         _show_gui_message(
-            f"Could not listen on port {desired_port}; restored the bridge on {restarted.endpoint}."
+            f"Could not start {selected_transport}; restored the bridge on {restarted.endpoint}."
         )
     else:
         _show_gui_message(
-            f"Could not start the bridge on port {desired_port}. See the Binary Ninja log for details."
+            f"Could not start the bridge with {selected_transport}. "
+            "See the Binary Ninja log for details."
         )
 
 
@@ -6867,7 +7319,13 @@ def _set_gui_port_command(_):  # pragma: no cover - GUI runtime
         _show_gui_message("Binary Ninja could not save the GUI port setting.")
         return
 
-    restarted, restored = _restart_gui_bridge(previous_port)
+    selected_transport = _configured_transport("gui")
+    if selected_transport != "tcp":
+        _show_gui_message(f"Port {port} saved for Loopback TCP mode.")
+        return
+
+    previous_transport = _bridge.transport if _bridge is not None else "tcp"
+    restarted, restored = _restart_gui_bridge(previous_transport, previous_port)
     if restarted is not None and not restored:
         _show_gui_message(f"Bridge is now listening on {restarted.endpoint}.")
     elif restored:
@@ -6888,7 +7346,11 @@ def start_bridge(mode: str = "gui"):  # pragma: no cover - exercised in real bri
         return None
     if _bridge is not None:
         return _bridge
-    candidate = BinaryNinjaBridge(mode=mode)
+    try:
+        candidate = BinaryNinjaBridge(mode=mode)
+    except ValueError as exc:
+        bn.log_error(f"BN Agent Bridge transport configuration is invalid: {exc}")
+        return None
     if not candidate.start():
         return None
     _bridge = candidate
@@ -6933,7 +7395,7 @@ if ui is not None:
         "Restart the bn CLI bridge",
         _restart_bridge_command,
     )
-    if ThreadedUnixServer is None or not hasattr(socket, "AF_UNIX"):
+    if os.name == "nt":
         _register_gui_settings()
         PluginCommand.register(
             "BN Agent Bridge\\Set GUI Port...",

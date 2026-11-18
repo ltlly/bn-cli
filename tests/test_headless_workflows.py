@@ -265,7 +265,7 @@ def test_function_page_reports_next_offset_without_changing_default(
 def test_standalone_documented_commands_parse(filename):
     root = Path(__file__).resolve().parents[1]
     parser = bn.cli.build_parser()
-    text = (root / filename).read_text().replace("\\\n", " ")
+    text = (root / filename).read_text(encoding="utf-8").replace("\\\n", " ")
     for line in text.splitlines():
         if not line.startswith("bn ") or any(
             char in line for char in ("|", ";", ">", "&", "<<")

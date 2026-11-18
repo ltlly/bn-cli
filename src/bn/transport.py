@@ -3,6 +3,9 @@ from __future__ import annotations
 import contextlib
 import errno
 import json
+import math
+import multiprocessing.connection
+import os
 import socket
 import time
 import uuid
@@ -10,6 +13,17 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+if os.name == "nt":
+    import _winapi
+    import ctypes
+    from ctypes import wintypes
+
+    _get_pipe_server_pid = ctypes.WinDLL("kernel32", use_last_error=True).GetNamedPipeServerProcessId
+    _get_pipe_server_pid.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG))
+    _get_pipe_server_pid.restype = wintypes.BOOL
+else:
+    _winapi = None
 
 from .paths import (
     DAEMON_MODES,
@@ -47,6 +61,25 @@ TRANSIENT_SOCKET_ERRNOS = {
     errno.ENOENT,
 }
 
+TRANSIENT_PIPE_WINERRORS = {
+    2,    # ERROR_FILE_NOT_FOUND
+    53,   # ERROR_BAD_NETPATH
+    121,  # ERROR_SEM_TIMEOUT
+    231,  # ERROR_PIPE_BUSY
+}
+
+MISSING_PIPE_WINERRORS = {
+    2,  # ERROR_FILE_NOT_FOUND
+    3,  # ERROR_PATH_NOT_FOUND
+}
+
+LOCAL_PIPE_PREFIX = "\\\\.\\pipe\\"
+
+# Supplying SECURITY_SQOS_PRESENT with SECURITY_ANONYMOUS (zero) prevents the
+# pipe server from impersonating the CLI user. The bridge only needs JSON bytes.
+SECURITY_SQOS_PRESENT = 0x00100000
+
+
 DENIED_SOCKET_ERRNOS = {
     errno.EACCES,
     errno.EPERM,
@@ -66,12 +99,15 @@ class BridgeInstance:
     transport: str = "unix"
     host: str | None = None
     port: int | None = None
+    pipe_name: str | None = None
     auth_token: str | None = None
 
     @property
     def endpoint(self) -> str:
         if self.transport == "tcp":
             return f"tcp://{self.host}:{self.port}"
+        if self.transport == "pipe":
+            return f"pipe://{self.pipe_name}"
         return str(self.socket_path)
 
 
@@ -90,8 +126,83 @@ def _socket_args(instance: BridgeInstance) -> tuple[int, str | tuple[str, int]]:
     return socket.AF_UNIX, str(instance.socket_path)
 
 
+def _validate_pipe_name(pipe_name: str) -> str:
+    if not pipe_name.startswith(LOCAL_PIPE_PREFIX):
+        raise OSError(errno.EINVAL, "Invalid local Named Pipe endpoint")
+    suffix = pipe_name[len(LOCAL_PIPE_PREFIX):]
+    if not suffix or "\\" in suffix or "/" in suffix:
+        raise OSError(errno.EINVAL, "Invalid local Named Pipe endpoint")
+    return pipe_name
+
+
+def _pipe_wait_ms(timeout: float) -> int:
+    if timeout <= 0:
+        raise TimeoutError("Named Pipe deadline expired")
+    # WaitNamedPipe treats zero as the server's default (potentially infinite).
+    return min(math.ceil(timeout * 1000), 0xFFFFFFFE)
+
+
+def _wait_named_pipe(pipe_name: str, timeout: float | None) -> None:
+    _validate_pipe_name(pipe_name)
+    if _winapi is None:
+        raise OSError(errno.EPROTONOSUPPORT, "Windows Named Pipes are unavailable")
+    wait_ms = _winapi.NMPWAIT_WAIT_FOREVER if timeout is None else _pipe_wait_ms(timeout)
+    _winapi.WaitNamedPipe(pipe_name, wait_ms)
+
+
+def _pipe_server_pid(handle: int) -> int:
+    pid = wintypes.ULONG()
+    if not _get_pipe_server_pid(handle, ctypes.byref(pid)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return pid.value
+
+
+def _pipe_connect(pipe_name: str, timeout: float | None, expected_pid: int):
+    _wait_named_pipe(pipe_name, timeout)
+    # Client(AF_PIPE) would start its own 20-second retry loop. Open once and
+    # let the request retry a lost race within its original deadline.
+    handle = _winapi.CreateFile(
+        pipe_name, _winapi.GENERIC_READ | _winapi.GENERIC_WRITE, 0,
+        _winapi.NULL, _winapi.OPEN_EXISTING,
+        _winapi.FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT, _winapi.NULL,
+    )
+    try:
+        if _pipe_server_pid(handle) != expected_pid:
+            raise BridgeError("Named Pipe server PID does not match the bridge registry")
+        _winapi.SetNamedPipeHandleState(handle, _winapi.PIPE_READMODE_MESSAGE, None, None)
+        return multiprocessing.connection.PipeConnection(handle)
+    except BaseException:
+        _winapi.CloseHandle(handle)
+        raise
+
+
+def _send_pipe_bytes(connection, encoded: bytes, deadline: float | None) -> None:
+    if deadline is None:
+        connection.send_bytes(encoded)
+        return
+    # A write larger than the pipe buffer can wait for the peer to start reading.
+    wait_ms = _pipe_wait_ms(deadline - time.monotonic())
+    write, status = _winapi.WriteFile(connection.fileno(), encoded, overlapped=True)
+    try:
+        if status == _winapi.ERROR_IO_PENDING:
+            if _winapi.WaitForSingleObject(write.event, wait_ms) == _winapi.WAIT_TIMEOUT:
+                raise TimeoutError("timed out writing Named Pipe request")
+    except BaseException:
+        write.cancel()
+        write.GetOverlappedResult(True)
+        raise
+    size, status = write.GetOverlappedResult(True)
+    if status or size != len(encoded):
+        raise OSError("Named Pipe request write did not complete")
+
+
 def _socket_probe_error(instance: BridgeInstance, timeout: float = 0.2) -> OSError | None:
     try:
+        if instance.transport == "pipe":
+            if instance.pipe_name is None:
+                raise OSError(errno.EINVAL, "Missing Named Pipe endpoint")
+            _wait_named_pipe(instance.pipe_name, timeout)
+            return None
         family, address = _socket_args(instance)
         with socket.socket(family, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
@@ -136,6 +247,20 @@ def _load_instance(path: Path) -> BridgeInstance | None:
             _purge_stale_registry(path)
             return None
         socket_path = None
+        pipe_name = None
+    elif transport == "pipe":
+        try:
+            pipe_name = _validate_pipe_name(str(payload["pipe_name"]))
+            auth_token = payload["auth_token"]
+        except (KeyError, TypeError, OSError):
+            _purge_stale_registry(path)
+            return None
+        if not isinstance(auth_token, str) or not auth_token:
+            _purge_stale_registry(path)
+            return None
+        socket_path = None
+        host = None
+        port = None
     elif transport == "unix":
         try:
             socket_path = Path(payload["socket_path"])
@@ -145,6 +270,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         host = None
         port = None
         auth_token = None
+        pipe_name = None
         if not socket_path.exists():
             _purge_stale_registry(path)
             return None
@@ -164,15 +290,22 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         transport=transport,
         host=host,
         port=port,
+        pipe_name=pipe_name,
         auth_token=auth_token,
     )
 
     probe_error = _socket_probe_error(instance)
-    if probe_error is not None and probe_error.errno in DENIED_SOCKET_ERRNOS:
+    if probe_error is not None:
+        if instance.transport == "pipe":
+            # Busy and timed-out listeners still exist. Keep their registry
+            # so that the actual request can retry within its own deadline.
+            stale = getattr(probe_error, "winerror", None) in MISSING_PIPE_WINERRORS
+        else:
+            stale = probe_error.errno not in DENIED_SOCKET_ERRNOS
+        if stale:
+            _purge_stale_registry(path)
+            return None
         payload["socket_probe_error"] = str(probe_error)
-    elif probe_error is not None:
-        _purge_stale_registry(path)
-        return None
 
     return instance
 
@@ -284,6 +417,61 @@ def _send_request_to_instance(
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
 
+    if instance.transport == "pipe":
+        if instance.pipe_name is None:
+            raise BridgeError("Named Pipe registry is missing pipe_name")
+        last_error: OSError | None = None
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for attempt in range(connect_retries):
+            connection = None
+            try:
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if remaining == 0:
+                    raise TimeoutError("Named Pipe deadline expired")
+                connection = _pipe_connect(instance.pipe_name, remaining, instance.pid)
+                _send_pipe_bytes(connection, encoded, deadline)
+                if deadline is not None:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if not connection.poll(remaining):
+                        raise TimeoutError("timed out waiting for Named Pipe response")
+                response_bytes = connection.recv_bytes()
+                return _decode_response(response_bytes)
+            except OSError as exc:
+                last_error = exc
+                winerror = getattr(exc, "winerror", None)
+                if (
+                    connection is not None  # A request may already have reached the server.
+                    or winerror not in TRANSIENT_PIPE_WINERRORS
+                    or attempt == connect_retries - 1
+                    or (deadline is not None and time.monotonic() >= deadline)
+                ):
+                    break
+                delay = 0.05 * (attempt + 1)
+                if deadline is not None:
+                    delay = min(delay, max(0.0, deadline - time.monotonic()))
+                time.sleep(delay)
+            except EOFError as exc:
+                last_error = OSError(
+                    errno.ECONNRESET,
+                    "Named Pipe closed before the bridge returned a response",
+                )
+                last_error.__cause__ = exc
+                break
+            finally:
+                if connection is not None:
+                    with contextlib.suppress(OSError):
+                        connection.close()
+        assert last_error is not None
+        if isinstance(last_error, TimeoutError) or getattr(last_error, "winerror", None) == 121:
+            timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
+            raise BridgeError(
+                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.endpoint}"
+                f"{timeout_suffix}"
+            ) from last_error
+        raise BridgeError(
+            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.endpoint}: {last_error}"
+        ) from last_error
+
     chunks: list[bytes] = []
     last_error: OSError | None = None
     for attempt in range(connect_retries):
@@ -322,9 +510,13 @@ def _send_request_to_instance(
     if not chunks:
         raise BridgeError("Binary Ninja bridge returned an empty response")
 
+    return _decode_response(b"".join(chunks))
+
+
+def _decode_response(encoded: bytes) -> dict[str, Any]:
     try:
-        response = json.loads(b"".join(chunks).decode("utf-8"))
-    except json.JSONDecodeError as exc:
+        response = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BridgeError("Binary Ninja bridge returned invalid JSON") from exc
 
     if not isinstance(response, dict):
