@@ -166,17 +166,21 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 - `bn` has two parts:
   - a normal Python CLI that you can run from your shell or agent tool harness
-  - a Binary Ninja bridge that exposes the API over a local transport: a Unix-domain socket on Unix, or authenticated loopback TCP on Windows
+  - a Binary Ninja bridge that exposes the API over a local transport: a Unix-domain socket on Unix, or an authenticated Windows Named Pipe on Windows
 - The bridge runs in one of two **modes**:
   - **`gui`** — loaded as a Binary Ninja plugin inside the GUI process. Works with a personal license. Started automatically when Binary Ninja opens with the plugin installed.
   - **`headless`** — long-running daemon started with `bn daemon start`. Requires a Binary Ninja commercial (headless) license. Built for containers, CI, and AI agent driver loops.
-- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. On Windows, GUI defaults to `127.0.0.1:26765` and headless to `127.0.0.1:26766`; registry entries include a random authentication token and the CLI only accepts loopback endpoints. Override the defaults with `BN_BRIDGE_GUI_PORT` or `BN_BRIDGE_HEADLESS_PORT`.
+- Each mode has its own endpoint and registry file under the platform cache directory, so both can run simultaneously on the same machine. Windows uses the fixed local Named Pipes `\\.\pipe\bn-agent-bridge-gui` and `\\.\pipe\bn-agent-bridge-headless`; the registry contains the selected endpoint and a random authentication token. The CLI rejects remote or nested pipe names.
 - The CLI auto-discovers all running daemons. When only one is up, it routes to that one. When both are up, it routes to the **sticky** mode chosen via `bn daemon use <mode>` (see [Daemon Mode Selection](#daemon-mode-selection)).
-- **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation just opens a socket, sends a JSON request, and reads the response — the binary is never re-imported.
+- **No repeated loading**: The daemon keeps loaded binaries resident in memory. Each CLI invocation opens the registered endpoint, sends a JSON request, and reads the response — the binary is never re-imported.
 
-### Changing the GUI bridge port
+### Transport selection
 
-On Windows, run `BN Agent Bridge\Set GUI Port...` inside Binary Ninja to save a new user-level port and restart the bridge immediately. You can also edit **GUI Listen Port** under the **BN Agent Bridge** group in Binary Ninja Settings, then run `BN Agent Bridge\Restart Bridge`. If the new port cannot be bound, the plugin restores the previous setting and listener instead of leaving the bridge offline.
+On Windows, choose **Named Pipe** or **Loopback TCP** with **GUI Transport** under the **BN Agent Bridge** group in Binary Ninja Settings. **GUI Listen Port** configures the TCP port. Run `BN Agent Bridge\Restart Bridge` after changing either setting. If the new transport or port cannot start, the plugin restores the previous working configuration.
+
+`BN_BRIDGE_TRANSPORT=auto|pipe|tcp|unix` also controls the bridge transport. `auto` is the default: the Windows GUI reads **GUI Transport**, Windows headless selects `pipe`, and Unix selects `unix`. An explicit environment value overrides the GUI setting. Unsupported platform combinations fail explicitly and never fall back silently.
+
+For Windows automation or headless compatibility, set `BN_BRIDGE_TRANSPORT=tcp` before starting Binary Ninja or the headless daemon. TCP remains restricted to `127.0.0.1`, requires the registry authentication token, and uses `BN_BRIDGE_GUI_PORT` / `BN_BRIDGE_HEADLESS_PORT` or the GUI **Listen Port** setting. CLI and plugin should be upgraded together because older CLIs do not understand Pipe registry entries.
 
 ## Quick Start
 
@@ -228,7 +232,7 @@ If exactly one BinaryView is loaded, target-specific commands can omit `--target
 | `bn function list` | List all functions (supports `--min-address`, `--max-address`) |
 | `bn function search` | Search functions by name (substring or `--regex`) |
 | `bn function info` | Detailed function info (locals, params, local_ids) |
-| `bn decompile` | Render HLIL-style decompile text |
+| `bn decompile` | Render structured HLIL text with nested control flow |
 | `bn il` | Dump IL for a function (HLIL/MLIL/LLIL variants) |
 | `bn disasm` | Disassemble a function |
 | `bn disasm-linear` | Disassemble linearly from an address |
@@ -375,7 +379,7 @@ The headless daemon imports `binaryninja` and requires a Binary Ninja commercial
 
 ```bash
 bn daemon start --foreground   # block in foreground (Docker PID 1 / systemd)
-bn daemon status               # pid, socket, target count
+bn daemon status               # pid, endpoint, target count
 bn daemon stop                 # authenticated graceful shutdown + registry cleanup
 ```
 
@@ -449,6 +453,8 @@ If `--out` is set, the command writes the rendered result to that path and print
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
 `bn function list` and `bn function search` support `--offset` and `--limit` (default `--limit -1` returns all for compatibility) for the selected target or address range. Large results auto-spill to an artifact. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout stays empty and stderr carries the spill metadata as plain text, including the artifact path and size counts.
+
+Token counting works fully offline: the `o200k_base` BPE table ships inside the package (`bn/_data/o200k_base.tiktoken`, pinned by sha256), so no first-run download is needed. If that table is ever missing, `bn` tries tiktoken's own cache (`$BN_CACHE_DIR/tiktoken`) and finally falls back to a byte-based estimate, so commands never fail because of the tokenizer. `bn doctor` reports which source is active. Payloads smaller than the spill threshold skip tokenization entirely, which keeps short commands fast.
 
 ## Extraction Commands
 
@@ -651,6 +657,8 @@ If `bn target list` is empty:
 - make sure a binary or `.bndb` is open
 - make sure the plugin is installed with `bn plugin install`
 - reload Binary Ninja plugins or restart Binary Ninja after plugin changes
+
+On Windows, `bn doctor` should report a `pipe://\\.\pipe\...` endpoint. If Pipe creation or access fails, check that the CLI and plugin run as the same Windows user. For explicit compatibility mode, set `BN_BRIDGE_TRANSPORT=tcp` in both environments and restart the bridge; there is no automatic TCP fallback.
 
 On Unix, if `bn doctor` sees a bridge registry but reports `Operation not permitted` under Codex,
 the Codex sandbox is blocking the Unix socket that connects to the live Binary Ninja GUI

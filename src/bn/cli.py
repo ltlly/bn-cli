@@ -11,8 +11,8 @@ from typing import Any, Callable
 
 from . import api_docs
 from .artifacts import select_result, diff_results
+from .output import tokenizer_status, write_output_result
 from .schema import command_schema
-from .output import write_output_result
 from .paths import (
     DAEMON_MODES,
     SKILL_CLIENTS,
@@ -83,9 +83,20 @@ class _HelpFullAction(argparse.Action):
         parser.exit()
 
 
+class _ShorthandSubparsers(argparse._SubParsersAction):
+    def __call__(self, parser, namespace, values, option_string=None):
+        # argparse normally parses the child in a fresh namespace. Replay options
+        # preceding its name so defaults cannot erase an explicit target or format.
+        prefix = namespace._shorthand_argv[:-len(values)]
+        super().__call__(parser, namespace, [values[0], *prefix, *values[1:]], option_string)
+
+
 class BnArgumentParser(argparse.ArgumentParser):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, shorthand: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.shorthand = shorthand
+        if shorthand:
+            self.register("action", "parsers", _ShorthandSubparsers)
         self.set_defaults(_parser=self)
         self.add_argument(
             "--help-full",
@@ -93,11 +104,27 @@ class BnArgumentParser(argparse.ArgumentParser):
             help="Show help for this command and all subcommands",
         )
 
+    def parse_known_args(self, args=None, namespace=None):
+        if not self.shorthand:
+            return super().parse_known_args(args, namespace)
+        if namespace is None:
+            namespace = argparse.Namespace()
+        namespace._shorthand_argv = list(sys.argv[1:] if args is None else args)
+        try:
+            return super().parse_known_args(namespace._shorthand_argv, namespace)
+        finally:
+            del namespace._shorthand_argv
+
     def _iter_full_help_parsers(self) -> list[argparse.ArgumentParser]:
         parsers: list[argparse.ArgumentParser] = [self]
         for action in self._actions:
             if isinstance(action, argparse._SubParsersAction):
+                # Alias names map to the same parser object; only walk each one once.
+                seen: set[int] = set()
                 for parser in action.choices.values():
+                    if id(parser) in seen:
+                        continue
+                    seen.add(id(parser))
                     if isinstance(parser, BnArgumentParser):
                         parsers.extend(parser._iter_full_help_parsers())
                     else:
@@ -749,6 +776,97 @@ def _render_xref_data_simple_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_line_list_text(value: Any) -> str:
+    """One plain string per line (metadata keys, names, ...)."""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    return "\n".join(str(item) for item in value)
+
+
+def _render_tag_types_text(value: Any) -> str:
+    """Compact tag types: `name  icon` one per line."""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(str(item))
+            continue
+        name = item.get("name", "?")
+        icon = item.get("icon") or ""
+        hidden = " hidden" if item.get("visible") is False else ""
+        lines.append(f"{name}  {icon}{hidden}".rstrip())
+    return "\n".join(lines)
+
+
+def _render_external_locations_text(value: Any) -> str:
+    """Compact external locations: `source library symbol [-> target]`."""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(str(item))
+            continue
+        source = item.get("source_address") or "?"
+        library = item.get("library") or "-"
+        symbol = item.get("symbol") or "-"
+        line = f"{source}  {library}  {symbol}"
+        target = item.get("target_address")
+        if target:
+            line += f"  -> {target}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_type_refs_text(value: Any) -> str:
+    """Compact type refs: `type offset reference_type`."""
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(str(item))
+            continue
+        ref_type = item.get("type") or "?"
+        offset = item.get("offset") or "-"
+        kind = item.get("reference_type") or "-"
+        lines.append(f"{ref_type}  {offset}  {kind}")
+    return "\n".join(lines)
+
+
+def _render_uidf_text(value: Any) -> str:
+    """Compact user IL data flow: `address variable value` per definition site."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    variables = value.get("variables") or []
+    if not variables:
+        return "none"
+    lines = []
+    for entry in variables:
+        if not isinstance(entry, dict):
+            lines.append(str(entry))
+            continue
+        name = entry.get("var", "?")
+        definitions = entry.get("definitions") or [{}]
+        for definition in definitions:
+            if not isinstance(definition, dict):
+                lines.append(f"{name}  {definition}")
+                continue
+            address = definition.get("address") or "?"
+            content = definition.get("value") or ""
+            lines.append(f"{address}  {name}  {content}".rstrip())
+    return "\n".join(lines)
+
+
 def _render_data_typed_at_text(value: Any) -> str:
     """Compact data-typed-at: address type [name]"""
     if not isinstance(value, dict):
@@ -1265,15 +1383,24 @@ def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
+    tokenizer = value.get("tokenizer") if isinstance(value.get("tokenizer"), dict) else {}
+    tokenizer_label = tokenizer.get("tokenizer", "<unknown>")
+    tokenizer_source = tokenizer.get("source", "<unknown>")
+
     lines = [
         f"cli version: {value.get('cli_version', '<unknown>')}",
         f"plugin source: {value.get('plugin_source_dir', '<unknown>')}",
         f"plugin install: {value.get('plugin_install_dir', '<unknown>')}",
         f"plugin source build: {value.get('plugin_source_build_id', '<unknown>')}",
         f"plugin install build: {value.get('plugin_install_build_id', '<unknown>')}",
-        "",
-        "instances:",
+        f"tokenizer: {tokenizer_label} ({tokenizer_source})",
     ]
+    if tokenizer and tokenizer.get("exact") is False:
+        lines.append(
+            "tokenizer warning: o200k_base BPE table unavailable, token counts are "
+            "estimated (output spilling still works)"
+        )
+    lines.extend(["", "instances:"])
     instances = list(value.get("instances") or [])
     if not instances:
         lines.append("- none")
@@ -1302,8 +1429,9 @@ def _render_doctor_text(value: Any) -> str:
             lines.append("  stale: loaded plugin code does not match installed plugin file")
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
-        if item.get("socket_path"):
-            lines.append(f"  socket: {item['socket_path']}")
+        endpoint = item.get("endpoint") or item.get("socket_path")
+        if endpoint:
+            lines.append(f"  endpoint: {endpoint}")
         error = doctor.get("error")
         if error:
             lines.append(f"  error: {error}")
@@ -1490,6 +1618,7 @@ def _doctor(args: argparse.Namespace) -> int:
         instance_info = {
             "pid": instance.pid,
             "socket_path": instance.endpoint,
+            "endpoint": instance.endpoint,
             "transport": instance.transport,
             "plugin_version": instance.plugin_version,
             "plugin_build_id": loaded_build_id,
@@ -1517,6 +1646,7 @@ def _doctor(args: argparse.Namespace) -> int:
         "plugin_install_dir": str(install_dir),
         "plugin_source_build_id": source_build_id,
         "plugin_install_build_id": install_build_id,
+        "tokenizer": tokenizer_status(),
         "instances": instances,
     }
     if args.format == "text":
@@ -1640,7 +1770,8 @@ def _render_daemon_list_text(value: Any) -> str:
         flag = " [current]" if sticky and item.get("mode") == sticky else ""
         lines.append(
             f"- mode={item.get('mode', '<unknown>')}  pid={item.get('pid', '?')}  "
-            f"socket={item.get('socket_path', '<unknown>')}  targets={item.get('target_count', '?')}{flag}"
+            f"endpoint={item.get('endpoint') or item.get('socket_path', '<unknown>')}  "
+            f"targets={item.get('target_count', '?')}{flag}"
         )
     return "\n".join(lines)
 
@@ -1653,7 +1784,7 @@ def _render_daemon_status_text(value: Any) -> str:
     lines = [
         f"mode: {value.get('mode')}",
         f"pid: {value.get('pid')}",
-        f"socket: {value.get('socket_path')}",
+        f"endpoint: {value.get('endpoint') or value.get('socket_path')}",
         f"registry: {value.get('registry_path')}",
         f"plugin_version: {value.get('plugin_version')}",
         f"target_count: {value.get('target_count')}",
@@ -1677,6 +1808,7 @@ def _instance_summary(instance: BridgeInstance) -> dict[str, Any]:
         "mode": instance.mode,
         "pid": instance.pid,
         "socket_path": instance.endpoint,
+        "endpoint": instance.endpoint,
         "transport": instance.transport,
         "registry_path": str(instance.registry_path),
         "plugin_version": instance.plugin_version,
@@ -2501,14 +2633,45 @@ def _patch_status(args: argparse.Namespace) -> int:
 
 
 def _patch_assemble(args: argparse.Namespace) -> int:
+    assembly = getattr(args, "asm", None) or getattr(args, "assembly", None)
+    if not assembly:
+        raise BridgeError("patch assemble needs an assembly string")
     return _call(
         args,
         "patch_assemble",
-        {"address": args.address, "asm": args.assembly},
+        {"address": args.address, "asm": assembly},
         require_target=True,
         allow_implicit_target=True,
         stem="patch-assemble",
     )
+
+
+def _patch_shorthand(args: argparse.Namespace) -> int:
+    """Route the documented `bn patch --address ... --hex/--asm` form."""
+    address = getattr(args, "address", None)
+    if not address:
+        raise BridgeError(
+            "bn patch needs --address with --hex or --asm (or a patch subcommand)"
+        )
+    if getattr(args, "hex_data", None):
+        return _call(
+            args,
+            "memory_write",
+            {"address": address, "data_hex": args.hex_data},
+            require_target=True,
+            allow_implicit_target=True,
+            stem="patch-hex",
+        )
+    if getattr(args, "asm", None):
+        return _call(
+            args,
+            "patch_assemble",
+            {"address": address, "asm": args.asm},
+            require_target=True,
+            allow_implicit_target=True,
+            stem="patch-assemble",
+        )
+    raise BridgeError("bn patch needs --hex or --asm together with --address")
 
 
 def _patch_nop(args: argparse.Namespace) -> int:
@@ -2643,14 +2806,100 @@ def _memory_writer(args: argparse.Namespace) -> int:
 # =========================================================================
 
 
+def _value_params(args: argparse.Namespace) -> dict[str, Any]:
+    address = getattr(args, "address", None)
+    if not address:
+        raise BridgeError("bn value needs --address <addr> (or the subcommand form)")
+    params: dict[str, Any] = {"address": address}
+    function = getattr(args, "function", None)
+    if function:
+        params["function_start"] = function
+    return params
+
+
+def _value_reg(args: argparse.Namespace) -> int:
+    params = _value_params(args)
+    params["register"] = args.register
+    params["after"] = bool(getattr(args, "after", False))
+    return _call(
+        args,
+        "value_reg",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
+        stem="value-reg",
+    )
+
+
+def _value_stack(args: argparse.Namespace) -> int:
+    params = _value_params(args)
+    params["stack_offset"] = args.offset
+    params["size"] = getattr(args, "size", 8)
+    params["after"] = bool(getattr(args, "after", False))
+    return _call(
+        args,
+        "value_stack",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
+        stem="value-stack",
+    )
+
+
+def _value_possible(args: argparse.Namespace) -> int:
+    params = _value_params(args)
+    params["level"] = getattr(args, "level", "hlil")
+    params["ssa"] = bool(getattr(args, "ssa", False))
+    return _call(
+        args,
+        "value_possible",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
+        stem="value-possible",
+    )
+
+
+def _value_flags(args: argparse.Namespace) -> int:
+    params = _value_params(args)
+    return _call(
+        args,
+        "value_flags_at",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_value_result_text,
+        stem="value-flags",
+    )
+
+
 def _value_command(args: argparse.Namespace) -> int:
     params = {"function_start": args.function, "kind": args.value_command,
               "address": args.address, "instruction_index": args.instr_index, "after": args.after}
-    for key in ("register", "flag", "offset", "size"):
-        if hasattr(args, key):
-            params[key] = getattr(args, key)
+    operand_keys = {"reg": ("register",), "possible": ("register",),
+                    "stack": ("offset", "size"), "flags": ("flag",)}
+    for key in operand_keys[args.value_command]:
+        params[key] = getattr(args, key)
     return _call(args, "value_query", params, require_target=True, allow_implicit_target=True,
                  text_renderer=_render_value_result_text, stem="value-" + args.value_command)
+
+
+def _value_shorthand(args: argparse.Namespace) -> int:
+    """Route the documented `bn value --address ... --reg/--stack` form."""
+    if getattr(args, "register", None):
+        return _value_reg(args)
+    if getattr(args, "offset", None) is not None:
+        return _value_stack(args)
+    if getattr(args, "possible", False):
+        return _value_possible(args)
+    if getattr(args, "flags", False):
+        return _value_flags(args)
+    raise BridgeError(
+        "bn value needs one of --reg/--stack/--possible/--flags together with --address"
+    )
 
 
 # =========================================================================
@@ -2708,6 +2957,33 @@ def _search_text_handler(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_search_result_text,
         stem="search-text",
+    )
+
+
+def _search_shorthand(args: argparse.Namespace) -> int:
+    """Route the documented `bn search --bytes/--constant/--text` forms."""
+    inner = argparse.Namespace(**vars(args))
+    if getattr(args, "bytes_pattern", None) is not None:
+        inner.pattern = args.bytes_pattern
+        inner.start = None
+        inner.end = None
+        inner.limit = 100
+        return _search_bytes(inner)
+    if getattr(args, "constant_value", None) is not None:
+        inner.value = args.constant_value
+        inner.start = None
+        inner.end = None
+        inner.limit = 100
+        return _search_constant(inner)
+    if getattr(args, "text_pattern", None) is not None:
+        inner.pattern = args.text_pattern
+        inner.regex = bool(getattr(args, "regex", False))
+        inner.il_type = "hlil"
+        inner.limit = 50
+        return _search_text_handler(inner)
+    raise BridgeError(
+        "bn search needs a mode: use `bn search bytes|constant|text ...` "
+        "or the --bytes/--constant/--text shorthand"
     )
 
 
@@ -3541,11 +3817,42 @@ def _type_archive_push(args: argparse.Namespace) -> int:
 
 
 def _annotation_add_tag(args: argparse.Namespace) -> int:
-    return _call(args, "annotation_add_tag", {"address": args.address, "tag_type": args.tag_type, "data": args.data}, require_target=True, allow_implicit_target=True, stem="annotation-add-tag")
+    values = list(getattr(args, "args", []) or [])
+    function = getattr(args, "function", None)
+    address = getattr(args, "address", None)
+    if function or address:
+        if len(values) != 2:
+            raise BridgeError(
+                "annotation add-tag expects TAG_TYPE DATA when --function/--address is used"
+            )
+        tag_type, data = values
+    else:
+        if len(values) != 3:
+            raise BridgeError(
+                "annotation add-tag expects ADDRESS TAG_TYPE DATA, or "
+                "TAG_TYPE DATA together with --function/--address"
+            )
+        address, tag_type, data = values
+
+    params: dict[str, Any] = {"tag_type": tag_type, "data": data}
+    if address:
+        params["address"] = address
+    if function:
+        params["function"] = function
+    return _call(args, "annotation_add_tag", params, require_target=True, allow_implicit_target=True, stem="annotation-add-tag")
 
 
 def _annotation_get_tags(args: argparse.Namespace) -> int:
-    return _call(args, "annotation_get_tags", {"address": args.address}, require_target=True, allow_implicit_target=True, stem="annotation-get-tags")
+    address = getattr(args, "address_option", None) or getattr(args, "address", None)
+    function = getattr(args, "function", None)
+    params: dict[str, Any] = {}
+    if address:
+        params["address"] = address
+    if function:
+        params["function"] = function
+    if not params:
+        raise BridgeError("annotation get-tags expects an address or --function <id>")
+    return _call(args, "annotation_get_tags", params, require_target=True, allow_implicit_target=True, stem="annotation-get-tags")
 
 
 def _annotation_define_data_var(args: argparse.Namespace) -> int:
@@ -3576,6 +3883,26 @@ def _annotation_undefine_symbol(args: argparse.Namespace) -> int:
 
 def _annotation_rename_data_var(args: argparse.Namespace) -> int:
     return _call(args, "annotation_rename_data_var", {"address": args.address, "new_name": args.new_name}, require_target=True, allow_implicit_target=True, stem="annotation-rename-data-var")
+
+
+def _annotation_create_tag_type(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"tag_type": args.tag_type}
+    if getattr(args, "icon", None):
+        params["icon"] = args.icon
+    return _call(args, "annotation_create_tag_type", params, require_target=True, allow_implicit_target=True, stem="annotation-create-tag")
+
+
+def _annotation_list_tag_types(args: argparse.Namespace) -> int:
+    return _call(args, "annotation_list_tag_types", {}, require_target=True, allow_implicit_target=True, text_renderer=_render_tag_types_text, stem="annotation-list-tag-types")
+
+
+def _annotation_remove_tag(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"tag_type": args.tag_type}
+    if getattr(args, "function", None):
+        params["function"] = args.function
+    if getattr(args, "address", None):
+        params["address"] = args.address
+    return _call(args, "annotation_remove_tag", params, require_target=True, allow_implicit_target=True, stem="annotation-remove-tag")
 
 
 # =========================================================================
@@ -3634,13 +3961,21 @@ def _uidf_parse(args: argparse.Namespace) -> int:
     return _call(args, "uidf_parse_possible_value", {"value": args.value, "state": args.state}, require_target=True, allow_implicit_target=True, stem="uidf-parse")
 
 
+def _uidf_from_address(args: argparse.Namespace) -> int:
+    return _call(args, "uidf_from_address", {"address": args.address}, require_target=True, allow_implicit_target=True, text_renderer=_render_uidf_text, stem="uidf-from-address")
+
+
 # =========================================================================
 # Loader handlers
 # =========================================================================
 
 
 def _loader_settings_get(args: argparse.Namespace) -> int:
-    return _call(args, "loader_load_settings_get", {"type_name": args.type_name}, require_target=True, allow_implicit_target=True, stem="loader-settings-get")
+    params: dict[str, Any] = {}
+    type_name = getattr(args, "type_name", None)
+    if type_name:
+        params["type_name"] = type_name
+    return _call(args, "loader_load_settings_get", params, require_target=True, allow_implicit_target=True, stem="loader-settings-get")
 
 
 def _loader_settings_set(args: argparse.Namespace) -> int:
@@ -3694,6 +4029,10 @@ def _external_location_remove(args: argparse.Namespace) -> int:
     return _call(args, "external_location_remove", {"source_address": args.source_address}, require_target=True, allow_implicit_target=True, stem="external-location-remove")
 
 
+def _external_location_list(args: argparse.Namespace) -> int:
+    return _call(args, "external_location_list", {}, require_target=True, allow_implicit_target=True, text_renderer=_render_external_locations_text, stem="external-location-list")
+
+
 # =========================================================================
 # Analysis handlers
 # =========================================================================
@@ -3740,6 +4079,10 @@ def _metadata_remove(args: argparse.Namespace) -> int:
     return _call(args, "metadata_remove", {"key": args.key}, require_target=True, allow_implicit_target=True, stem="metadata-remove")
 
 
+def _metadata_keys(args: argparse.Namespace) -> int:
+    return _call(args, "metadata_keys", {}, require_target=True, allow_implicit_target=True, text_renderer=_render_line_list_text, stem="metadata-keys")
+
+
 # =========================================================================
 # Data handlers
 # =========================================================================
@@ -3780,6 +4123,13 @@ def _xref_data_refs_to(args: argparse.Namespace) -> int:
     if hasattr(args, "limit") and args.limit:
         params["limit"] = args.limit
     return _call(args, "xref_data_refs_to", params, require_target=True, allow_implicit_target=True, text_renderer=_render_xref_data_simple_text, stem="xref-data-refs-to")
+
+
+def _xref_type_refs(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"name": args.name}
+    if hasattr(args, "limit") and args.limit:
+        params["limit"] = args.limit
+    return _call(args, "xref_type_refs", params, require_target=True, allow_implicit_target=True, text_renderer=_render_type_refs_text, stem="xref-type-refs")
 
 
 # =========================================================================
@@ -4785,7 +5135,14 @@ def build_parser() -> argparse.ArgumentParser:
     batch_apply.set_defaults(handler=_batch_apply)
 
     # --- patch ---
-    patch = subparsers.add_parser("patch", help="Binary patching operations")
+    patch = subparsers.add_parser("patch", shorthand=True, help="Binary patching operations")
+    _common_io_options(patch, default_format="json")
+    _target_option(patch, required=False)
+    patch.add_argument("--address", help="Address to patch")
+    patch_modes = patch.add_mutually_exclusive_group()
+    patch_modes.add_argument("--hex", dest="hex_data", help="Bytes to write, as hex")
+    patch_modes.add_argument("--asm", dest="asm", help="Assembly to assemble and patch")
+    patch.set_defaults(handler=_patch_shorthand)
     patch_sub = patch.add_subparsers(dest="patch_command")
     patch_status_p = patch_sub.add_parser("status", help="Show current patch status")
     _common_io_options(patch_status_p)
@@ -4870,7 +5227,24 @@ def build_parser() -> argparse.ArgumentParser:
     memory_writer_p.set_defaults(handler=_memory_writer)
 
     # --- value ---
-    value = subparsers.add_parser("value", help="Register/stack value analysis at IL instructions")
+    value = subparsers.add_parser("value", shorthand=True, help="Register/stack value analysis at IL instructions")
+    _common_io_options(value)
+    _target_option(value, required=False)
+    value.add_argument("--address", help="IL instruction address")
+    value.add_argument(
+        "--function",
+        help="Function identifier (defaults to the function containing --address)",
+    )
+    value_modes = value.add_mutually_exclusive_group()
+    value_modes.add_argument("--reg", dest="register", help="Register name")
+    value_modes.add_argument("--stack", dest="offset", type=int, help="Stack offset")
+    value_modes.add_argument("--possible", action="store_true", help="Show possible values")
+    value_modes.add_argument("--flags", action="store_true", help="Show flag access")
+    value.add_argument("--size", type=int, default=8, help="Stack read size in bytes")
+    value.add_argument("--after", action="store_true", help="Use the post-instruction state")
+    value.add_argument("--level", choices=("hlil", "mlil", "llil"), default="hlil")
+    value.add_argument("--ssa", action="store_true")
+    value.set_defaults(handler=_value_shorthand)
     value_sub = value.add_subparsers(dest="value_command")
     for name in ("reg", "stack", "possible", "flags"):
         command = value_sub.add_parser(name, help="Query native LLIL data-flow values")
@@ -4888,8 +5262,28 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--after", action="store_true", help="Query after this LLIL instruction")
         command.set_defaults(handler=_value_command)
 
+
     # --- search ---
-    search = subparsers.add_parser("search", help="Search binary content")
+    search = subparsers.add_parser("search", shorthand=True, help="Search binary content")
+    _common_io_options(search)
+    _target_option(search, required=False)
+    search_shorthand = search.add_mutually_exclusive_group()
+    search_shorthand.add_argument(
+        "--bytes", dest="bytes_pattern", metavar="PATTERN", help="Hex byte pattern shorthand"
+    )
+    search_shorthand.add_argument(
+        "--constant", dest="constant_value", metavar="VALUE", help="Numeric constant shorthand"
+    )
+    search_shorthand.add_argument(
+        "--text",
+        dest="text_pattern",
+        metavar="PATTERN",
+        help="Text/regex shorthand (pair with --regex)",
+    )
+    search.add_argument(
+        "--regex", action="store_true", help="Interpret --text pattern as a regex"
+    )
+    search.set_defaults(handler=_search_shorthand)
     search_sub = search.add_subparsers(dest="search_command")
     search_bytes_p = search_sub.add_parser("bytes", help="Search for byte pattern")
     _common_io_options(search_bytes_p)
@@ -5117,7 +5511,11 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(te_lib_list, required=False)
     te_lib_list.set_defaults(handler=_type_library_list)
 
-    te_lib_get = type_ext_sub.add_parser("library-get", help="Get type library detail")
+    te_lib_get = type_ext_sub.add_parser(
+        "library-get",
+        aliases=["library-query"],
+        help="Get type library detail (names of the types it provides)",
+    )
     _common_io_options(te_lib_get)
     _target_option(te_lib_get, required=False)
     te_lib_get.add_argument("id", help="Library name or GUID")
@@ -5183,19 +5581,57 @@ def build_parser() -> argparse.ArgumentParser:
     annot_p = subparsers.add_parser("annotation", help="Annotation operations (tags, data vars, symbols)")
     annot_sub = annot_p.add_subparsers(dest="annotation_command")
 
-    annot_add_tag = annot_sub.add_parser("add-tag", help="Add tag at address")
+    annot_add_tag = annot_sub.add_parser(
+        "add-tag", help="Add a tag to a function or an address"
+    )
     _common_io_options(annot_add_tag, default_format="json")
     _target_option(annot_add_tag, required=False)
-    annot_add_tag.add_argument("address")
-    annot_add_tag.add_argument("tag_type")
-    annot_add_tag.add_argument("data")
+    annot_add_tag.add_argument(
+        "args",
+        nargs="+",
+        metavar="TAG_TYPE DATA",
+        help=(
+            "TAG_TYPE DATA to tag the address/function, or "
+            "ADDRESS TAG_TYPE DATA for the positional form"
+        ),
+    )
+    annot_add_tag.add_argument("--function", help="Function identifier to tag")
+    annot_add_tag.add_argument("--address", help="Address to tag")
     annot_add_tag.set_defaults(handler=_annotation_add_tag)
 
-    annot_get_tags = annot_sub.add_parser("get-tags", help="Get tags at address")
+    annot_get_tags = annot_sub.add_parser(
+        "get-tags", help="Get tags for a function or an address"
+    )
     _common_io_options(annot_get_tags)
     _target_option(annot_get_tags, required=False)
-    annot_get_tags.add_argument("address")
+    annot_get_tags.add_argument("address", nargs="?", help="Address to read tags from")
+    annot_get_tags.add_argument("--function", help="Function identifier to read tags from")
+    annot_get_tags.add_argument(
+        "--address", dest="address_option", help="Address to read tags from"
+    )
     annot_get_tags.set_defaults(handler=_annotation_get_tags)
+
+    annot_create_tag_type = annot_sub.add_parser("create-tag", help="Create a tag type")
+    _common_io_options(annot_create_tag_type, default_format="json")
+    _target_option(annot_create_tag_type, required=False)
+    annot_create_tag_type.add_argument("tag_type", help="Tag type name")
+    annot_create_tag_type.add_argument(
+        "icon", nargs="?", help="Icon for the tag type (an emoji or two characters)"
+    )
+    annot_create_tag_type.set_defaults(handler=_annotation_create_tag_type)
+
+    annot_list_tag_types = annot_sub.add_parser("list-tag-types", help="List tag types")
+    _common_io_options(annot_list_tag_types)
+    _target_option(annot_list_tag_types, required=False)
+    annot_list_tag_types.set_defaults(handler=_annotation_list_tag_types)
+
+    annot_remove_tag = annot_sub.add_parser("remove-tag", help="Remove tags of a type")
+    _common_io_options(annot_remove_tag, default_format="json")
+    _target_option(annot_remove_tag, required=False)
+    annot_remove_tag.add_argument("tag_type", help="Tag type name to remove")
+    annot_remove_tag.add_argument("--function", help="Function identifier to scope the removal")
+    annot_remove_tag.add_argument("--address", help="Address to scope the removal")
+    annot_remove_tag.set_defaults(handler=_annotation_remove_tag)
 
     annot_def_dv = annot_sub.add_parser("define-data-var", help="Define data variable at address")
     _common_io_options(annot_def_dv, default_format="json")
@@ -5295,6 +5731,15 @@ def build_parser() -> argparse.ArgumentParser:
     uidf_list_p.add_argument("function_start")
     uidf_list_p.set_defaults(handler=_uidf_list)
 
+    uidf_from_p = uidf_sub.add_parser(
+        "from-address",
+        help="User IL data flow for the function containing an address",
+    )
+    _common_io_options(uidf_from_p)
+    _target_option(uidf_from_p, required=False)
+    uidf_from_p.add_argument("address", help="Address inside the function to inspect")
+    uidf_from_p.set_defaults(handler=_uidf_from_address)
+
     uidf_parse_p = uidf_sub.add_parser("parse", help="Parse possible value")
     _common_io_options(uidf_parse_p)
     _target_option(uidf_parse_p, required=False)
@@ -5308,10 +5753,18 @@ def build_parser() -> argparse.ArgumentParser:
     loader_p = subparsers.add_parser("loader", help="Loader settings and rebase")
     loader_sub = loader_p.add_subparsers(dest="loader_command")
 
-    loader_get = loader_sub.add_parser("settings-get", help="Get loader settings")
+    loader_get = loader_sub.add_parser(
+        "settings-get",
+        aliases=["settings"],
+        help="Get loader settings (defaults to the active view's type)",
+    )
     _common_io_options(loader_get)
     _target_option(loader_get, required=False)
-    loader_get.add_argument("type_name", help="View type name (e.g. ELF)")
+    loader_get.add_argument(
+        "type_name",
+        nargs="?",
+        help="View type name (e.g. ELF); defaults to the active view's type",
+    )
     loader_get.set_defaults(handler=_loader_settings_get)
 
     loader_set = loader_sub.add_parser("settings-set", help="Set a loader setting")
@@ -5378,6 +5831,11 @@ def build_parser() -> argparse.ArgumentParser:
     ext_loc_rm.add_argument("source_address")
     ext_loc_rm.set_defaults(handler=_external_location_remove)
 
+    ext_loc_list = ext_sub.add_parser("location-list", help="List external locations")
+    _common_io_options(ext_loc_list)
+    _target_option(ext_loc_list, required=False)
+    ext_loc_list.set_defaults(handler=_external_location_list)
+
     # -----------------------------------------------------------------
     # analysis
     # -----------------------------------------------------------------
@@ -5440,6 +5898,11 @@ def build_parser() -> argparse.ArgumentParser:
     meta_rm.add_argument("key")
     meta_rm.set_defaults(handler=_metadata_remove)
 
+    meta_keys = meta_sub.add_parser("keys", help="List all metadata keys")
+    _common_io_options(meta_keys)
+    _target_option(meta_keys, required=False)
+    meta_keys.set_defaults(handler=_metadata_keys)
+
     # -----------------------------------------------------------------
     # data
     # -----------------------------------------------------------------
@@ -5483,13 +5946,26 @@ def build_parser() -> argparse.ArgumentParser:
     xref_dt.add_argument("--limit", type=int, default=100)
     xref_dt.set_defaults(handler=_xref_data_refs_to)
 
+    xref_tr = xref_ext_sub.add_parser(
+        "type-refs", help="References to a named type"
+    )
+    _common_io_options(xref_tr)
+    _target_option(xref_tr, required=False)
+    xref_tr.add_argument("name", help="Type name to find references to")
+    xref_tr.add_argument("--limit", type=int, default=100)
+    xref_tr.set_defaults(handler=_xref_type_refs)
+
     # -----------------------------------------------------------------
     # il (extended)
     # -----------------------------------------------------------------
     il_p = subparsers.add_parser("il-nav", help="IL navigation operations")
     il_sub = il_p.add_subparsers(dest="il_command")
 
-    il_a2i = il_sub.add_parser("addr-to-index", help="Address to IL instruction index")
+    il_a2i = il_sub.add_parser(
+        "addr-to-index",
+        aliases=["get-index-for-addr"],
+        help="Address to IL instruction index",
+    )
     _common_io_options(il_a2i)
     _target_option(il_a2i, required=False)
     il_a2i.add_argument("function_start")
@@ -5497,7 +5973,11 @@ def build_parser() -> argparse.ArgumentParser:
     il_a2i.add_argument("--level", choices=["hlil", "mlil", "llil"], default="hlil")
     il_a2i.set_defaults(handler=_il_address_to_index)
 
-    il_i2a = il_sub.add_parser("index-to-addr", help="IL instruction index to address")
+    il_i2a = il_sub.add_parser(
+        "index-to-addr",
+        aliases=["get-addr-for-index"],
+        help="IL instruction index to address",
+    )
     _common_io_options(il_i2a)
     _target_option(il_i2a, required=False)
     il_i2a.add_argument("function_start")
@@ -5519,7 +5999,9 @@ def build_parser() -> argparse.ArgumentParser:
     sec_user_p = subparsers.add_parser("section-user", help="User section operations")
     sec_user_sub = sec_user_p.add_subparsers(dest="section_user_command")
 
-    sec_add = sec_user_sub.add_parser("add", help="Add user section")
+    sec_add = sec_user_sub.add_parser(
+        "add", aliases=["create"], help="Add user section"
+    )
     _common_io_options(sec_add, default_format="json")
     _target_option(sec_add, required=False)
     sec_add.add_argument("name")
@@ -5527,7 +6009,9 @@ def build_parser() -> argparse.ArgumentParser:
     sec_add.add_argument("length", type=int)
     sec_add.set_defaults(handler=_section_add_user)
 
-    sec_rm = sec_user_sub.add_parser("remove", help="Remove user section")
+    sec_rm = sec_user_sub.add_parser(
+        "remove", aliases=["delete"], help="Remove user section"
+    )
     _common_io_options(sec_rm, default_format="json")
     _target_option(sec_rm, required=False)
     sec_rm.add_argument("name")
@@ -5536,7 +6020,9 @@ def build_parser() -> argparse.ArgumentParser:
     seg_user_p = subparsers.add_parser("segment-user", help="User segment operations")
     seg_user_sub = seg_user_p.add_subparsers(dest="segment_user_command")
 
-    seg_add = seg_user_sub.add_parser("add", help="Add user segment")
+    seg_add = seg_user_sub.add_parser(
+        "add", aliases=["create"], help="Add user segment"
+    )
     _common_io_options(seg_add, default_format="json")
     _target_option(seg_add, required=False)
     seg_add.add_argument("start")
@@ -5546,7 +6032,9 @@ def build_parser() -> argparse.ArgumentParser:
     seg_add.add_argument("--flags", type=int, default=0)
     seg_add.set_defaults(handler=_segment_add_user)
 
-    seg_rm = seg_user_sub.add_parser("remove", help="Remove user segment")
+    seg_rm = seg_user_sub.add_parser(
+        "remove", aliases=["delete"], help="Remove user segment"
+    )
     _common_io_options(seg_rm, default_format="json")
     _target_option(seg_rm, required=False)
     seg_rm.add_argument("start")
@@ -5559,7 +6047,9 @@ def build_parser() -> argparse.ArgumentParser:
     debug_p = subparsers.add_parser("debug-info", help="Debug info operations")
     debug_sub = debug_p.add_subparsers(dest="debug_command")
 
-    debug_parsers_p = debug_sub.add_parser("parsers", help="List debug info parsers")
+    debug_parsers_p = debug_sub.add_parser(
+        "parsers", aliases=["list"], help="List debug info parsers"
+    )
     _common_io_options(debug_parsers_p)
     _target_option(debug_parsers_p, required=False)
     debug_parsers_p.set_defaults(handler=_debug_parsers)
@@ -5583,7 +6073,9 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_list_p.add_argument("--address")
     plugin_list_p.set_defaults(handler=_plugin_valid_commands)
 
-    plugin_exec_p = plugin_cmd_sub.add_parser("execute", help="Execute plugin command")
+    plugin_exec_p = plugin_cmd_sub.add_parser(
+        "execute", aliases=["run"], help="Execute plugin command"
+    )
     _common_io_options(plugin_exec_p, default_format="json")
     _target_option(plugin_exec_p, required=False)
     plugin_exec_p.add_argument("name", help="Plugin command name")
