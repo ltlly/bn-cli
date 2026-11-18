@@ -10,8 +10,12 @@ PLUGIN_NAME = "bn_agent_bridge"
 SKILL_NAME = "bn"
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def _asset_dir(group: str, name: str) -> Path:
+    package = Path(__file__).resolve().parent
+    packaged = package / "assets" / group / name
+    if packaged.is_dir():
+        return packaged
+    return package.parents[1] / group / name
 
 
 def codex_home() -> Path:
@@ -106,7 +110,7 @@ def spill_root() -> Path:
 
 
 def plugin_source_dir() -> Path:
-    return repo_root() / "plugin" / PLUGIN_NAME
+    return _asset_dir("plugin", PLUGIN_NAME)
 
 
 def binary_ninja_plugin_dir() -> Path:
@@ -138,7 +142,7 @@ def claude_skills_dir() -> Path:
 
 
 def skill_source_dir() -> Path:
-    return repo_root() / "skills" / SKILL_NAME
+    return _asset_dir("skills", SKILL_NAME)
 
 
 def skill_install_dir() -> Path:

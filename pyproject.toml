@@ -3,6 +3,8 @@ name = "bn"
 version = "0.16.0"
 description = "Agent-friendly Binary Ninja CLI with a persistent headless bridge"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "banteg", email = "4562643+banteg@users.noreply.github.com" }
 ]
@@ -20,8 +22,25 @@ dev = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.18,<0.10.0"]
-build-backend = "uv_build"
+requires = ["hatchling>=1.28,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+dev-mode-dirs = ["src"]
+
+[tool.hatch.build.hooks.custom]
+path = "tools/build_companions.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/plugin", "/skills", "/tests", "/tools", "/README*.md"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/bn", "plugin/bn_agent_bridge", "skills/bn"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
+"plugin" = "bn/assets/plugin"
+"skills" = "bn/assets/skills"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -27,3 +27,18 @@ jobs:
       - run: uv sync --locked
       - run: uv run --frozen pytest -q
       - run: uv build --no-sources
+      - name: Install wheel and verify companion assets
+        shell: bash
+        run: |
+          uv venv "$RUNNER_TEMP/bn-wheel"
+          export VIRTUAL_ENV="$RUNNER_TEMP/bn-wheel"
+          uv pip install dist/*.whl
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            bn="$VIRTUAL_ENV/Scripts/bn.exe"
+          else
+            bn="$VIRTUAL_ENV/bin/bn"
+          fi
+          "$bn" plugin install --mode copy --dest "$RUNNER_TEMP/bn-plugin"
+          "$bn" skill install --client codex --mode copy --dest "$RUNNER_TEMP/bn-skill"
+          test -f "$RUNNER_TEMP/bn-plugin/query.py"
+          test -f "$RUNNER_TEMP/bn-skill/SKILL.md"
